@@ -3406,3 +3406,21 @@ The injection relevance gate must use the same identifier-aware tokenization as 
 Clean ancestor bundle imports must apply Git changes through the same closure, rebinding, budget, and stale-region behavior as live watcher updates while keeping validation and diverged rebuild behavior unchanged.
 
 **Consequences:** McpWatcher exposes a repository-scoped delta method that import invokes against validated staging; the shared boundary remains the watcher mutation lane and no second incremental algorithm is introduced.
+
+<!-- manual -->
+### Known Invariants
+
+- `install.sh` must build the checkout from its own repository root and expose its CLI from Bun's global `bin` directory. It must not rely on Bun's global package manifest or `bun link --global`, which can fail when that manifest lacks a package name. — discovered via bug fix on 2026-10-14, root cause: Bun's global install/link path can leave the previous `openlore` command active or fail before replacing it.
+
+#### Scenario: Install the checkout from another directory
+- **GIVEN** the checkout manifest declares OpenLore version `3.3.1`
+- **WHEN** a user invokes `install.sh` by path from outside the checkout
+- **THEN** the script builds and exposes that checkout's CLI in Bun's global `bin` directory
+- **AND** `openlore --version` matches the manifest version
+
+#### Scenario: Install succeeds with a malformed Bun global manifest
+- **GIVEN** Bun's global `package.json` is missing its `name` field
+- **WHEN** a user invokes `install.sh`
+- **THEN** the script installs the built CLI using `BUN_INSTALL/bin` or the default `$HOME/.bun/bin`
+- **AND** it verifies that the globally exposed command reports the checkout's manifest version
+<!-- /manual -->
