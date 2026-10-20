@@ -3423,4 +3423,17 @@ Clean ancestor bundle imports must apply Git changes through the same closure, r
 - **WHEN** a user invokes `install.sh`
 - **THEN** the script installs the built CLI using `BUN_INSTALL/bin` or the default `$HOME/.bun/bin`
 - **AND** it verifies that the globally exposed command reports the checkout's manifest version
+
+- `openlore install` must write into hook and MCP commands the runtime the user names with `--runtime <node|bun>` (or `OPENLORE_RUNTIME`; the flag wins), and otherwise the runtime that ran the install. It must refuse an unknown runtime, or one it cannot find, before writing anything. It must never take a runtime from a `PATH` entry that is relative or inside the current working directory. — discovered via bug report on 2026-10-20, root cause: a bun-installed `openlore` starts with `#!/usr/bin/env node`, so the installer always ran under node and recorded node in `~/.claude/settings.json`.
+
+#### Scenario: Wire bun for a bun-installed openlore
+- **GIVEN** `openlore` was installed with `install.sh`, so its CLI starts under node
+- **WHEN** a user runs `openlore install --runtime bun`
+- **THEN** every SessionStart and UserPromptSubmit hook command, and the MCP server command, launch OpenLore with the absolute path to `bun`
+
+#### Scenario: Refuse a runtime that is not installed
+- **GIVEN** `bun` is on neither `PATH` nor `$BUN_INSTALL/bin`
+- **WHEN** a user runs `openlore install --runtime bun`
+- **THEN** the command exits with status 2 and names the places it looked
+- **AND** no configuration file is written
 <!-- /manual -->

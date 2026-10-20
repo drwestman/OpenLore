@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from 'node:fs';
-import { win32 } from 'node:path';
+import { homedir } from 'node:os';
+import { posix, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export interface PlatformCommand {
@@ -22,13 +23,14 @@ export interface PlatformCommandRuntime {
 
 const WINDOWS_COMMAND_SHIMS = new Set(['npm', 'npx']);
 
-function isWithinDirectory(path: string, directory: string): boolean {
-  const relative = win32.relative(
-    win32.resolve(directory).toLowerCase(),
-    win32.resolve(path).toLowerCase(),
-  );
+type PathApi = typeof win32;
+
+function isWithinDirectory(path: string, directory: string, api: PathApi = win32): boolean {
+  // Windows paths compare case-insensitively; a POSIX filesystem's do not.
+  const fold = (value: string): string => (api === win32 ? value.toLowerCase() : value);
+  const relative = api.relative(fold(api.resolve(directory)), fold(api.resolve(path)));
   return relative === ''
-    || (relative !== '..' && !relative.startsWith(`..${win32.sep}`) && !win32.isAbsolute(relative));
+    || (relative !== '..' && !relative.startsWith(`..${api.sep}`) && !api.isAbsolute(relative));
 }
 
 function resolveNpmCli(
@@ -309,6 +311,72 @@ export function stableHomebrewPath(path: string): string {
   } catch {
     return path;
   }
+}
+
+export const RUNTIME_NAMES = ['node', 'bun'] as const;
+export type RuntimeName = (typeof RUNTIME_NAMES)[number];
+
+export interface RuntimeLookup {
+  /** The executable running this process. Defaults to `process.execPath`. */
+  execPath?: string;
+  /** Which runtime `execPath` is. Defaults to bun when `process.versions.bun` is set. */
+  running?: RuntimeName;
+  pathValue?: string;
+  /** PATH entries inside this directory are never used. Defaults to `process.cwd()`. */
+  cwd?: string;
+  /** Bun's install root, searched after PATH. Defaults to `$BUN_INSTALL`, then `~/.bun`. */
+  bunInstall?: string;
+  fileExists?: (path: string) => boolean;
+}
+
+function isRuntimeName(value: string): value is RuntimeName {
+  return (RUNTIME_NAMES as readonly string[]).includes(value);
+}
+
+/**
+ * The absolute executable a generated hook or MCP command should launch OpenLore with.
+ *
+ * With nothing requested this is the executable running the install, which is what the
+ * wiring has always recorded. That is wrong for a bun-installed `openlore`: its CLI starts
+ * with `#!/usr/bin/env node`, so even a bun user's install runs under node and records node.
+ * Naming a runtime lets the user choose without launching the installer through it.
+ *
+ * A PATH entry that is relative, or inside `cwd`, is skipped: this path is written into a
+ * user-scope config, and `bun run openlore install` puts `<repo>/node_modules/.bin` on PATH
+ * — a hook must not execute a binary that belongs to whichever repository we stood in.
+ * A runtime that cannot be found is an error rather than a guess, since a hook that names a
+ * missing executable fails silently on every agent turn.
+ */
+export function resolveRuntimeExecutable(
+  requested: string | undefined,
+  platform: NodeJS.Platform,
+  lookup: RuntimeLookup = {},
+): string {
+  const execPath = lookup.execPath ?? process.execPath;
+  if (!requested) return execPath;
+  if (!isRuntimeName(requested)) {
+    throw new Error(`Unknown runtime "${requested}". Known runtimes: ${RUNTIME_NAMES.join(', ')}.`);
+  }
+  if (requested === (lookup.running ?? (process.versions.bun ? 'bun' : 'node'))) return execPath;
+
+  const api = platform === 'win32' ? win32 : posix;
+  const binary = platform === 'win32' ? `${requested}.exe` : requested;
+  const cwd = lookup.cwd ?? process.cwd();
+  const pathValue = lookup.pathValue ?? process.env.PATH ?? '';
+  const directories = pathValue
+    .split(platform === 'win32' ? ';' : ':')
+    .filter((dir) => api.isAbsolute(dir) && !isWithinDirectory(dir, cwd, api));
+  const bunBin = requested === 'bun'
+    ? api.join(lookup.bunInstall ?? process.env.BUN_INSTALL ?? api.join(homedir(), '.bun'), 'bin')
+    : undefined;
+  if (bunBin) directories.push(bunBin);
+
+  const fileExists = lookup.fileExists ?? existsSync;
+  const found = directories.map((dir) => api.join(dir, binary)).find((candidate) => fileExists(candidate));
+  if (!found) {
+    throw new Error(`Could not find "${requested}" on PATH${bunBin ? ` or in ${bunBin}` : ''}.`);
+  }
+  return found;
 }
 
 /**

@@ -145,6 +145,8 @@ openlore install [options]   # wire agents (this repo AND your user scope),
   --force                # Overwrite OpenLore-managed blocks even if hand-edited
   --uninstall            # Remove OpenLore-managed blocks and entries (both scopes)
   --repo-only            # Wire this repository only; write no user-scope entries
+  --runtime <name>       # Runtime the hook + MCP commands launch OpenLore with: node or bun
+                         #   (also OPENLORE_RUNTIME; default: the runtime running the install)
   --no-analyze           # Configure surfaces only; skip init + analyze
 ```
 

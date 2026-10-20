@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import { Command } from 'commander';
 import { logger } from '../../utils/logger.js';
 import { FULL_PRESET, FULL_PRESET_ALIAS, LEAN_DEFAULT_PRESET } from '../../constants.js';
+import { RUNTIME_NAMES, resolveRuntimeExecutable } from '../../utils/platform-command.js';
 import { detect, ALL_AGENTS, type AgentName, type DetectedSurface } from './detect.js';
 import type { Adapter, ApplyContext, ApplyResult, InstallScope, PlannedChange } from './adapters/types.js';
 import { agentsMdAdapter } from './adapters/agents-md.js';
@@ -82,6 +83,12 @@ export interface InstallOptions {
    * scope alone.
    */
   repoOnly?: boolean;
+  /**
+   * JavaScript runtime the generated hook and MCP commands launch OpenLore with (`node` or
+   * `bun`). Defaults to `OPENLORE_RUNTIME`, then to the runtime running this command — which
+   * is node even for a bun-installed `openlore`, whose CLI starts with a node shebang.
+   */
+  runtime?: string;
   /** User-scope root. Defaults to the user's home directory; a test seam, not a flag. */
   home?: string;
 }
@@ -400,6 +407,18 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
     }
   }
 
+  let runtimeExecutable: string;
+  try {
+    runtimeExecutable = resolveRuntimeExecutable(
+      opts.runtime || process.env.OPENLORE_RUNTIME,
+      process.platform,
+      { pathValue: process.env.PATH, cwd: process.cwd() },
+    );
+  } catch (error) {
+    logger.error((error as Error).message);
+    return 2;
+  }
+
   let surfaces: DetectedSurface[];
   if (opts.agents?.length) {
     const unknown = opts.agents.filter((a) => !ALL_AGENTS.includes(a));
@@ -443,7 +462,7 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
     scope,
     platform: process.platform,
     platformCommandRuntime: {
-      nodeExecutable: process.execPath,
+      nodeExecutable: runtimeExecutable,
       npmExecPath: process.env.npm_execpath,
       pathValue: process.env.PATH,
       cwd: process.cwd(),
@@ -759,6 +778,12 @@ export const installCommand = new Command('install')
     'Wire only this repository — skip the user-scope entries that make every future repository reach OpenLore',
     false,
   )
+  .option(
+    '--runtime <name>',
+    `Runtime the hook and MCP commands launch OpenLore with (${RUNTIME_NAMES.join(' or ')}). ` +
+      'Default: the runtime running this command, which is node even for a bun-installed openlore. ' +
+      'Also read from OPENLORE_RUNTIME.',
+  )
   .option('--analyze', 'Build the index after configuring surfaces', true)
   .option('--no-analyze', 'Configure surfaces only; do not run init/analyze (run "openlore analyze" yourself later)')
   .addHelpText(
@@ -771,6 +796,7 @@ Examples:
   $ openlore install --no-analyze    Wire up surfaces only (skip index build)
   $ openlore install --dry-run       Preview changes without writing
   $ openlore install --repo-only     Wire this repository only (no user-scope entries)
+  $ openlore install --runtime bun   Launch hooks and the MCP server with bun instead of node
   $ openlore install --uninstall     Remove OpenLore-managed entries (both scopes)
 
 Bare \`openlore install\` wires your USER scope as well as this repository: every

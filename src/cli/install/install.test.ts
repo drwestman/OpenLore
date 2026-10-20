@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 import { mkdtemp, rm, writeFile, readFile, mkdir, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { formatProveGuidance, runInstall } from './index.js';
+import { claudeCodeAdapter } from './adapters/claude-code.js';
 import { formatPlatformCommand, resolveOpenloreCommand } from '../../utils/platform-command.js';
 import { logger } from '../../utils/logger.js';
 
@@ -147,6 +148,88 @@ describe('openlore install (end-to-end)', () => {
     expect(settings.hooks.SessionStart[0].hooks[0].command).toBe(
       expectedHook(['orient', '--json'])
     );
+  });
+
+  describe('--runtime', () => {
+    // A bun-installed `openlore` still starts under node (the CLI's shebang), so the runtime
+    // recorded in a hook is node unless the user names bun. The fake binary stands in for bun
+    // on PATH: the lookup only needs the file to exist.
+    //
+    // The choice is observed where the adapter receives it, not in the written hook: from
+    // source there is no built CLI entry, so the wired command falls back to `npx` and carries
+    // no runtime at all — an assertion on that text would pass whatever runtime was chosen.
+    let binDir: string;
+    let fakeBun: string;
+    let applied: MockInstance<typeof claudeCodeAdapter.apply>;
+
+    beforeEach(async () => {
+      binDir = await mkdtemp(join(tmpdir(), 'openlore-runtime-bin-'));
+      fakeBun = join(binDir, process.platform === 'win32' ? 'bun.exe' : 'bun');
+      await writeFile(fakeBun, '');
+      vi.stubEnv('PATH', `${binDir}${delimiter}${process.env.PATH ?? ''}`);
+      applied = vi.spyOn(claudeCodeAdapter, 'apply');
+    });
+
+    afterEach(async () => {
+      applied.mockRestore();
+      vi.unstubAllEnvs();
+      await rm(binDir, { recursive: true, force: true });
+    });
+
+    const runtimesWired = (): string[] =>
+      applied.mock.calls.map(([ctx]) => ctx.platformCommandRuntime.nodeExecutable ?? '');
+
+    it('hands the requested runtime to both the repo and the user scope', async () => {
+      const code = await runInstall({ cwd: dir, agent: 'claude-code', analyze: false, runtime: 'bun' });
+      expect(code).toBe(0);
+      // Two applies: this repository, then ~/.claude, where a global install reads its hooks.
+      expect(runtimesWired()).toEqual([fakeBun, fakeBun]);
+    });
+
+    it('honours OPENLORE_RUNTIME when the flag is absent, and lets the flag win', async () => {
+      vi.stubEnv('OPENLORE_RUNTIME', 'bun');
+      expect(await runInstall({ cwd: dir, agent: 'claude-code', analyze: false })).toBe(0);
+      expect(runtimesWired()).toEqual([fakeBun, fakeBun]);
+
+      applied.mockClear();
+      expect(await runInstall({ cwd: dir, agent: 'claude-code', analyze: false, runtime: 'node' })).toBe(0);
+      expect(runtimesWired()).not.toContain(fakeBun);
+    });
+
+    it('keeps the running executable when no runtime is named', async () => {
+      expect(await runInstall({ cwd: dir, agent: 'claude-code', analyze: false })).toBe(0);
+      expect(runtimesWired()).toEqual([process.execPath, process.execPath]);
+    });
+
+    it('--dry-run plans with the requested runtime and still writes nothing', async () => {
+      expect(await runInstall({ cwd: dir, agent: 'claude-code', dryRun: true, runtime: 'bun' })).toBe(0);
+      expect(runtimesWired()).toEqual([fakeBun, fakeBun]);
+      expect(await exists(join(dir, '.claude/settings.json'))).toBe(false);
+    });
+
+    it('refuses an unknown runtime before touching anything', async () => {
+      expect(await runInstall({
+        cwd: dir, agent: 'claude-code', analyze: false, runtime: 'deno',
+      })).toBe(2);
+      expect(applied).not.toHaveBeenCalled();
+      expect(await exists(join(dir, '.claude/settings.json'))).toBe(false);
+      expect(await exists(join(home, '.claude/settings.json'))).toBe(false);
+    });
+
+    it('refuses when the requested runtime is not installed, rather than wiring a dead hook', async () => {
+      const empty = await mkdtemp(join(tmpdir(), 'openlore-runtime-empty-'));
+      try {
+        vi.stubEnv('PATH', empty);
+        vi.stubEnv('BUN_INSTALL', empty);
+        expect(await runInstall({
+          cwd: dir, agent: 'claude-code', analyze: false, runtime: 'bun',
+        })).toBe(2);
+        expect(applied).not.toHaveBeenCalled();
+        expect(await exists(join(dir, '.claude/settings.json'))).toBe(false);
+      } finally {
+        await rm(empty, { recursive: true, force: true });
+      }
+    });
   });
 
   it('claude-code install migrates a legacy mcpServers entry out of settings.json', async () => {

@@ -95,6 +95,7 @@ The happy path needs no flags and never touches your repo on `npm install`:
 | `--agent <name>` | Install only for one surface. Names: `claude-code`, `cursor`, `cline`, `continue`, `pi`, `agents-md`. |
 | `--preset <name>` | Wire the MCP server to a tool preset: `substrate` (the default — the navigation core, governance reads `recall` + `verify_claim` + `blast_radius`, and `prepare_spec_generation` + `prepare_spec_repair`; the write face `remember`/`record_decision` stays opt-in), `navigation` (the lean navigate-only escape), `minimal`, `memory`, `verify`, `federation`, `coordination`, or `full`. Omit it for the `substrate` default; pass `--preset navigation` for the lean core, or `--preset full` to wire all 76 tools. |
 | `--repo-only` | Wire this repository only — write no user-scope entries. |
+| `--runtime <name>` | Runtime the hook and MCP commands launch OpenLore with: `node` or `bun`. Also read from `OPENLORE_RUNTIME`. Without it the commands use the runtime that ran the install — which is **node even for a bun-installed `openlore`**, because its CLI starts with `#!/usr/bin/env node`. Fails if the named runtime is not on `PATH` (bun is also looked up in `$BUN_INSTALL/bin`, then `~/.bun/bin`). |
 | `--dry-run` | Print the planned changes; write nothing. |
 | `--force` | Overwrite OpenLore-managed blocks even when hand-edited. |
 | `--uninstall` | Remove every OpenLore-managed block / entry. Files OpenLore created (and never had non-OpenLore content) are deleted. |

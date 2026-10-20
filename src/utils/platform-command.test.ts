@@ -7,6 +7,7 @@ import {
   isOpenloreCliEntryPath,
   resolvePlatformCommand,
   resolveOpenloreCommand,
+  resolveRuntimeExecutable,
   stableHomebrewPath,
   windowsCommandHazard,
   windowsQuotingHazard,
@@ -167,6 +168,98 @@ describe('resolveOpenloreCommand', () => {
       pathValue: NPM_PREFIX,
       fileExists: (p) => p === NPX_CLI,
     })).toThrow('absolute Node executable');
+  });
+});
+
+/**
+ * The runtime written into a hook is the one that ran `openlore install`, and a bun-installed
+ * `openlore` always runs under node (its shebang is `#!/usr/bin/env node`). These pin the
+ * explicit override that lets a user choose bun without launching the installer through it.
+ */
+describe('resolveRuntimeExecutable', () => {
+  const onPath = (...found: string[]) => (p: string) => found.includes(p);
+
+  it('keeps the running executable when no runtime is requested', () => {
+    expect(resolveRuntimeExecutable(undefined, 'linux', { execPath: '/nvm/bin/node' }))
+      .toBe('/nvm/bin/node');
+  });
+
+  it('finds bun on PATH when the installer itself is running under node', () => {
+    expect(resolveRuntimeExecutable('bun', 'linux', {
+      execPath: '/nvm/bin/node',
+      running: 'node',
+      pathValue: '/usr/bin:/home/me/.bun/bin',
+      fileExists: onPath('/home/me/.bun/bin/bun'),
+    })).toBe('/home/me/.bun/bin/bun');
+  });
+
+  it('uses the executable already running when it is the requested runtime', () => {
+    expect(resolveRuntimeExecutable('bun', 'linux', {
+      execPath: '/home/me/.bun/bin/bun',
+      running: 'bun',
+      pathValue: '/elsewhere',
+      fileExists: () => false,
+    })).toBe('/home/me/.bun/bin/bun');
+  });
+
+  it('finds node on PATH when the installer is running under bun', () => {
+    expect(resolveRuntimeExecutable('node', 'linux', {
+      execPath: '/home/me/.bun/bin/bun',
+      running: 'bun',
+      pathValue: '/usr/local/bin',
+      fileExists: onPath('/usr/local/bin/node'),
+    })).toBe('/usr/local/bin/node');
+  });
+
+  it('falls back to BUN_INSTALL/bin when bun is not on PATH', () => {
+    expect(resolveRuntimeExecutable('bun', 'linux', {
+      execPath: '/nvm/bin/node',
+      running: 'node',
+      pathValue: '/usr/bin',
+      bunInstall: '/opt/bun',
+      fileExists: onPath('/opt/bun/bin/bun'),
+    })).toBe('/opt/bun/bin/bun');
+  });
+
+  it('never wires a binary the project owns, nor a relative PATH entry', () => {
+    // `bun run openlore install` puts <cwd>/node_modules/.bin on PATH; a user-scope hook
+    // must not end up executing a file that lives inside whatever repository we stood in.
+    const ownedByProject = '/work/repo/node_modules/.bin/bun';
+    expect(() => resolveRuntimeExecutable('bun', 'linux', {
+      execPath: '/nvm/bin/node',
+      running: 'node',
+      cwd: '/work/repo',
+      pathValue: '/work/repo/node_modules/.bin:.:bin',
+      bunInstall: '/nowhere',
+      fileExists: onPath(ownedByProject, '/work/repo/bin/bun', './bun', 'bin/bun'),
+    })).toThrow('Could not find "bun"');
+  });
+
+  it('looks for bun.exe along a semicolon-separated PATH on Windows', () => {
+    const dir = win32.join('C:', 'Users', 'me', '.bun', 'bin');
+    const bun = win32.join(dir, 'bun.exe');
+    expect(resolveRuntimeExecutable('bun', 'win32', {
+      execPath: win32.join('C:', 'Program Files', 'nodejs', 'node.exe'),
+      running: 'node',
+      cwd: win32.join('C:', 'work', 'repo'),
+      pathValue: `${win32.join('C:', 'Windows')};${dir}`,
+      fileExists: onPath(bun),
+    })).toBe(bun);
+  });
+
+  it('refuses an unknown runtime and names the ones it knows', () => {
+    expect(() => resolveRuntimeExecutable('deno', 'linux', { execPath: '/nvm/bin/node' }))
+      .toThrow('Unknown runtime "deno". Known runtimes: node, bun.');
+  });
+
+  it('fails loudly when the requested runtime cannot be found', () => {
+    expect(() => resolveRuntimeExecutable('bun', 'linux', {
+      execPath: '/nvm/bin/node',
+      running: 'node',
+      pathValue: '/usr/bin',
+      bunInstall: '/opt/bun',
+      fileExists: () => false,
+    })).toThrow('Could not find "bun" on PATH or in /opt/bun/bin');
   });
 });
 
