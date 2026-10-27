@@ -612,8 +612,11 @@ stated in source.
 ### Requirement: PiDefaultToolSurfaceIsLean
 
 When a Pi session starts with the default configuration, the Pi extension SHALL activate only its
-lean surface: the Pi tools that correspond to the MCP `substrate` preset, the configuration tool,
-and the tool-group activator. All other OpenLore tools SHALL stay registered and inactive. The
+lean surface: the Pi tools that correspond to the MCP `substrate` preset, except the spec-authoring
+composites (`prepare_spec_generation`, `prepare_spec_repair`), plus the configuration tool and the
+tool-group activator. The spec-authoring composites SHALL belong to the `specs` tool group, and the
+activator description SHALL name that group for creating or repairing a spec. All other OpenLore
+tools SHALL stay registered and inactive. The
 extension SHALL NOT change the active state of any tool that OpenLore does not register. The lean
 surface SHALL apply in every Pi session mode.
 
@@ -621,8 +624,8 @@ surface SHALL apply in every Pi session mode.
 
 - **GIVEN** a repository whose `.openlore/config.json` has no `pi.toolSurface` key
 - **WHEN** a Pi session starts
-- **THEN** the active OpenLore tools are exactly the Pi tools of the `substrate` preset, the
-  configuration tool, and the activator
+- **THEN** the active OpenLore tools are exactly the Pi tools of the `substrate` preset other than
+  the spec-authoring composites, the configuration tool, and the activator
 - **AND** every other OpenLore tool is registered but inactive
 
 #### Scenario: Host tools are not changed
@@ -636,6 +639,12 @@ surface SHALL apply in every Pi session mode.
 - **GIVEN** a change that adds a tool to, or removes a tool from, the MCP `substrate` preset
 - **WHEN** the Pi lean surface does not match the Pi-registered tools of that preset
 - **THEN** a CI test fails, naming the tools that differ
+
+#### Scenario: Spec-authoring composites are activated on demand
+
+- **GIVEN** a default Pi session
+- **WHEN** the agent calls the activator with the `specs` group
+- **THEN** `openlore_prepare_spec_generation` and `openlore_prepare_spec_repair` become active
 
 ### Requirement: PiToolGroupsAreActivatable
 
@@ -968,20 +977,20 @@ to overwrite an existing malformed or non-object config.
 
 ### Requirement: PiDaemonFailuresAreBoundedAndHonest
 
-The Pi extension SHALL bound the best-effort context-injection orient call with a timeout and
-degrade to its pointer-line fallback on expiry, so daemon discovery plus orient share one bounded
-first-turn deadline. The extension SHALL launch the package's own CLI with the current Node runtime,
+The Pi extension SHALL NOT call orient on the user's behalf before a turn: the prompt may be a
+greeting rather than a task, so no daemon round-trip is spent before the agent decides to orient.
+The extension SHALL launch the package's own CLI with the current Node runtime,
 without PATH lookup or a shell, and SHALL distinguish launch failure, startup preparation failure,
 early exit, draining, and health timeout rather than uniformly advising the user to run
 `openlore analyze`. Draining and health-timeout outcomes SHALL remain immediately retryable. A daemon
 that becomes reachable after session start SHALL have its keepalive armed so it is not reaped
 mid-session.
 
-#### Scenario: An upgrade rebuild does not hang the first prompt
+#### Scenario: A greeting does not trigger orientation
 
-- **GIVEN** a schema-version bump that makes the daemon rebuild on first request
-- **WHEN** the extension injects context before the first turn
-- **THEN** the orient call times out to the pointer-line fallback and the turn proceeds
+- **GIVEN** a Pi session whose first prompt is a greeting
+- **WHEN** the extension injects context before the turn
+- **THEN** no orient call reaches the daemon and the turn proceeds with the digest and spec index only
 
 #### Scenario: A packaged daemon exits before health
 
@@ -999,7 +1008,8 @@ mid-session.
 ### Requirement: PiInjectedContextIsBoundedAndCurrent
 
 The Pi extension SHALL build before-agent context from the current event's `cwd` and `mode`, not
-state captured at session start. Its specification index SHALL contain at most 50 sorted domain
+state captured at session start, and SHALL attach it on every turn, because Pi restores its base
+system prompt for a turn whose hook returns none. Its specification index SHALL contain at most 50 sorted domain
 entries and SHALL disclose the number of omitted domains when the repository contains more.
 
 #### Scenario: The active root changes after session start

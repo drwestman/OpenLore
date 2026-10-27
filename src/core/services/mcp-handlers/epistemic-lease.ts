@@ -207,11 +207,16 @@ const TOOL_WEIGHTS: Record<string, number> = {
   generate_tests: 4,
   get_low_risk_refactor_candidates: 4,
   blast_radius: 5,              // ← analyze_impact (5) — callers/layers/tests briefing over the graph
+  verify_change: 5,            // ← blast_radius (5) — diff-scoped composed verification receipt
+
   select_tests: 5,             // ← analyze_impact (5) — backward reachability over the graph
   report_coverage_gaps: 5,     // ← analyze_impact (5) — whole-graph reachability (inverse of select_tests)
   find_dead_code: 5,           // ← analyze_impact (5) — whole-graph reachability sweep
   change_impact_certificate: 5,// ← generate_change_proposal (5) — diff-scoped multi-source certificate
+  certify_provenance: 5,       // ← change_impact_certificate (5) — reproducible provenance over the same diff
   plan_parallel_work: 5,       // ← analyze_impact (5) — footprint + hazard graph over task seeds
+  certify_merge: 5,            // ← plan_parallel_work (5) — cross-branch graph join at landing
+  fleet_status: 5,             // ← map_in_flight_conflicts (5) — composes the coordination arc + drift memory
   map_in_flight_conflicts: 5,  // ← plan_parallel_work (5) — same hazard classifier, harvested inputs
 
   // Deep architectural tracing

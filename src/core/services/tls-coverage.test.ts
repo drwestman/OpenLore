@@ -42,16 +42,16 @@ const SRC = join(REPO_ROOT, 'src');
 const EXEMPT: { file: string; line: number; why: string }[] = [
   { file: 'src/core/services/serve-client.ts', line: 97, why: 'loopback http:// health probe' },
   { file: 'src/core/services/serve-client.ts', line: 194, why: 'loopback http:// daemon call' },
-  { file: 'src/cli/commands/serve.ts', line: 336, why: 'loopback http:// health and compatibility probe' },
-  { file: 'src/cli/commands/serve.ts', line: 408, why: 'loopback http:// authenticated shutdown request' },
+  { file: 'src/cli/commands/serve.ts', line: 337, why: 'loopback http:// health and compatibility probe' },
+  { file: 'src/cli/commands/serve.ts', line: 409, why: 'loopback http:// authenticated shutdown request' },
   { file: 'src/cli/commands/serve-descriptor.ts', line: 224, why: 'loopback http:// legacy liveness probe' },
   { file: 'src/api/health.ts', line: 115, why: 'loopback http:// watcher-state probe of an announced daemon' },
-  { file: 'src/pi/extension.ts', line: 673, why: 'loopback http:// health probe' },
-  { file: 'src/pi/extension.ts', line: 866, why: 'loopback http:// daemon call' },
-  { file: 'src/pi/extension.ts', line: 2056, why: 'loopback http:// health probe' },
+  { file: 'src/pi/extension.ts', line: 649, why: 'loopback http:// health probe' },
+  { file: 'src/pi/extension.ts', line: 842, why: 'loopback http:// daemon call' },
+  { file: 'src/pi/extension.ts', line: 2070, why: 'loopback http:// health probe' },
   {
     file: 'src/pi/extension.ts',
-    line: 260,
+    line: 234,
     why: 'pre-existing: the Pi host never opts in, so skipSslVerify is not honoured there at all',
   },
 ];

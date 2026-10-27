@@ -73,6 +73,10 @@ export const TOOL_OUTPUT_CLASS: Record<string, ToolOutputClass> = {
   get_god_functions: 'conclusion',
   check_spec_drift: 'conclusion',
   blast_radius: 'conclusion',
+  verify_change: 'conclusion',
+  certify_provenance: 'conclusion',
+  certify_merge: 'conclusion',
+  fleet_status: 'conclusion',
   search_code: 'conclusion',
   suggest_insertion_points: 'conclusion',
   search_specs: 'conclusion',
@@ -246,7 +250,9 @@ export const TOOL_CAPABILITY_FAMILY: Record<string, CapabilityFamily> = {
   // --- change: reason about a specific diff or change set ---
   structural_diff: 'change',
   blast_radius: 'change',
+  verify_change: 'change',
   change_impact_certificate: 'change',
+  certify_provenance: 'change',
   certify_public_surface: 'change',
   briefing_since: 'change',
   detect_changes: 'change',
@@ -266,6 +272,8 @@ export const TOOL_CAPABILITY_FAMILY: Record<string, CapabilityFamily> = {
   // --- coordinate: schedule / deconflict parallel work ---
   plan_parallel_work: 'coordinate',
   map_in_flight_conflicts: 'coordinate',
+  certify_merge: 'coordinate',
+  fleet_status: 'coordinate',
 
   // --- federate: cross-repo / spec-store conclusions ---
   federation_status: 'federate',

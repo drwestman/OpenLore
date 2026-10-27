@@ -642,6 +642,27 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'verify_change',
+    description:
+      'USE THIS WHEN: you just made a change and want ONE actionable checklist before landing — ' +
+      '"what did I break and what must I re-run?". Flattens the diff-based signals into one ' +
+      'severity-ranked receipt — each item names its subject, the check that produced it, a ' +
+      'severity, and the single next action — plus the tests to run. Composes blast_radius (which ' +
+      'already folds in select_tests and spec/memory/decision drift) and structural_diff ' +
+      '(removed/re-signed functions, new calls into deprecated code); no LLM, no new analysis. ' +
+      'Advisory and grader-not-author: it names what to fix and run, but runs and edits nothing. ' +
+      'Its sibling blast_radius returns the full structured briefing; this is the flattened ' +
+      'next-action list for a propose-verify-correct loop. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref to diff the working tree against (e.g. "HEAD", "main"). Default HEAD (uncommitted changes).' },
+      },
+    },
+  },
+  {
     name: 'find_dead_code',
     description:
       'USE THIS WHEN: "what code is unreachable / dead?", "is anything calling X?", or ' +
@@ -1678,6 +1699,74 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'certify_provenance',
+    description:
+      'Emit a reproducible, content-addressed record of WHAT A CHANGE DOES, for attachment to the ' +
+      'repo\'s supply-chain provenance (SLSA / in-toto). Composes change_impact_certificate (blast ' +
+      'radius, paths newly opened into a declared surface, drifted specs, tests to run) + ' +
+      'structural_diff (added/removed/re-signed functions), serialized canonically and hashed (sha256) ' +
+      'so any consumer can RECOMPUTE and verify it — checkable, not merely signed. Emit as an in-toto ' +
+      'predicate (format "in-toto") or standalone JSON. OpenLore emits, it does not sign. Bad base is ' +
+      'fatal; boundaries disclosed (the claim is a lower bound, never "safe"). Sibling ' +
+      'change_impact_certificate briefs YOUR pending diff in-session; this is the portable attestation ' +
+      'a third party recomputes. No LLM.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref to diff the working tree against (default HEAD).' },
+        change: { type: 'string', description: 'Change id recorded on the certificate (spec-store context; default "working-tree").' },
+        allowBaseFallback: { type: 'boolean', description: 'Accept the disclosed main → master → HEAD~1 base fallback instead of failing on an unresolvable base.' },
+        format: { type: 'string', enum: ['in-toto', 'json'], description: 'Output shape: an in-toto predicate statement, or standalone JSON (default json).' },
+      },
+    },
+  },
+  {
+    name: 'certify_merge',
+    description:
+      'USE THIS WHEN: before landing two branches that merge cleanly — "will these combine correctly, ' +
+      'or does one break what the other calls?". Builds the call graph at the merge-base and each ' +
+      'side, and reports where one side ADDS a call into a symbol the other side changed incompatibly ' +
+      'or removed — the "git merges cleanly, the combination is broken" failure textual merge cannot ' +
+      'see. Verdict per finding: incompatible (removed / breaking signature) or ' +
+      'potentially-incompatible (unprovable), never silently safe; the overall verdict is a sound ' +
+      'lower bound ("no detected incompatibility"). Completes the coordination arc after ' +
+      'plan_parallel_work (dispatch) and map_in_flight_conflicts (in flight); distinct from the ' +
+      'merge-tree oracle (will git textually conflict) — this answers what breaks when it does not. No LLM.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        ours: { type: 'string', description: 'One side to merge (a git ref).' },
+        theirs: { type: 'string', description: 'The other side to merge (a git ref).' },
+        base: { type: 'string', description: 'Merge base to compare against (default: the git merge-base of ours and theirs).' },
+        maxFindings: { type: 'number', description: 'Cap on reported conflicts (default 200).' },
+      },
+      required: ['ours', 'theirs'],
+    },
+  },
+  {
+    name: 'fleet_status',
+    description:
+      'USE THIS WHEN: coordinating parallel agents/branches off a moving base — "which of my recorded ' +
+      'verdicts still hold, and what is the coordination picture?". Re-checks each recorded ' +
+      'coordination verdict (a clean blast radius, a stable public surface, a passed certify_merge) ' +
+      'against the current graph via the freshness lease: still-valid / carried / invalidated / ' +
+      'needs-reverification — a verdict is never served fresh once its base moved without the check. ' +
+      'Composes the coordination arc (plan_parallel_work → map_in_flight_conflicts → certify_merge), ' +
+      'referencing each tool rather than re-deriving it. Advisory, read-only, no LLM.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        branches: { type: 'array', items: { type: 'string' }, description: 'In-flight branches to compose the arc for (attribution + the tools to run per branch).' },
+      },
+    },
+  },
+  {
     name: 'plan_parallel_work',
     description:
       'USE THIS WHEN: before fanning N tasks out across agents/worktrees — "which of these tasks are ' +
@@ -2343,7 +2432,7 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | t
   prepare_spec_generation: _RO, prepare_spec_repair: _RO,
   get_refactor_report: _RO, get_call_graph: _RO, get_duplicate_report: _RO,
   get_signatures: _RO, get_subgraph: _RO, trace_execution_path: _RO,
-  get_mapping: _RO, check_spec_drift: _RO, analyze_impact: _RO, select_tests: _RO, blast_radius: _RO, find_dead_code: _RO, structural_diff: _RO, get_change_coupling: _RO, check_architecture: _RO,
+  get_mapping: _RO, check_spec_drift: _RO, analyze_impact: _RO, select_tests: _RO, blast_radius: _RO, verify_change: _RO, find_dead_code: _RO, structural_diff: _RO, get_change_coupling: _RO, check_architecture: _RO,
   get_low_risk_refactor_candidates: _RO, get_leaf_functions: _RO,
   get_critical_hubs: _RO, get_function_skeleton: _RO, get_god_functions: _RO,
   suggest_insertion_points: _RO, search_code: _RO, list_spec_domains: _RO,
@@ -2360,8 +2449,9 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | t
   // Audited writers (change: adopt-mcp-protocol-conformance): `persist: true` writes a certificate,
   // and federation_status adopts newly indexed fingerprints into the federation manifest.
   spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RWI, federation_status: _RWI,
+  certify_provenance: _RO,
   get_landmarks: _RO, get_map: _RO, find_path: _RO,
-  plan_parallel_work: _RO, map_in_flight_conflicts: _RO, get_language_support: _RO,
+  plan_parallel_work: _RO, map_in_flight_conflicts: _RO, certify_merge: _RO, fleet_status: _RO, get_language_support: _RO,
   report_coverage_gaps: _RO,
   certify_public_surface: _RO,
   get_style_fingerprint: _RO,
@@ -2470,7 +2560,7 @@ export const TOOL_PRESETS: Record<string, Set<string>> = {
   // Deliberately NOT in the default or `minimal` surface (mcp-quality: minimize the
   // tools an agent must consider). search_code helps the agent name the subject precisely.
   verify: new Set([
-    'orient', 'search_code', 'verify_claim',
+    'orient', 'search_code', 'verify_claim', 'verify_change', 'certify_provenance',
   ]),
   // Multi-repo federation (opt-in): the cross-repo conclusion tools plus the
   // registry status tool. `federation_status` exists ONLY here — the default and
@@ -2488,7 +2578,7 @@ export const TOOL_PRESETS: Record<string, Set<string>> = {
   // (mcp-quality: minimize the tools an agent must consider; changes: add-parallel-work-plan,
   // add-cross-actor-interference-map).
   coordination: new Set([
-    'orient', 'plan_parallel_work', 'map_in_flight_conflicts', 'analyze_impact', 'find_path',
+    'orient', 'plan_parallel_work', 'map_in_flight_conflicts', 'certify_merge', 'fleet_status', 'analyze_impact', 'find_path',
   ]),
   // The navigation core plus governance reads (change: unify-navigation-and-governance-substrate;
   // architecture: UnifiedStructuralSubstrate). The `navigation` graph-traversal core
@@ -2531,11 +2621,11 @@ export const STANDING_CONTEXT_BUDGETS: Record<string, {
   minimal: { baselineTokens: 2_736, maxTokens: 2_950, rationale: 'Exact v1 wire baseline plus 7.8% headroom.' },
   navigation: { baselineTokens: 3_533, maxTokens: 3_800, rationale: 'Exact v1 wire baseline plus 7.6% headroom.' },
   memory: { baselineTokens: 1_510, maxTokens: 1_610, rationale: 'Re-baselined from 1,216 for remember\'s trigger and pinned inputs (change: add-memory-trigger-predicates), then from 1,399 for its bounded claims input (change: add-memory-claim-verdicts), plus 6.6% headroom.' },
-  verify: { baselineTokens: 1_262, maxTokens: 1_350, rationale: 'Exact v1 wire baseline plus 7.0% headroom.' },
+  verify: { baselineTokens: 2_075, maxTokens: 2_220, rationale: 'Grew with verify_change then certify_provenance (add-verification-feedback-loop, add-change-provenance-certificate); exact measured baseline plus 7.0% headroom.' },
   federation: { baselineTokens: 3_837, maxTokens: 4_100, rationale: 'Exact v1 wire baseline plus 6.9% headroom.' },
-  coordination: { baselineTokens: 2_487, maxTokens: 2_650, rationale: 'Exact v1 wire baseline plus 6.6% headroom.' },
+  coordination: { baselineTokens: 3_171, maxTokens: 3_400, rationale: 'Grew with certify_merge then fleet_status (add-merge-semantic-certificate, add-fleet-coordination-arc); exact measured baseline plus 7.2% headroom.' },
   substrate: { baselineTokens: 5_131, maxTokens: 5_500, rationale: 'Exact v1 wire baseline plus 7.2% headroom.' },
-  full: { baselineTokens: 24_140, maxTokens: 25_500, rationale: 'Exact v1 wire baseline plus 5.6% headroom.' },
+  full: { baselineTokens: 25_848, maxTokens: 27_000, rationale: 'Grew with verify_change, certify_provenance, and certify_merge; exact measured baseline plus 4.5% headroom.' },
 };
 
 /**

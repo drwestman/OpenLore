@@ -119,6 +119,18 @@ export const ARCHITECTURE_FINDING_CODES = [
 ] as const;
 
 export const FINDING_CODE_REGISTRY: Record<string, FindingCodeSpec> = {
+  // ── merge semantic certificate (change: add-merge-semantic-certificate) ──
+  'merge-semantic-conflict': {
+    defaultClass: 'advisory', source: 'merge-semantic-certificate',
+    description: 'Two branches merge cleanly textually but one side adds a call into a symbol the other side changed incompatibly or removed — a semantic merge conflict the textual merge cannot see.',
+    remediation: 'Semantic merge conflict: {subject}; reconcile the added call against the other branch\'s change before landing, or land the two branches in sequence.',
+  },
+  // ── call-graph soundness calibration (change: add-callgraph-soundness-calibration) ──
+  'callgraph-precision-order-violation': {
+    defaultClass: 'advisory', source: 'callgraph-soundness',
+    description: 'Disabling a refining resolution mechanism changed what the full ladder resolved (an edge was dropped or re-targeted down the confidence ladder), or enabling the over-approximating CHA pass changed a non-overrides edge — a precision-order (monotone-refinement) violation detected without ground truth.',
+    remediation: 'Precision-order violation: {subject}; the resolution ladder is not monotone here — a more precise mechanism must only refine or add edges, never drop or down-rank one the conservative build resolved.',
+  },
   'scenario-unverifiable-shape': {
     defaultClass: 'advisory', source: 'scenario-checkability',
     description: 'A scenario lacks a checkable condition or observable outcome; a verification path existing means a test reaches the anchored code, never that the test asserts the scenario\'s behavior.',

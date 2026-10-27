@@ -6,8 +6,10 @@
  *
  * Two halves:
  *   C — context injection (before_agent_start): model starts grounded with the
- *       architecture digest + spec index + task-grounded orient call, so weak
- *       tool-callers benefit even without calling a tool.
+ *       architecture digest + spec index. No orient call is made on the user's
+ *       behalf: the first prompt may be a greeting, not a task, and no prompt
+ *       heuristic tells them apart reliably. The agent calls openlore_orient
+ *       itself once it has a task.
  *   B — native tools (registerTool): the substrate surface for on-demand structural
  *       queries — NAV_TOOLS spans navigate + change + remember + verify + governance,
  *       each round-tripping to the warm daemon via fetch. Every tool is registered, but a
@@ -48,18 +50,6 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-// Task-scoped injection gate + render. This module is intentionally
-// dependency-light (pure tokenization, framing, and token estimation) so importing it
-// here does NOT drag the analyzer into the Pi host — orientation still comes
-// from the warm daemon over RPC (decision abee8e3e).
-import {
-  resolveInjectionConfig,
-  evaluateRelevanceGate,
-  renderInjectionBlock,
-  classifyTurnIntent,
-  pointerLineFor,
-  type LeanOrientResult,
-} from '../cli/commands/orient-inject-render.js';
 // The shared serve.json validator. Dependency-light (node builtins + the loopback
 // predicate) so it does not drag the analyzer into the Pi host, and it guarantees
 // Pi trusts the untrusted descriptor exactly as the CLI and MCP server do
@@ -147,22 +137,6 @@ export async function readConfig(cwd: string): Promise<OpenLoreConfig | null> {
 }
 
 /**
- * Read just the `contextInjection` block, independent of `isUsableConfig`.
- * The injection opt-out (including user defaults) must work even before an LLM provider is configured —
- * `readConfig` returns null until `generation.provider` is set (a headless/rpc
- * session may never run the wizard), which would silently drop `mode: "off"`.
- * Mirrors the CLI path, which reads config unconditionally.
- */
-export async function readContextInjection(cwd: string): Promise<ContextInjectionConfig | undefined> {
-  try {
-    const raw = await readLayeredConfig(safeJoin(cwd, join(OPENLORE_DIR, 'config.json')));
-    return raw && typeof raw === 'object'
-      ? (raw as { contextInjection?: ContextInjectionConfig }).contextInjection
-      : undefined;
-  } catch { return undefined; }
-}
-
-/**
  * Environment override for daemon spawn authority (change: extend-api-for-supervising-hosts).
  * Set by a supervising host that already runs one daemon per working tree, so an
  * extension-initiated spawn would produce a second, unsupervised process outliving the session.
@@ -172,7 +146,7 @@ const PI_NO_SPAWN_ENV = 'OPENLORE_PI_NO_SPAWN';
 /**
  * May this extension spawn a daemon of its own?
  *
- * Read like `readContextInjection` and NOT through `readConfig`: the opt-out must work before an
+ * Read directly and NOT through `readConfig`: the opt-out must work before an
  * LLM provider is configured, and `readConfig` returns null until `generation.provider` is set —
  * which would silently restore spawn authority the operator revoked. The environment variable wins
  * over the config key, because it is the host's per-process statement about who owns the process.
@@ -553,11 +527,14 @@ export async function runConfigWizard(
       const [exitCode, errText] = await new Promise<[number, string]>((resolve) => {
         const trySpawn = (cmd: string, args: string[]) => new Promise<[number, string] | null>((res) => {
           const chunks: Buffer[] = [];
+          // Pass env explicitly so the child honors the process's CURRENT environment
+          // (e.g. a PATH the host adjusted) rather than a stale snapshot — identical to the
+          // default inherited env in normal use, but it keeps resolution deterministic.
           const proc = process.platform === 'win32'
-            ? spawn('cmd.exe', ['/c', cmd, ...args], { cwd: ctx.cwd, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
+            ? spawn('cmd.exe', ['/c', cmd, ...args], { cwd: ctx.cwd, env: process.env, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
             // windowsHide is a documented no-op off Windows; set here too so the invariant is
             // uniform across both branches rather than a carve-out the guard has to know about.
-            : spawn(cmd, args, { cwd: ctx.cwd, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+            : spawn(cmd, args, { cwd: ctx.cwd, env: process.env, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
           proc.stderr?.on('data', (d: Buffer) => chunks.push(d));
           proc.on('close', (code) => res([code ?? 1, Buffer.concat(chunks).toString().trim()]));
           proc.on('error', () => res(null));
@@ -592,7 +569,6 @@ interface DaemonProbe {
 
 const HEALTH_TIMEOUT_MS = 8000;
 const HEALTH_POLL_MS = 150;
-export const PI_ORIENT_TIMEOUT_MS = 4_000;
 export const PI_SPEC_INDEX_MAX_DOMAINS = 50;
 // Generous per-probe timeout: a cold Node HTTP server on Windows can be slow to
 // answer the first /health. Too short a timeout misreads a live daemon as dead,
@@ -892,19 +868,6 @@ export class PiDaemonConnectionError extends Error {
   }
 }
 
-/** Bound a best-effort Pi operation without abandoning useful background work. */
-export async function awaitWithSignal<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  signal.throwIfAborted();
-  return await new Promise<T>((resolve, reject) => {
-    const abort = () => reject(signal.reason);
-    signal.addEventListener('abort', abort, { once: true });
-    void work.then(
-      (value) => { signal.removeEventListener('abort', abort); resolve(value); },
-      (error) => { signal.removeEventListener('abort', abort); reject(error); },
-    );
-  });
-}
-
 export function isUsableDaemon(daemon: Daemon): boolean {
   return daemon.incompatibility === undefined;
 }
@@ -1115,6 +1078,46 @@ export const NAV_TOOLS: NavToolSpec[] = [
       baseRef: Type.Optional(Type.String({ description: 'Git ref to diff the working tree against (e.g. "HEAD", "main"). Optional — defaults to HEAD (uncommitted changes).' })),
       depth: Type.Optional(Type.Number({ description: 'Impact-analysis traversal depth (default 2).' })),
       maxSymbols: Type.Optional(Type.Number({ description: 'Cap on the highest-fan-in changed symbols analyzed (default 12).' })),
+    }),
+  },
+  {
+    name: 'verify_change',
+    label: 'openlore verify_change',
+    description: 'Before landing a change, get ONE severity-ranked checklist of what it breaks and what to re-run: each item names its subject, the check that found it, a severity, and the single next action, plus the tests to run. Composes blast_radius and structural_diff; advisory, runs nothing and edits nothing.',
+    guideline: 'Right before you commit or finish a change, call openlore_verify_change to get a single ordered action list — the breaks to fix and the tests to run — distilled from the diff. With no arguments it uses your uncommitted changes (diff vs HEAD). It is a grader, not an author: act on the list; it runs and edits nothing. Its sibling blast_radius returns the fuller structured briefing.',
+    parameters: Type.Object({
+      baseRef: Type.Optional(Type.String({ description: 'Git ref to diff the working tree against (e.g. "HEAD", "main"). Optional — defaults to HEAD (uncommitted changes).' })),
+    }),
+  },
+  {
+    name: 'certify_provenance',
+    label: 'openlore certify_provenance',
+    description: 'Emit a reproducible, content-addressed record of what a change does (blast radius, paths newly opened into a declared surface, drifted specs, tests to run, structural delta), for attachment to SLSA/in-toto provenance. OpenLore emits, it does not sign.',
+    guideline: 'When a change needs a verifiable provenance record (a CI attestation or audit trail), call openlore_certify_provenance to emit a content-addressed certificate of what the change does — as an in-toto predicate (format "in-toto") or JSON. Any consumer recomputes it to verify the digest. A bad base is fatal; it signs nothing.',
+    parameters: Type.Object({
+      baseRef: Type.Optional(Type.String({ description: 'Git ref to diff against (default HEAD).' })),
+      change: Type.Optional(Type.String({ description: 'Change id recorded on the certificate (default "working-tree").' })),
+      format: Type.Optional(Type.String({ description: 'Output shape: "in-toto" predicate or "json" (default json).' })),
+    }),
+  },
+  {
+    name: 'certify_merge',
+    label: 'openlore certify_merge',
+    description: 'Before landing two branches that merge cleanly, check whether one side breaks what the other calls: build the call graph at the merge-base and each side, and report where one adds a call into a symbol the other changed incompatibly or removed. Advisory, a sound lower bound (never "safe").',
+    guideline: 'Before merging two branches (or landing a PR onto its base), call openlore_certify_merge with `ours` and `theirs` (git refs) to catch the "merges cleanly but the combination is broken" failure textual merge misses. Verdicts are incompatible / potentially-incompatible, never "safe".',
+    parameters: Type.Object({
+      ours: Type.String({ description: 'One side to merge (a git ref).' }),
+      theirs: Type.String({ description: 'The other side to merge (a git ref).' }),
+      base: Type.Optional(Type.String({ description: 'Merge base (default: the git merge-base of ours and theirs).' })),
+    }),
+  },
+  {
+    name: 'fleet_status',
+    label: 'openlore fleet_status',
+    description: 'Coordinating parallel branches off a moving base: re-check each recorded coordination verdict (a clean blast radius, a stable surface, a passed merge check) against the current graph — still-valid / carried / invalidated / needs-reverification — and surface the coordination arc. A verdict is never served fresh once its base moved.',
+    guideline: 'When coordinating several in-flight branches, call openlore_fleet_status to see which recorded verdicts still hold after the base moved, and the overall coordination picture (dispatch → in-flight → landing). Read-only and advisory.',
+    parameters: Type.Object({
+      branches: Type.Optional(Type.Array(Type.String(), { description: 'In-flight branches to compose the arc for.' })),
     }),
   },
   {
@@ -1489,6 +1492,10 @@ export const PI_TOOL_SNIPPETS: Record<string, string> = {
   select_tests: 'Tests to run for given functions or your uncommitted changes.',
   get_test_coverage: 'Which code has tests and which does not.',
   blast_radius: 'Pre-commit briefing: callers, tests to run, specs and decisions at risk.',
+  verify_change: 'Pre-commit checklist: what the diff breaks and the tests to run, severity-ranked.',
+  certify_provenance: 'Reproducible, content-addressed record of what a change does, for SLSA/in-toto.',
+  certify_merge: 'Two branches merge cleanly but break in combination — the semantic conflict check.',
+  fleet_status: 'Which recorded coordination verdicts still hold after the base moved, plus the arc.',
   structural_diff: 'Functions, edges, and signatures changed between two states, plus stale callers.',
   verify_claim: 'Check a structural fact or a decision citation before you state it.',
   suggest_insertion_points: 'Ranked places to add new code.',
@@ -1526,24 +1533,32 @@ export const PI_TOOL_SNIPPETS: Record<string, string> = {
 
 // Tools active when a Pi session starts (names without the `openlore_` prefix):
 // the MCP `substrate` preset — the default `openlore install` wires for Claude
-// Code — plus the two Pi-only utilities. extension.test.ts derives this set from
-// TOOL_PRESETS.substrate so the two surfaces cannot drift.
+// Code — minus PI_ON_DEMAND_SUBSTRATE_TOOLS, plus the two Pi-only utilities.
+// extension.test.ts derives this set from TOOL_PRESETS.substrate so the two
+// surfaces cannot drift.
 export const PI_LEAN_TOOLS: readonly string[] = [
   'orient', 'search_code', 'get_subgraph', 'trace_execution_path',
   'analyze_impact', 'suggest_insertion_points', 'get_function_skeleton',
   'get_landmarks', 'get_map', 'find_path',
   'recall', 'verify_claim', 'blast_radius',
-  'prepare_spec_generation', 'prepare_spec_repair',
   'configure', 'activate_tools',
 ];
+
+// Substrate tools Pi keeps out of the lean set: an MCP host cannot turn a tool on
+// mid-session, but Pi can, so task-specific spec authoring waits in the `specs`
+// group instead of adding its descriptions to every prompt.
+export const PI_ON_DEMAND_SUBSTRATE_TOOLS: readonly string[] = ['prepare_spec_generation', 'prepare_spec_repair'];
 
 // Task groups openlore_activate_tools turns on. Every registered tool outside
 // PI_LEAN_TOOLS belongs to exactly one group (guarded in extension.test.ts).
 // Groups are task-shaped, not capability families: `navigate` alone holds most tools.
 export const PI_TOOL_GROUPS: Record<string, readonly string[]> = {
-  specs: ['search_specs', 'get_spec', 'list_spec_domains', 'search_unified', 'check_spec_drift', 'audit_spec_coverage'],
+  specs: [
+    'search_specs', 'get_spec', 'list_spec_domains', 'search_unified', 'check_spec_drift', 'audit_spec_coverage',
+    ...PI_ON_DEMAND_SUBSTRATE_TOOLS,
+  ],
   memory: ['remember', 'record_decision', 'list_decisions', 'approve_decision', 'reject_decision', 'sync_decisions'],
-  review: ['structural_diff', 'select_tests', 'get_test_coverage', 'briefing_since', 'certify_public_surface'],
+  review: ['structural_diff', 'verify_change', 'certify_provenance', 'certify_merge', 'fleet_status', 'select_tests', 'get_test_coverage', 'briefing_since', 'certify_public_surface'],
   quality: [
     'get_refactor_report', 'get_health_map', 'get_critical_hubs', 'get_god_functions',
     'get_architecture_overview', 'get_surprising_connections', 'find_clones', 'get_style_fingerprint',
@@ -1631,6 +1646,7 @@ export function piActivatorDescription(): string {
     .map(([group, tools]) => `- ${group}: ${tools.map((name) => PI_TOOL_PREFIX + name).join(', ')}`);
   return [
     'Turn on more openlore tools for the rest of this session. Pass group names, or the name of any tool below.',
+    'To create a spec from code or repair an existing spec, turn on the specs group.',
     ...lines,
   ].join('\n');
 }
@@ -1641,8 +1657,8 @@ export function piActivatorDescription(): string {
  * raising a budget changes both a number and its rationale (the STANDING_CONTEXT_BUDGETS pattern).
  */
 export const PI_STANDING_CONTEXT_BUDGETS: Record<PiToolSurface, { baselineTokens: number; maxTokens: number; rationale: string }> = {
-  lean: { baselineTokens: 3_089, maxTokens: 3_300, rationale: 'Measured baseline plus 6.8% headroom.' },
-  all: { baselineTokens: 7_445, maxTokens: 7_950, rationale: 'Measured baseline plus 6.8% headroom.' },
+  lean: { baselineTokens: 2_789, maxTokens: 2_980, rationale: 'Shrank when spec authoring moved to the specs group; measured baseline plus 6.8% headroom.' },
+  all: { baselineTokens: 8_825, maxTokens: 9_400, rationale: 'Grew with verify_change, certify_provenance, certify_merge, and fleet_status (the moat/interop features); measured baseline plus 6.5% headroom.' },
 };
 
 /** Deterministic estimate (characters / 4) of what the given registered tools add to the prompt. */
@@ -1936,7 +1952,6 @@ export function formatToolResult(result: unknown, toolName?: string): string {
 
 /** Bounded runtime overrides for the extension. @internal */
 export interface PiExtensionRuntime {
-  orientTimeoutMs?: number;
   /** Replaces the functional-readiness read behind the footer status. */
   readHealth?: PiHealthReader;
   /** Replaces the watcher-only probe used on a cached health read. */
@@ -1962,7 +1977,6 @@ function registerOpenlore(
   // repo that simply isn't analyzed yet. Transient failures recover after TTL.
   const failedUntil = new Map<string, number>();
   const DAEMON_RETRY_COOLDOWN_MS = 30_000;
-  const primed = new Set<string>();
   const configHinted = new Set<string>();
   // Footer status state (spec: PiStatusReportsFunctionalReadiness). Keyed by cwd like the daemon
   // cache. No ExtensionContext is ever stored: each update uses the ctx of the event it handles.
@@ -2346,11 +2360,11 @@ function registerOpenlore(
     if (ctx) setPiStatus(ctx, undefined);
   });
 
-  // ── C: context injection on the first turn ──
+  // ── C: context injection on every turn ──
+  // Pi restores its base system prompt for any turn whose hook returns nothing,
+  // so the digest is re-attached each turn rather than only on the first.
   pi.on('before_agent_start', async (event: BeforeAgentStartEvent, ctx: ExtensionContext): Promise<BeforeAgentStartEventResult | void> => {
     if (ctx.mode === 'json' || ctx.mode === 'print') return;
-    if (primed.has(ctx.cwd)) return;
-    primed.add(ctx.cwd);
 
     const blocks: string[] = [];
     const [analysisProvenance, specProvenance] = await Promise.all([
@@ -2365,57 +2379,6 @@ function registerOpenlore(
     ));
     const specIndex = await readSpecIndex(ctx.cwd);
     if (specIndex) blocks.push(frameServedContent(specIndex, specProvenance, 'specification index'));
-
-    // Task-scoped orientation: gate + token-budgeted render, the same pipeline
-    // `openlore orient --inject` uses for the Claude Code hook (change
-    // add-task-scoped-context-injection). The daemon does the orientation; the
-    // host only gates and renders. `mode: "off"` opts out (digest/spec index,
-    // Pi's own baseline grounding, are unaffected); a weak/absent match degrades
-    // to the single ignorable pointer line instead of dumping raw orient JSON.
-    const cfg = resolveInjectionConfig(await readContextInjection(ctx.cwd));
-    // Turn-intent gate, ahead of the daemon round-trip: a repository-management
-    // turn (push, open/merge a PR, cut a release) gets the reason-bearing
-    // pointer line and no orientation at all — same classifier, same wording as
-    // the CLI hook (change scope-advisory-noise-to-touched-code).
-    const prompt = event.prompt?.trim() ?? '';
-    if (cfg.mode !== 'off') {
-      if (!prompt) {
-        blocks.push(pointerLineFor('empty-prompt'));
-      } else if (cfg.intentGate && classifyTurnIntent(prompt) === 'repository-management') {
-        blocks.push(pointerLineFor('management-intent'));
-      } else {
-        // Resolve/contact the daemon only after the intent gate has admitted the
-        // turn. Every failure remains visible as a reason-bearing pointer; a
-        // digest already in `blocks` must not accidentally hide orientation loss.
-        const injectionSignal = AbortSignal.timeout(runtime.orientTimeoutMs ?? PI_ORIENT_TIMEOUT_MS);
-        try {
-          const daemon = await awaitWithSignal(getDaemon(ctx.cwd), injectionSignal);
-          if (!daemon) {
-            blocks.push(pointerLineFor('error'));
-          } else {
-            const oriented = await callTool(
-              daemon,
-              'orient',
-              { task: prompt },
-              ctx.cwd,
-              injectionSignal,
-            );
-            const result = oriented && typeof oriented === 'object'
-              ? (oriented as LeanOrientResult)
-              : { error: 'invalid orient response' };
-            const evaluation = evaluateRelevanceGate(result, cfg);
-            blocks.push(evaluation.passes
-              ? renderInjectionBlock(result, cfg)
-              : pointerLineFor(evaluation.reason ?? 'weak-relevance'));
-          }
-        } catch {
-          // A first-turn deadline is not evidence that the daemon is unhealthy.
-          // Discovery continues in the background and may warm the next call.
-          if (!injectionSignal.aborted) dropDaemon(ctx.cwd);
-          blocks.push(pointerLineFor('error'));
-        }
-      }
-    }
 
     const suffix = blocks.length > 0
       ? blocks.join('\n\n')

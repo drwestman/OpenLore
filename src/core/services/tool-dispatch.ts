@@ -53,6 +53,7 @@ import { handleFindDeadCode } from './mcp-handlers/reachability.js';
 import { handleVerifyClaim } from './mcp-handlers/claim-verification.js';
 import type { ClaimKind } from './mcp-handlers/claim-verification.js';
 import { handleStructuralDiff } from './mcp-handlers/structural-diff.js';
+import { handleVerifyChange } from './mcp-handlers/verify-change.js';
 import { handleGetChangeCoupling } from './mcp-handlers/change-coupling.js';
 import { handleGetHealthMap } from './mcp-handlers/health-map.js';
 import { handleGetSurprisingConnections } from './mcp-handlers/surprising-connections.js';
@@ -63,6 +64,9 @@ import { handleFederationStatus } from './mcp-handlers/federation.js';
 import { handleSpecStoreStatus } from './mcp-handlers/spec-store.js';
 import { handleWorkingSetContext } from './mcp-handlers/working-set.js';
 import { computeImpactCertificate } from './mcp-handlers/impact-certificate.js';
+import { handleCertifyProvenance } from './mcp-handlers/change-provenance.js';
+import { handleCertifyMerge } from './mcp-handlers/merge-semantic-certificate.js';
+import { handleFleetStatus } from './mcp-handlers/fleet-coordination.js';
 import { handleCheckArchitecture } from './mcp-handlers/architecture.js';
 import { handleGenerateChangeProposal, handleAnnotateStory } from './mcp-handlers/change.js';
 import {
@@ -322,6 +326,9 @@ async function dispatchToolImpl(
         declaredFootprint?: import('./mcp-handlers/footprint-escape.js').DeclaredFootprintInput;
         peerFootprints?: import('./mcp-handlers/footprint-escape.js').DeclaredFootprintInput[] };
     return handleStructuralDiff({ directory, baseRef, headRef, maxResults, files, declaredFootprint, peerFootprints });
+  } else if (name === 'verify_change') {
+    const { directory, baseRef } = args as { directory: string; baseRef?: string };
+    return handleVerifyChange({ directory, baseRef });
   } else if (name === 'get_change_coupling') {
     const { directory, file, limit } = args as { directory: string; file?: string; limit?: number };
     return handleGetChangeCoupling({ directory, file, limit });
@@ -474,6 +481,15 @@ async function dispatchToolImpl(
   } else if (name === 'change_impact_certificate') {
     const { directory, baseRef, change, persist, allowBaseFallback } = args as { directory: string; baseRef?: string; change?: string; persist?: boolean; allowBaseFallback?: boolean };
     return computeImpactCertificate({ directory, baseRef, change, persist, allowBaseFallback });
+  } else if (name === 'certify_provenance') {
+    const { directory, baseRef, change, allowBaseFallback, format } = args as { directory: string; baseRef?: string; change?: string; allowBaseFallback?: boolean; format?: 'in-toto' | 'json' };
+    return handleCertifyProvenance({ directory, baseRef, change, allowBaseFallback, format });
+  } else if (name === 'certify_merge') {
+    const { directory, ours, theirs, base, maxFindings } = args as { directory: string; ours: string; theirs: string; base?: string; maxFindings?: number };
+    return handleCertifyMerge({ directory, ours, theirs, base, maxFindings });
+  } else if (name === 'fleet_status') {
+    const { directory, branches } = args as { directory: string; branches?: string[] };
+    return handleFleetStatus({ directory, branches });
   } else if (name === 'detect_changes') {
     const { directory, base } = args as { directory: string; base?: string };
     return handleDetectChanges(directory, base);
