@@ -1,0 +1,702 @@
+/**
+ * `openlore hook <moment>` (change: add-agent-loop-hook-surfaces).
+ *
+ * One command per moment of the agent loop, wired by `openlore install` into the harness's hook
+ * events, so the agent receives OpenLore's deterministic receipts without having to call a tool:
+ *
+ * | Moment        | Claude Code event            | Receipt                                                     |
+ * |---------------|------------------------------|-------------------------------------------------------------|
+ * | `before-edit` | `PreToolUse` (edit tools)    | the target is a generated file: its source and command      |
+ * | `after-tools` | `PostToolUse` (edit tools)   | the edit recorded for the session ledger; new ledger facts; |
+ * |               |                              | generated-file, phantom-reference and check-weakening facts |
+ * |               |                              | for the edited file                                         |
+ * | `before-stop` | `Stop`                       | the `verify_change` receipt for the session's diff, shown   |
+ * |               |                              | to the user; the agent sees it only as a policy block       |
+ * | `after-compact` | `SessionStart` (`compact`)  | the handoff briefing of the in-flight change                |
+ * | `before-subagent` | `PreToolUse` (`Agent|Task`) | nothing: queues the sub-agent's task                      |
+ * | `subagent-start` | `SubagentStart`            | the sub-agent's task-scoped briefing and the board's peers  |
+ *
+ * Every hook reads the harness payload from stdin and prints at most one budgeted receipt as the
+ * event's `additionalContext`; it prints nothing when it has nothing new. A fact already delivered
+ * under the payload's `session_id` is not repeated. Hooks are advisory: they exit 0, and on a
+ * timeout or an error they print nothing. Only a finding code the repository's `enforcement.policy`
+ * makes blocking can block, and only at `before-stop`. A moment is turned off with
+ * `hooks.<moment>: false` in `.openlore/config.json`.
+ */
+
+import { Command } from 'commander';
+import { createHash } from 'node:crypto';
+import { sanitizeForTerminal } from '../../utils/misc.js';
+import { homedir } from 'node:os';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { readStdin } from '../../utils/stdin.js';
+import { withLoggerOptions } from '../../utils/logger.js';
+import { atomicWriteFile } from '../../core/decisions/atomic-store.js';
+import { OPENLORE_DIR } from '../../constants.js';
+
+export const HOOK_MOMENTS = ['before-edit', 'after-tools', 'before-stop', 'after-compact', 'before-subagent', 'subagent-start'] as const;
+export type HookMoment = typeof HOOK_MOMENTS[number];
+
+/** The harness event each moment is wired to (Claude Code). */
+export const HOOK_EVENT: Record<HookMoment, string> = {
+  'before-edit': 'PreToolUse',
+  'after-tools': 'PostToolUse',
+  'before-stop': 'Stop',
+  'after-compact': 'SessionStart',
+  // The parent's Agent/Task call queues the sub-agent's task; SubagentStart briefs the sub-agent.
+  'before-subagent': 'PreToolUse',
+  'subagent-start': 'SubagentStart',
+};
+
+/** Per-moment budget, in characters of the printed receipt (about four characters a token). */
+const BUDGET_CHARS: Record<HookMoment, number> = { 'before-edit': 1600, 'after-tools': 4800, 'before-stop': 8000, 'after-compact': 8000, 'before-subagent': 0, 'subagent-start': 6000 };
+/** Hard time limit per moment; past it the hook prints nothing. */
+const TIMEOUT_MS: Record<HookMoment, number> = { 'before-edit': 8_000, 'after-tools': 15_000, 'before-stop': 50_000, 'after-compact': 30_000, 'before-subagent': 5_000, 'subagent-start': 10_000 };
+const STDIN_MAX_BYTES = 8 * 1024 * 1024;
+const MAX_DELIVERED = 2000;
+
+const SEVERITY_RANK: Record<string, number> = { critical: 0, error: 1, warning: 2, info: 3 };
+
+/** One fact for the receipt. `key` identifies it for the per-session dedupe. */
+export interface HookItem { key: string; severity: string; text: string; next?: string }
+
+export interface HookPayload {
+  sessionId?: string;
+  cwd?: string;
+  toolName?: string;
+  /** Files the tool call writes, as given (absolute or relative). */
+  files: string[];
+  /** The shell command of a shell tool call, and its exit status when the payload carries one. */
+  command?: string;
+  exit?: number;
+  /** The shell call was interrupted before it finished. */
+  interrupted?: boolean;
+  stopHookActive: boolean;
+  /** An Agent/Task tool call: the sub-agent's task and type. */
+  agentPrompt?: string;
+  subagentType?: string;
+  /** A SubagentStart event: the starting sub-agent's type. */
+  agentType?: string;
+  /** An edit tool call's pending change: Write's content, or Edit/MultiEdit's replacements. */
+  edit?: { content?: string; edits?: Array<{ oldString: string; newString: string; replaceAll: boolean }> };
+}
+
+/** Read the fields OpenLore uses from a harness hook payload (Claude Code's shape). */
+export function parseHookPayload(raw: string): HookPayload {
+  let p: Record<string, unknown> = {};
+  try {
+    const v = JSON.parse(raw) as unknown;
+    if (v && typeof v === 'object') p = v as Record<string, unknown>;
+  } catch { /* an unreadable payload is an empty one */ }
+  const input = p.tool_input && typeof p.tool_input === 'object' ? (p.tool_input as Record<string, unknown>) : {};
+  // Codex edits through `apply_patch`: its `command` is the patch text, naming every file it touches.
+  const patch = p.tool_name === 'apply_patch' && typeof input.command === 'string' ? input.command : undefined;
+  const files = patch !== undefined
+    ? patchFiles(patch)
+    : [input.file_path, input.path, input.notebook_path].filter((f): f is string => typeof f === 'string' && f.length > 0);
+  const response = p.tool_response && typeof p.tool_response === 'object' ? (p.tool_response as Record<string, unknown>) : {};
+  let exit = [response.exit_code, response.exitCode, response.returncode, response.code].find((x): x is number => typeof x === 'number' && Number.isInteger(x));
+  // Codex sends a shell result as text: its exit status line, when present, heads the text.
+  if (exit === undefined && typeof p.tool_response === 'string') {
+    const m = /^(?:Exit code: |Process exited with code )(\d+)\b/m.exec(p.tool_response.split('\n', 3).join('\n'));
+    if (m) exit = Number(m[1]);
+  }
+  // Claude Code reports a non-zero shell exit as a tool failure (PostToolUseFailure, `error` text).
+  if (exit === undefined && p.hook_event_name === 'PostToolUseFailure') {
+    const m = typeof p.error === 'string' ? /exit code (\d+)/i.exec(p.error) : null;
+    exit = m ? Number(m[1]) : 1;
+  }
+  return {
+    ...(response.interrupted === true || p.is_interrupt === true ? { interrupted: true } : {}),
+    ...(patch === undefined && typeof input.command === 'string' && input.command ? { command: input.command } : {}),
+    ...(exit !== undefined ? { exit } : {}),
+    ...(typeof p.session_id === 'string' && p.session_id ? { sessionId: p.session_id } : {}),
+    ...(typeof p.cwd === 'string' && p.cwd ? { cwd: p.cwd } : {}),
+    ...(typeof p.tool_name === 'string' ? { toolName: p.tool_name } : {}),
+    files: files.slice(0, patch !== undefined ? MAX_PATCH_FILES : 1),
+    stopHookActive: p.stop_hook_active === true,
+    ...(typeof input.prompt === 'string' && input.prompt ? { agentPrompt: input.prompt } : {}),
+    ...(typeof input.subagent_type === 'string' && input.subagent_type ? { subagentType: input.subagent_type } : {}),
+    ...(typeof p.agent_type === 'string' && p.agent_type ? { agentType: p.agent_type } : {}),
+    ...pendingEdit(input),
+  };
+}
+
+/** Files of one patch recorded and checked (a larger patch is a bulk change). */
+const MAX_PATCH_FILES = 200;
+
+/** The files a Codex `apply_patch` patch adds, updates, deletes, or moves to, in order, once each. */
+export function patchFiles(patch: string): string[] {
+  const out = new Set<string>();
+  for (const line of patch.split(/\r?\n/)) {
+    const m = /^\s*\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$/.exec(line);
+    if (m && m[1]) out.add(m[1]);
+  }
+  return [...out];
+}
+
+/** The pending change an edit tool call carries (Claude Code's Write, Edit, and MultiEdit inputs). */
+function pendingEdit(input: Record<string, unknown>): Pick<HookPayload, 'edit'> {
+  if (typeof input.content === 'string') return { edit: { content: input.content } };
+  const one = (e: unknown) => {
+    const x = e as Record<string, unknown> | null;
+    return x && typeof x.old_string === 'string' && typeof x.new_string === 'string'
+      ? { oldString: x.old_string, newString: x.new_string, replaceAll: x.replace_all === true } : null;
+  };
+  const list = Array.isArray(input.edits) ? input.edits.map(one) : [one(input)];
+  if (!list.length || list.some(e => e === null)) return {};
+  return { edit: { edits: list as Array<{ oldString: string; newString: string; replaceAll: boolean }> } };
+}
+
+/**
+ * The text a pending edit would produce from `current` (null: the file does not exist), or undefined
+ * when it cannot be told exactly — an old string that is absent or (without replace-all) not unique,
+ * as the edit tool itself would refuse it.
+ */
+export function applyPendingEdit(current: string | null, edit: NonNullable<HookPayload['edit']>): string | undefined {
+  if (edit.content !== undefined) return edit.content;
+  if (!edit.edits) return undefined;
+  // An Edit with an empty old string creates the file (or fills an empty one).
+  if (edit.edits.length === 1 && !edit.edits[0].oldString && (current === null || current === '')) return edit.edits[0].newString;
+  if (current === null) return undefined;
+  const apply = (start: string): string | undefined => {
+    let text = start;
+    for (const e of edit.edits!) {
+      if (!e.oldString) return undefined;
+      // Occurrences as the tool counts them (non-overlapping).
+      const parts = text.split(e.oldString);
+      if (parts.length < 2 || (!e.replaceAll && parts.length > 2)) return undefined;
+      text = parts.join(e.newString);
+    }
+    return text;
+  };
+  // The edit tool matches a CRLF file's text with LF line ends.
+  return apply(current) ?? (current.includes('\r\n') ? apply(current.replace(/\r\n/g, '\n')) : undefined);
+}
+
+/**
+ * A payload path as a root-relative path with forward slashes, or `undefined` when it is outside
+ * the repository. The file need not exist yet (a `Write` of a new file).
+ */
+export function repoPath(root: string, file: string): string | undefined {
+  // A file not written yet resolves through its nearest existing parent.
+  const real = (p: string): string => {
+    try { return realpathSync(p); } catch {
+      const parent = dirname(p);
+      return parent === p ? p : join(real(parent), basename(p));
+    }
+  };
+  const abs = real(isAbsolute(file) ? file : resolve(root, file));
+  const rel = relative(real(root), abs);
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+  return rel.split(sep).join('/');
+}
+
+/** Keep the most severe items within the budget; the rest are counted. */
+export function renderReceipt(moment: HookMoment, items: HookItem[], budgetChars = BUDGET_CHARS[moment]): string | null {
+  return renderShown(moment, items, budgetChars).text;
+}
+
+/** The receipt and the keys of the items it shows (only those count as delivered). */
+function renderShown(moment: HookMoment, items: HookItem[], budgetChars = BUDGET_CHARS[moment]): { text: string | null; shown: string[] } {
+  if (!items.length) return { text: null, shown: [] };
+  const sorted = [...items].sort((a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9));
+  const header = `[openlore ${moment}]`;
+  const lines: string[] = [];
+  let used = header.length;
+  let omitted = 0;
+  const shown: string[] = [];
+  for (const it of sorted) {
+    const line = `- ${it.text}${it.next ? ` (next action: ${it.next})` : ''}`;
+    if (used + line.length + 1 > budgetChars) { omitted++; continue; }
+    lines.push(line);
+    shown.push(it.key);
+    used += line.length + 1;
+  }
+  if (!lines.length) return { text: null, shown: [] };
+  if (omitted) lines.push(`- ${omitted} more fact(s) not shown (budget); they are stated on a later call.`);
+  return { text: `${header}\n${lines.join('\n')}`, shown };
+}
+
+function deliveredDir(root: string): string {
+  return join(root, OPENLORE_DIR, 'session-ledger', 'hook-delivered');
+}
+
+function deliveredPath(root: string, sessionId: string): string {
+  const id = createHash('sha256').update(sessionId).digest('hex').slice(0, 24);
+  return join(deliveredDir(root), `${id}.json`);
+}
+
+/** Per harness session: the facts already delivered, and the commit the session started from. */
+interface SessionRecord { keys: Set<string>; startHead?: string }
+
+function readSession(root: string, sessionId: string | undefined): SessionRecord {
+  if (!sessionId) return { keys: new Set() };
+  try {
+    const v = JSON.parse(readFileSync(deliveredPath(root, sessionId), 'utf-8')) as { keys?: unknown; startHead?: unknown } | unknown[];
+    // Fail-open on an older or foreign shape.
+    const keys = Array.isArray(v) ? v : Array.isArray((v as { keys?: unknown }).keys) ? (v as { keys: unknown[] }).keys : [];
+    const head = Array.isArray(v) ? undefined : (v as { startHead?: unknown }).startHead;
+    return { keys: new Set(keys.filter((x): x is string => typeof x === 'string')), ...(typeof head === 'string' && /^[0-9a-f]{40,64}$/.test(head) ? { startHead: head } : {}) };
+  } catch {
+    return { keys: new Set() };
+  }
+}
+
+/**
+ * Write the session record, merged with what a concurrent hook of the same session wrote meanwhile
+ * (the harness runs matching hooks in parallel). Records untouched for a week are removed.
+ */
+async function writeSession(root: string, sessionId: string | undefined, rec: SessionRecord): Promise<void> {
+  if (!sessionId) return;
+  try {
+    const now = readSession(root, sessionId);
+    const keys = [...new Set([...now.keys, ...rec.keys])].slice(-MAX_DELIVERED);
+    await atomicWriteFile(deliveredPath(root, sessionId), JSON.stringify({ startHead: now.startHead ?? rec.startHead, keys }));
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    for (const n of readdirSync(deliveredDir(root))) {
+      try { if (statSync(join(deliveredDir(root), n)).mtimeMs < cutoff) unlinkSync(join(deliveredDir(root), n)); } catch { /* raced */ }
+    }
+  } catch { /* dedupe is best-effort: at worst a fact is said twice */ }
+}
+
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf899d15f71049056';
+
+/**
+ * What this session's facts compare with: its start commit, when every move of HEAD since then was
+ * a commit (the session's own work). A checkout, pull, merge, reset, or rebase since then brings in
+ * work that is not the session's, so the facts compare with HEAD from that point. Unknown (no HEAD
+ * yet): the empty tree.
+ */
+async function sessionBaseline(root: string, startHead: string): Promise<string | undefined> {
+  const head = await headSha(root);
+  if (!head) return startHead === EMPTY_TREE ? EMPTY_TREE : undefined;
+  if (startHead === EMPTY_TREE || startHead === head) return startHead;
+  try {
+    const { execFileGit } = await import('../../utils/git-exec.js');
+    const log = String((await execFileGit('git', ['reflog', '--format=%H %gs', '-n', '500', 'HEAD'], { cwd: root })).stdout).split('\n');
+    for (const line of log) {
+      const [sha, ...rest] = line.split(' ');
+      if (sha === startHead) return startHead; // reached the start: only commits since
+      if (!/^commit\b/.test(rest.join(' '))) return head;
+    }
+  } catch { /* no reflog: compare with HEAD */ }
+  return head;
+}
+
+async function headSha(root: string): Promise<string | undefined> {
+  try {
+    const { execFileGit } = await import('../../utils/git-exec.js');
+    const sha = String((await execFileGit('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root })).stdout).trim();
+    return /^[0-9a-f]{40,64}$/.test(sha) ? sha : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Where `root` sits in its git repository (`packages/app/`), so git-based checks get repo paths. */
+async function repoPrefix(root: string): Promise<string> {
+  const { getRepoPrefix } = await import('../../core/drift/git-diff.js');
+  return (await getRepoPrefix(root)) ?? '';
+}
+
+/** `before-edit`: the target is generated, vendored, or a lockfile. Reads headers; writes nothing. */
+async function beforeEdit(root: string, files: string[], edit?: HookPayload['edit']): Promise<HookItem[]> {
+  const { classifyGeneratedFiles } = await import('../../core/services/generated-file-guard.js');
+  const { facts } = await classifyGeneratedFiles(root, files);
+  const items: HookItem[] = [...facts.values()].map(f => ({
+    key: `generated:${f.file}`,
+    severity: 'warning',
+    text: generatedText(f),
+    ...(f.kind !== 'lockfile' ? { next: f.regenerateWith !== 'unknown' ? `regenerate with \`${f.regenerateWith}\`` : 'edit the source and regenerate' } : {}),
+  }));
+  if (edit && files.length === 1) {
+    // Bounded on its own: the generated-file facts above never wait on it.
+    let timer: NodeJS.Timeout | undefined;
+    const limit = new Promise<HookItem[]>(r => { timer = setTimeout(() => r([]), PENDING_CHECK_MS); timer.unref?.(); });
+    items.push(...(await Promise.race([pendingReferences(root, files[0], edit).catch(() => []), limit])));
+    if (timer) clearTimeout(timer);
+  }
+  return items;
+}
+
+/** Time for the pending-edit reference check, inside the before-edit moment's limit. */
+const PENDING_CHECK_MS = 5_000;
+/** Pending-edit facts per call: the budget keeps room for the generated-file facts. */
+const MAX_PENDING_FACTS = 3;
+/** The size the after-write check reads (`phantom-references` MAX_FILE_BYTES): the same files are graded. */
+const MAX_PENDING_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The references a pending edit would add that do not resolve, graded on the pending text in memory
+ * before the tool writes it. Same finding keys as after-tools, so a fact is stated once.
+ */
+async function pendingReferences(root: string, file: string, edit: NonNullable<HookPayload['edit']>): Promise<HookItem[]> {
+  const { readFileConfined } = await import('../../utils/path-confinement.js');
+  let current: string | null;
+  try { current = await readFileConfined(root, file, MAX_PENDING_BYTES); } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') return [];
+    current = null;
+  }
+  const next = applyPendingEdit(current, edit);
+  if (next === undefined || next === current || Buffer.byteLength(next) > MAX_PENDING_BYTES) return [];
+  const prefix = await repoPrefix(root);
+  const { classifyFile } = await import('../../core/drift/git-diff.js');
+  const path = prefix + file;
+  const changed = [{ path, status: current === null ? 'added' as const : 'modified' as const, additions: 0, deletions: 0, ...classifyFile(path) }];
+  const { checkPhantomReferences } = await import('../../core/services/phantom-references.js');
+  const r = await checkPhantomReferences(root, 'HEAD', changed, undefined, { head: new Map([[file, next]]), base: new Map([[file, current]]) }).catch(() => undefined);
+  // Own keys: a denied or failed edit must not silence the after-write fact of a later, real one.
+  return (r?.findings ?? []).slice(0, MAX_PENDING_FACTS).map(f => f.code === 'unresolved-internal-import'
+    // The module may be the agent's next write: a pending state, not yet an error.
+    ? { key: `pending:${f.code}:${f.location?.path ?? ''}:${f.subject}`, severity: 'warning', text: `Before the write: ${f.message.replace(/, which is not a module in this repository/, ', which does not exist yet')}`, next: 'create that module, or fix the path' }
+    : { key: `pending:${f.code}:${f.location?.path ?? ''}:${f.subject}`, severity: f.severity, text: `Before the write: ${f.message}`, ...(f.remediation ? { next: f.remediation } : {}) });
+}
+
+function generatedText(f: { file: string; kind: string; generatedFrom: string[] | 'unknown'; matched: string }): string {
+  if (f.kind === 'lockfile') return `${f.file} is a lockfile; its manifest and the package manager produce it.`;
+  const from = f.generatedFrom !== 'unknown' && f.generatedFrom.length ? `, from ${f.generatedFrom.join(', ')}` : ' (source not named)';
+  return `${f.file} is ${f.kind === 'vendored' ? 'vendored' : 'generated'} (${f.matched})${from}; a hand edit is lost when it is regenerated.`;
+}
+
+/**
+ * `after-tools`: record the agent's edit for the session ledger, then the facts new since the last
+ * delivery — the live ledger's background changes and edit loops, and for the edited file its
+ * generated-file, phantom-reference and check-weakening findings.
+ */
+async function afterTools(root: string, files: string[], baseline: string | undefined): Promise<HookItem[]> {
+  const items: HookItem[] = [];
+  const { recordAgentEdit, readLiveLedger } = await import('../../core/services/session-ledger.js');
+  for (const f of files) recordAgentEdit(root, f);
+
+  const live = readLiveLedger(root);
+  if ('ledger' in live) {
+    for (const c of live.ledger.backgroundChanges) {
+      items.push({ key: `bg:${c.id}@${c.changedAt}`, severity: 'warning', text: `${c.name} (${c.file}) changed since this session read it (another process's edit).` });
+    }
+    for (const o of live.ledger.editOscillation) {
+      items.push({ key: `loop:${o.id}#${o.returns}`, severity: 'warning', text: `${o.name} (${o.file}) returned to an earlier version ${o.returns} times this session.` });
+    }
+  }
+  // A peer changed a symbol this worktree's agent declared it reads or was served (changes:
+  // add-peer-change-notices, add-peer-notices-served-set-and-fleet-records).
+  try {
+    const { peerChangeNotices } = await import('../../core/services/peer-notices.js');
+    const { emittedText: t } = await import('../../core/services/generated-file-guard.js');
+    for (const n of await peerChangeNotices(root)) {
+      items.push({
+        key: `peer:${n.peer.actorId}:${n.repoPath}#${n.symbol}`,
+        severity: 'warning',
+        // Board fields are peer-written: screened before they reach the agent.
+        text: sanitizeForTerminal(`Peer ${t(n.peer.actorId)} (${t(n.peer.branch || 'detached')} in ${t(n.peer.worktree)}) changed ${t(n.symbol)} (${t(n.file)}), which ${n.via === 'served' ? 'was served in this worktree' : 'an agent in this worktree declared reading'} at ${t(n.at).slice(11, 16)} UTC.`),
+        next: `re-read ${t(n.symbol)} before relying on it`,
+      });
+    }
+  } catch { /* the board is optional */ }
+  if (!files.length) return items;
+
+  items.push(...(await beforeEdit(root, files)));
+
+  if (!baseline) return items; // no commit to compare with (an unborn branch)
+  // Compared with the commit this harness session started from: a finding in an earlier commit is
+  // not this session's, and is not raised again in every session.
+  const prefix = await repoPrefix(root);
+  const repoFiles = files.map(f => prefix + f);
+  const { classifyFile } = await import('../../core/drift/git-diff.js');
+  const changed = repoFiles.map(path => ({ path, status: 'modified' as const, additions: 0, deletions: 0, ...classifyFile(path) }));
+  const { checkPhantomReferences } = await import('../../core/services/phantom-references.js');
+  const phantom = await checkPhantomReferences(root, baseline, changed).catch(() => undefined);
+  for (const f of phantom?.findings ?? []) {
+    items.push({ key: `${f.code}:${f.location?.path ?? ''}:${f.subject}`, severity: f.severity, text: f.message, ...(f.remediation ? { next: f.remediation } : {}) });
+  }
+
+  const { checkWeakening } = await import('../../core/services/check-weakening.js');
+  // The repository top, derived from this root and its prefix (git's own spelling of the path can
+  // differ on Windows: forward slashes, a long name for an 8.3 one).
+  const top = resolve(root, ...prefix.split('/').filter(Boolean).map(() => '..'));
+  const weak = top ? await checkWeakening({ root: top, baseRef: baseline, files: repoFiles }).catch(() => undefined) : undefined;
+  for (const f of weak?.findings ?? []) items.push({ key: `${f.code}:${f.subject}:${f.discriminator ?? ''}`, severity: f.severity, text: f.message });
+  return items;
+}
+
+/**
+ * `before-stop`: the `verify_change` receipt. Blocks only when `enforcement.policy` makes one of its
+ * findings blocking, and never twice in a row (`stop_hook_active`).
+ */
+/**
+ * The symbols this session edited after its last observed test run, and the tests that reach them
+ * (change: add-session-ledger-runs-contracts-tokens). OpenLore runs no test.
+ */
+async function testRunItem(root: string, sessionId: string | undefined): Promise<HookItem | undefined> {
+  if (!sessionId) return undefined;
+  const { editsAfterLastRun } = await import('../../core/services/test-run-ledger.js');
+  const r = await editsAfterLastRun(root, sessionId);
+  if (!r) return undefined;
+  const when = (t: number) => new Date(t).toISOString().slice(11, 16);
+  const shellNote = 'Edits made through shell commands are not tracked.';
+  if (r.kind === 'not-observed') {
+    return { key: 'test-runs:not-observed', severity: 'info', text: 'Test runs are not observed in this session (no shell command reached the after-tools hook), so edits after the last run are not stated.' };
+  }
+  if (r.kind === 'no-run') {
+    const files = r.files!.slice(0, 5).join(', ');
+    return {
+      key: `test-runs:none:${r.files!.length}`, severity: 'warning',
+      text: `No completed test run was observed this session after editing ${files}${r.files!.length > 5 ? ` and ${r.files!.length - 5} more` : ''}${r.interruptedSince ? ` (${r.interruptedSince} run(s) were interrupted)` : ''}.`,
+      next: 'run the tests that reach these files',
+    };
+  }
+  const run = r.lastRun!;
+  const runText = `\`${run.command.slice(0, 80)}\` at ${when(run.at)} UTC${run.exit !== undefined ? `, exit ${run.exit}` : ''}`;
+  if (r.kind === 'clean') {
+    return run.exit !== undefined && run.exit !== 0
+      ? { key: `test-runs:failed:${run.at}`, severity: 'warning', text: `The last test run (${runText}) failed, and nothing was edited after it.`, next: 'fix the failure and rerun' }
+      : undefined;
+  }
+  const symbols = r.symbols ?? [];
+  const parts: string[] = [];
+  if (symbols.length) parts.push(`${symbols.slice(0, 8).map(s => `${s.name} (${s.file})${s.removed ? ' [removed]' : ''}`).join(', ')}${symbols.length > 8 ? ` and ${symbols.length - 8} more` : ''}`);
+  if (r.undetermined?.length) parts.push(`${r.undetermined.slice(0, 5).join(', ')} (which symbols is not determined)`);
+  // Only names the index knows exactly: a fuzzy name would seed tests for other symbols.
+  let testText: string;
+  try {
+    const { readCachedContext } = await import('../../core/services/mcp-handlers/utils.js');
+    const ctx = await readCachedContext(root);
+    const known = new Set((ctx?.callGraph?.nodes ?? []).map(n => n.name));
+    const names = [...new Set(symbols.filter(s => !s.removed).map(s => s.name))].filter(n => known.has(n));
+    const unknown = symbols.filter(s => !s.removed && !known.has(s.name)).length;
+    if (!ctx?.callGraph) testText = ' Tests that reach them are not computed (no index: run `openlore analyze`).';
+    else if (!names.length) testText = unknown ? ' Tests that reach them are not computed (the symbols are not in the index yet).' : '';
+    else {
+      const { handleSelectTests } = await import('../../core/services/mcp-handlers/test-impact.js');
+      const sel = await handleSelectTests({ directory: root, changedSymbols: names.slice(0, 50) }) as { selectedTests?: Array<{ test: string; file: string }>; error?: string };
+      if (sel.error || !sel.selectedTests) testText = ` Tests that reach them are not computed (${sel.error ?? 'no result'}).`;
+      else {
+        const tests = [...new Set(sel.selectedTests.map(t => `${t.file} › ${t.test}`))];
+        testText = tests.length
+          ? ` Tests that reach them: ${tests.slice(0, 6).join(', ')}${tests.length > 6 ? ` and ${tests.length - 6} more` : ''}.`
+          : ' No indexed test reaches them.';
+        if (unknown) testText += ` ${unknown} symbol(s) are not in the index yet.`;
+      }
+    }
+  } catch (e) {
+    testText = ` Tests that reach them are not computed (${e instanceof Error ? e.message.split('\n')[0] : String(e)}).`;
+  }
+  const keyBase = [...symbols.map(s => `${s.file}#${s.name}`), ...(r.undetermined ?? [])].join('\0');
+  return {
+    key: `test-runs:after:${run.at}:${createHash('sha256').update(keyBase).digest('hex').slice(0, 12)}`,
+    severity: 'warning',
+    text: sanitizeForTerminal(`Edited after the last test run (${runText}): ${parts.join('; ')}.${testText}${r.interruptedSince ? ` ${r.interruptedSince} later run(s) were interrupted.` : ''} ${shellNote}`),
+    next: 'rerun the tests that reach these edits',
+  };
+}
+
+async function beforeStop(root: string, baseline: string | undefined, sessionId?: string): Promise<{ items: HookItem[]; block?: string }> {
+  const runItem = await testRunItem(root, sessionId).catch(() => undefined);
+  const { handleVerifyChange } = await import('../../core/services/mcp-handlers/verify-change.js');
+  const r = await handleVerifyChange({ directory: root, ...(baseline ? { baseRef: baseline } : {}) }) as {
+    error?: string;
+    items?: Array<{ subject: string; check: string; severity: string; nextAction: string }>;
+    findings?: Array<{ code: string; subject: string; message: string; enforcementClass?: string; remediation?: string }>;
+    gated?: boolean;
+  };
+  if (r.error) return { items: runItem ? [runItem] : [] };
+  const items: HookItem[] = (r.items ?? []).map(i => ({ key: `${i.check}:${i.subject}`, severity: i.severity, text: `${i.subject} [${i.check}]`, next: i.nextAction }));
+  if (runItem) items.push(runItem);
+  const blocking = (r.findings ?? []).filter(f => f.enforcementClass === 'blocking');
+  if (!r.gated || !blocking.length) return { items };
+  const reason = [
+    `[openlore before-stop] ${blocking.length} finding(s) are blocking under this repository's enforcement.policy:`,
+    ...blocking.map(f => `- ${f.code}: ${f.message}${f.remediation ? ` (next action: ${f.remediation})` : ''}`),
+  ].join('\n');
+  return { items, block: reason };
+}
+
+/**
+ * The nearest directory at or above `start` that has `.openlore`, within the same repository: the
+ * walk stops at the repository's top (a `.git` entry) and never accepts the home directory, whose
+ * `~/.openlore` is OpenLore's user-level store, not a project.
+ */
+function openloreRoot(start: string): string | undefined {
+  const home = resolve(process.env.OPENLORE_HOME ?? homedir());
+  for (let dir = start; ; dir = dirname(dir)) {
+    if (dir === home) return undefined;
+    if (existsSync(join(dir, OPENLORE_DIR))) return dir;
+    if (existsSync(join(dir, '.git')) || dirname(dir) === dir) return undefined;
+  }
+}
+
+/**
+ * `subagent-start`: the starting sub-agent's task-scoped briefing (its task as queued by
+ * `before-subagent`) and the live peers on the footprint board. Not deduplicated: each sub-agent is
+ * a fresh context.
+ */
+async function subagentStart(root: string, payload: HookPayload, timeoutMs: number): Promise<HookRunResult> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<'timeout'>(r => { timer = setTimeout(() => r('timeout'), timeoutMs); timer.unref?.(); });
+  try {
+    const work = withLoggerOptions({ quiet: true }, async () => {
+      const { takeSubagentTask, subagentBriefing } = await import('../../core/services/subagent-briefing.js');
+      const prompt = await takeSubagentTask(root, { sessionId: payload.sessionId, agentType: payload.agentType }).catch(() => undefined);
+      return subagentBriefing(root, prompt, BUDGET_CHARS['subagent-start']);
+    });
+    const text = await Promise.race([work, timeout]);
+    if (text === 'timeout' || !text) return { stdout: '', exitCode: 0 };
+    const capped = sanitizeForTerminal(text, { keepNewlines: true }).slice(0, BUDGET_CHARS['subagent-start']).replace(/[\uD800-\uDBFF]$/, '');
+    return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: capped } }), exitCode: 0 };
+  } catch {
+    return { stdout: '', exitCode: 0 };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * `after-compact`: the handoff briefing, so the agent resumes from the computed state of its change
+ * rather than the compaction summary alone. Stated after every compaction (not deduplicated).
+ */
+async function afterCompact(root: string, timeoutMs: number): Promise<HookRunResult> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<'timeout'>(r => { timer = setTimeout(() => r('timeout'), timeoutMs); timer.unref?.(); });
+  try {
+    const work = withLoggerOptions({ quiet: true }, async () => {
+      const { handleGetHandoffBriefing, renderHandoff } = await import('../../core/services/mcp-handlers/handoff.js');
+      return renderHandoff(await handleGetHandoffBriefing({ directory: root }));
+    });
+    const text = await Promise.race([work, timeout]);
+    if (text === 'timeout' || !text) return { stdout: '', exitCode: 0 };
+    return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text.slice(0, BUDGET_CHARS['after-compact']).replace(/[\uD800-\uDBFF]$/, '') } }), exitCode: 0 };
+  } catch {
+    return { stdout: '', exitCode: 0 };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Whether task-scoped context injection is turned off (`contextInjection.mode: "off"`). */
+function injectionOff(root: string): boolean {
+  try {
+    const cfg = JSON.parse(readFileSync(join(root, OPENLORE_DIR, 'config.json'), 'utf-8')) as { contextInjection?: { mode?: string } };
+    return cfg?.contextInjection?.mode === 'off';
+  } catch { return false; }
+}
+
+/** Whether `hooks.<moment>` is turned off in `.openlore/config.json` (an unreadable config is "on"). */
+function momentDisabled(root: string, moment: HookMoment): boolean {
+  try {
+    const cfg = JSON.parse(readFileSync(join(root, OPENLORE_DIR, 'config.json'), 'utf-8')) as { hooks?: Record<string, unknown> };
+    return cfg?.hooks?.[moment] === false;
+  } catch {
+    return false;
+  }
+}
+
+export interface HookRunResult { stdout: string; exitCode: 0 }
+
+/**
+ * Run one moment over a payload. Never throws and always exits 0: a timeout or an error prints
+ * nothing. Exported for tests; the CLI prints `stdout`.
+ */
+export async function runHook(moment: HookMoment, raw: string, opts: { cwd?: string; timeoutMs?: number } = {}): Promise<HookRunResult> {
+  const silent: HookRunResult = { stdout: '', exitCode: 0 };
+  const payload = parseHookPayload(raw);
+  // The OpenLore root: the nearest directory at or above the session's working directory (the agent
+  // may have `cd`-ed into a subdirectory) that has `.openlore`. None: nothing to say.
+  const start = resolve(payload.cwd ?? opts.cwd ?? process.cwd());
+  // The working directory first; when it is above the project (a monorepo top), the edited file's.
+  const root = openloreRoot(start) ?? (payload.files[0] ? openloreRoot(dirname(resolve(start, payload.files[0]))) : undefined);
+  if (!root) return silent;
+  if (momentDisabled(root, moment)) return silent;
+  if (moment === 'before-stop' && payload.stopHookActive) return silent;
+  if (moment === 'after-compact') return afterCompact(root, opts.timeoutMs ?? TIMEOUT_MS[moment]);
+  if (moment === 'before-subagent') {
+    // Nothing reads the queue when sub-agent briefings or task injection are off: nothing is stored.
+    if ((payload.toolName === 'Agent' || payload.toolName === 'Task') && payload.agentPrompt && !momentDisabled(root, 'subagent-start') && !injectionOff(root)) {
+      const { queueSubagentTask } = await import('../../core/services/subagent-briefing.js');
+      let timer: NodeJS.Timeout | undefined;
+      // Bounded: a held queue lock must never stall the parent's Agent call.
+      const limit = new Promise<void>(r => { timer = setTimeout(r, opts.timeoutMs ?? TIMEOUT_MS[moment]); timer.unref?.(); });
+      await Promise.race([withLoggerOptions({ quiet: true }, () => queueSubagentTask(root, { sessionId: payload.sessionId, agentType: payload.subagentType, prompt: payload.agentPrompt! })).catch(() => undefined), limit]);
+      if (timer) clearTimeout(timer);
+    }
+    return silent; // only queues: the parent's tool call gets no output
+  }
+  if (moment === 'subagent-start') return subagentStart(root, payload, opts.timeoutMs ?? TIMEOUT_MS[moment]);
+  // A relative path is the harness's, from its working directory (Codex patches), not the root's.
+  const files = payload.files.map(f => repoPath(root, resolve(start, f))).filter((f): f is string => !!f);
+  // A shell command (after-tools sees them too): count it and record a test run, nothing else, so a
+  // shell call stays cheap.
+  if (moment === 'after-tools' && payload.command !== undefined && !files.length) {
+    if (payload.sessionId) {
+      const { recordShellCommand } = await import('../../core/services/test-run-ledger.js');
+      await withLoggerOptions({ quiet: true }, () => recordShellCommand(root, payload.sessionId!, payload.command!, payload.exit, payload.interrupted === true)).catch(() => undefined);
+    }
+    return silent;
+  }
+  if (moment === 'before-edit' && !files.length) return silent;
+
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<'timeout'>(r => { timer = setTimeout(() => r('timeout'), opts.timeoutMs ?? TIMEOUT_MS[moment]); timer.unref?.(); });
+  try {
+    const session = readSession(root, payload.sessionId);
+    // The commit this session started from: recorded by its first hook (git's empty tree on an
+    // unborn branch), reused by every later one.
+    if (!session.startHead) session.startHead = (await headSha(root)) ?? EMPTY_TREE;
+    const baseline = await sessionBaseline(root, session.startHead);
+    // Quiet: the hook's stdout is the harness's JSON channel, so no log line may reach it.
+    const work = withLoggerOptions({ quiet: true }, async () => {
+      const runs = await import('../../core/services/test-run-ledger.js');
+      if (moment === 'before-edit') {
+        if (payload.sessionId) await runs.recordEditIntent(root, payload.sessionId, files).catch(() => undefined);
+        return { items: await beforeEdit(root, files, payload.edit) };
+      }
+      if (moment === 'after-tools') {
+        if (payload.sessionId) await runs.recordEdits(root, payload.sessionId, files).catch(() => undefined);
+        return { items: await afterTools(root, files, baseline) };
+      }
+      return beforeStop(root, baseline, payload.sessionId);
+    });
+    const done = await Promise.race([work, timeout]);
+    if (done === 'timeout') return silent;
+    if ('block' in done && done.block) {
+      return { stdout: JSON.stringify({ decision: 'block', reason: done.block }), exitCode: 0 };
+    }
+    const { text, shown } = renderShown(moment, done.items.filter(i => !session.keys.has(i.key)));
+    if (!text) { await writeSession(root, payload.sessionId, session); return silent; }
+    for (const k of shown) session.keys.add(k);
+    await writeSession(root, payload.sessionId, session);
+    // At Stop, context for the model makes it continue working; the advisory receipt is for the
+    // user instead. Only a policy block reaches the model at Stop.
+    if (moment === 'before-stop') return { stdout: JSON.stringify({ systemMessage: text }), exitCode: 0 };
+    return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: HOOK_EVENT[moment], additionalContext: text } }), exitCode: 0 };
+  } catch {
+    return silent;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export const hookCommand = new Command('hook')
+  .description('Print the receipt for one moment of the agent loop (wired by `openlore install` into harness hooks)')
+  .argument('<moment>', `one of: ${HOOK_MOMENTS.join(', ')}`)
+  .option('--harness <name>', 'the harness that runs the hook (claude-code, codex); wired by install')
+  .addHelpText('after', `
+Reads the harness hook payload on stdin and prints at most one receipt as the event's
+additionalContext. Prints nothing when there is nothing new; always exits 0. Turn a moment off with
+"hooks": { "<moment>": false } in .openlore/config.json.
+`)
+  .action(async (moment: string, options: { harness?: string }) => {
+    if (!(HOOK_MOMENTS as readonly string[]).includes(moment)) process.exit(0);
+    let raw = '';
+    try { raw = await readStdin(process.stdin, 1500, STDIN_MAX_BYTES); } catch { /* no payload */ }
+    // Anything a dependency prints while the receipt is computed is dropped: stdout must carry
+    // exactly one JSON object (or nothing) for the harness to parse.
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    let r: HookRunResult;
+    try { r = await runHook(moment as HookMoment, raw); } finally { process.stdout.write = write; }
+    if (r.stdout) write(r.stdout + '\n');
+    // Codex expects JSON from a Stop hook that exits 0; an empty object says nothing.
+    else if (options.harness === 'codex' && moment === 'before-stop') write('{}\n');
+    process.exit(0);
+  });

@@ -14,6 +14,8 @@
  * → suggest_insertion_points manually.
  */
 
+import { classifyGeneratedFiles, type GeneratedFileFact } from '../generated-file-guard.js';
+import { toolIsWired } from './active-surface.js';
 import { join, relative } from 'node:path';
 import { readFile, stat } from 'node:fs/promises';
 import { ANALYSIS_ARTIFACT_MAX_BYTES, readArtifactBounded } from '../../../utils/bounded-artifact-read.js';
@@ -24,8 +26,9 @@ import { expandHandle, omissionNote } from './progressive.js';
 import { readOpenLoreConfig } from '../config-manager.js';
 import { repairStatusFor, repairDisclosureText } from '../cold-start-bootstrap.js';
 import { isIacLanguage } from '../../analyzer/iac/types.js';
+import { isContractLanguage } from '../../analyzer/contract/types.js';
 import type { RagManifest } from '../../generator/rag-manifest-generator.js';
-import { ARTIFACT_RAG_MANIFEST, ARTIFACT_STYLE_FINGERPRINT, ORIENT_BUDGET_CANDIDATE_POOL } from '../../../constants.js';
+import { ARTIFACT_RAG_MANIFEST, ARTIFACT_STYLE_FINGERPRINT, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ORIENT_BUDGET_CANDIDATE_POOL } from '../../../constants.js';
 import { fitPayloadToBudget } from './budget-fit.js';
 import { estimateTokens } from '../llm-service.js';
 import { loadArchitectureRules } from '../../architecture/rules.js';
@@ -153,8 +156,9 @@ interface OrientFunction {
 interface CallNeighbour {
   name: string;
   filePath: string;
-  /** Present only for infrastructure neighbors (IaC resources) — spec-17 cross-domain. */
-  domain?: 'infra';
+
+  /** Set when the neighbour is a projected declaration, not code: infrastructure or a contract. */
+  domain?: 'infra' | 'contract';
   /** The synthesis rule, when only a synthesized edge links this neighbour (a message or event hop, not a call). */
   via?: string;
   provenance: AnalysisContentProvenance;
@@ -206,6 +210,33 @@ interface InlineSpec {
 // HANDLER
 // ============================================================================
 
+/**
+ * How many spec domains the corpus holds, for the one question `specDomains: []` cannot answer on
+ * its own: is this repository ungoverned, or is the link index simply not built? A local,
+ * depth-bounded scan on purpose — no cross-module dependency for a directory probe, and every
+ * failure is "no disclosure" rather than a broken orient (change: fix-governance-face-dark).
+ */
+async function countSpecDomains(absDir: string, openspecPath?: string): Promise<number> {
+  try {
+    const { readdir } = await import('node:fs/promises');
+    const specsDir = join(absDir, openspecPath ?? OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR);
+    const walk = async (dir: string, depth: number): Promise<number> => {
+      if (depth > 3) return 0;
+      let found = 0;
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name === 'spec.md') found++;
+        else if (entry.isDirectory() && !entry.name.startsWith('.')) {
+          found += await walk(join(dir, entry.name), depth + 1);
+        }
+      }
+      return found;
+    };
+    return await walk(specsDir, 0);
+  } catch {
+    return 0;
+  }
+}
+
 export async function handleOrient(
   directory: string,
   task: string,
@@ -238,7 +269,7 @@ export async function handleOrient(
   if (!hasCodeIndex) {
     return {
       ...notReadyResult('No analysis found. Run "openlore analyze" first.', 'index-absent'),
-      hint: 'Plain "openlore analyze" builds a keyword (BM25) index that orient can use; add EMBED_* (or --embed) for semantic search.',
+      hint: 'Plain "openlore analyze" builds a keyword (BM25) index that orient can use.',
     };
   }
 
@@ -252,7 +283,7 @@ export async function handleOrient(
   // internal score-scale token (bounded `hybrid` vs unbounded keyword) for the
   // relevance gate; `retrievalMode` is the honest, human-facing mode.
   const cfg = await readOpenLoreConfig(absDir);
-  const embedSvc = await resolveEmbedder(cfg);
+  const embedSvc = await resolveEmbedder(cfg, outputDir);
   const vocabularyExpansion = cfg?.retrieval?.vocabularyExpansion !== false;
   let retrievalMode = servedRetrievalMode(embedSvc, outputDir, 'code', vocabularyExpansion);
 
@@ -353,6 +384,20 @@ export async function handleOrient(
   }
 
   // ── Spec domains covering those files ─────────────────────────────────────
+  // With no mapping index there is nothing to match against, and `specDomains: []` would read as
+  // "no spec governs this code". Say which it is: an absent index is a missing CACHE, not a
+  // finding about the repository (change: fix-governance-face-dark).
+  let specLinkage: { state: 'unavailable'; reason: string; remediation: string } | undefined;
+  if (!mappingIdx) {
+    const specCount = await countSpecDomains(absDir, cfg?.openspecPath);
+    if (specCount > 0) {
+      specLinkage = {
+        state: 'unavailable',
+        reason: `${specCount} spec domain(s) exist, but the spec→code link index has not been built, so no requirement could be matched to the code in scope.`,
+        remediation: 'Run `openlore analyze` (it writes the index), or `openlore mapping refresh`.',
+      };
+    }
+  }
   const domainScores = new Map<string, { specFile: string; matchCount: number }>();
   if (mappingIdx) {
     for (const filePath of relevantFiles) {
@@ -385,6 +430,9 @@ export async function handleOrient(
         ? {
           name: n.name, filePath: n.filePath, provenance: analysisProvenance,
           ...(isIacLanguage(n.language) ? { domain: 'infra' as const } : {}),
+          // A declared operation is not code the agent can edit; say which domain it is
+          // (change: add-contract-node-projection).
+          ...(isContractLanguage(n.language) ? { domain: 'contract' as const } : {}),
           ...(via ? { via } : {}),
         }
         : null;
@@ -436,7 +484,20 @@ export async function handleOrient(
   // Normalise search scores to [0, 1] for compositeScore (scores are RRF/BM25: higher = better)
   // With a budget the search is widened for the function pool; insertion points still come from the
   // default search width, so they match the no-budget answer.
-  const insertionResults = tokenBudget ? rawResults.slice(0, clampedLimit * 3) : rawResults;
+  // A test function is never where a feature is added. The candidates come straight from the
+  // search results, which include test code: on a Rust workspace the top insertion points were
+  // `#[test]` functions, so `orient` told the agent to write the feature inside a test
+  // (change: fix-rust-test-detection). Filtered here rather than in the search, because a test
+  // IS a legitimate `relevantFunction` — it shows how the code is used.
+  // The search index carries no test flag, so the graph answers it: a node the build marked
+  // `isTest` (a path convention, or a Rust `#[test]` attribute) is not an insertion point.
+  const isTestNode = (id: string): boolean => {
+    const node = llmCtx?.edgeStore?.getNode(id);
+    if (node) return node.isTest === true;
+    return llmCtx?.callGraph?.nodes.find(n => n.id === id)?.isTest === true;
+  };
+  const nonTestResults = rawResults.filter(r => !isTestNode(r.record.id));
+  const insertionResults = tokenBudget ? nonTestResults.slice(0, clampedLimit * 3) : nonTestResults;
   const maxRawScore = insertionResults.length > 0 ? Math.max(...insertionResults.map(r => r.score)) : 1;
   const normalise = (s: number) => maxRawScore > 0 ? s / maxRawScore : 0;
 
@@ -921,7 +982,10 @@ export async function handleOrient(
   if (/\b(cluster|community|coupled|group)\b/.test(_taskLow)) _suggested.push('get_cluster');
   if (!emptyResult) _suggested.push('check_spec_drift');
   const _seen = new Set<string>();
-  const suggestedTools = _suggested.filter(t => (_seen.has(t) ? false : (_seen.add(t), true)));
+  // `suggestedTools` is a CALL LIST: an entry this process does not serve is a wasted turn.
+  const suggestedTools = _suggested
+    .filter(t => (_seen.has(t) ? false : (_seen.add(t), true)))
+    .filter(toolIsWired);
 
   // ── Next steps ────────────────────────────────────────────────────────────
   const nextSteps: string[] = [];
@@ -938,9 +1002,13 @@ export async function handleOrient(
       );
     }
   } else {
-    nextSteps.push(
-      'Before making an architectural choice, call record_decision(title, rationale, consequences, affectedFiles) to document it',
-    );
+    // Named only when this process serves it. The default `substrate` preset does not, and an
+    // agent that followed the old unconditional advice got "Tool \"record_decision\" is not
+    // available in the active preset" — in the same session where install had promised the
+    // guidance names only wired tools (change: fix-orient-guidance-preset).
+    nextSteps.push(toolIsWired('record_decision')
+      ? 'Before making an architectural choice, call record_decision(title, rationale, consequences, affectedFiles) to document it'
+      : 'Before making an architectural choice, record it with `openlore decisions record --title "…" --rationale "…"` (the record_decision tool is not in the wired preset)');
   }
   if (!emptyResult && insertionPoints.length > 0) {
     nextSteps.push(
@@ -948,13 +1016,18 @@ export async function handleOrient(
     );
   }
   if (!emptyResult && specDomains.length > 0) {
-    const hint = inlineSpecs
-      ? `Domain purposes included in inlineSpecs — call get_spec("${specDomains[0].domain}") for requirements and implementation details`
-      : `Call get_spec("${specDomains[0].domain}") to read the full spec before writing code`;
+    const domain = specDomains[0].domain;
+    const hint = !toolIsWired('get_spec')
+      ? `Read the spec before writing code: ${specDomains[0].specFile} (the get_spec tool is not in the wired preset)`
+      : inlineSpecs
+        ? `Domain purposes included in inlineSpecs — call get_spec("${domain}") for requirements and implementation details`
+        : `Call get_spec("${domain}") to read the full spec before writing code`;
     nextSteps.push(hint);
   }
   if (!emptyResult) {
-    nextSteps.push('After implementing, run check_spec_drift to verify the code matches the spec');
+    nextSteps.push(toolIsWired('check_spec_drift')
+      ? 'After implementing, run check_spec_drift to verify the code matches the spec'
+      : 'After implementing, run `openlore drift` to verify the code matches the spec (the check_spec_drift tool is not in the wired preset)');
   }
 
   // Signal when the graph index is unavailable (e.g. wiped by a version upgrade and
@@ -1046,6 +1119,28 @@ export async function handleOrient(
     }
   }
 
+  // ── The OpenAPI contract of route handlers in scope (change: add-contract-graph-projection) ──
+  // An agent editing a handler sees, unasked, the operation it serves and what that declares.
+  // Read only when a file in scope has an indexed route. Additive + fail-open.
+  let contracts: import('../contract/contract-briefing.js').ContractBriefing | undefined;
+  if (!lean && relevantFunctions.length > 0) {
+    try {
+      const { contractsForFiles } = await import('../contract/contract-briefing.js');
+      contracts = await contractsForFiles(absDir, [...new Set(relevantFunctions.map(f => f.filePath))], relevantFunctions.map(f => f.name));
+    } catch { /* never fail orient over the contract summary */ }
+  }
+
+  // ── The infrastructure a handler in scope depends on (change: add-iac-deploy-binding-commands) ──
+  // The resource that runs it, and the sites that set the env vars it reads. The env scan runs
+  // only when a function in scope actually reads one, so a non-handler task pays nothing.
+  let infrastructure: import('./deploy-briefing.js').InfrastructureBriefing | undefined;
+  if (!lean && relevantFunctions.length > 0 && llmCtx?.callGraph) {
+    try {
+      const { infrastructureForFunctions } = await import('./deploy-briefing.js');
+      infrastructure = await infrastructureForFunctions(absDir, llmCtx.callGraph as SerializedCallGraph, relevantFunctions.map(f => ({ name: f.name, filePath: f.filePath })));
+    } catch { /* never fail orient over the infrastructure summary */ }
+  }
+
   // ReadyOrHonestFirstUse (change: make-index-self-healing): distinguish *repairing*
   // from *absent* (the not-ready result above) and plain *stale*. readCachedContext,
   // awaited above, fires the background repair for a stale/mismatched index; surface
@@ -1058,15 +1153,27 @@ export async function handleOrient(
   // letting the agent read the missing symbols as genuinely absent. Absent on a clean repo.
   const parseHealthNote = parseHealthBoundary(await loadParseHealthReport(absDir), relevantFiles);
 
+  // Generated-file guard (change: add-generated-file-guard): mark the files in scope that are
+  // generated or vendored, with the literal source and regenerate command, so an agent edits the
+  // source instead of output the next generator run erases. Full mode only: the lean prompt-hook
+  // path renders none of it. The budget-held-back files are classified too, so a file the budget
+  // fit adds keeps its mark. Best-effort; absent when none are.
+  let generatedByFile = new Map<string, GeneratedFileFact>();
+  if (!lean) {
+    try {
+      generatedByFile = (await classifyGeneratedFiles(absDir, [...relevantFiles, ...extraPairs.map(p => p.fn.filePath)])).facts;
+    } catch {
+      // additive enrichment — never fail orient over the generated-file marks
+    }
+  }
+  const generatedFiles = generatedFilesFor(relevantFiles, generatedByFile);
+
   // Minimal-sufficient navigation core — always returned (Spec 27).
   const core = {
     task,
     searchMode,
     retrievalMode,
     ...(parseHealthNote ? { parseHealth: parseHealthNote } : {}),
-    ...(isKeywordRetrievalMode(retrievalMode)
-      ? { note: 'Keyword (BM25) search — the zero-config default. For semantic ranking, run "openlore embed --local" (on-device, no API key) or set EMBED_* for a remote endpoint.' }
-      : {}),
     ...(graphIndexStale
       ? { graphIndexNote: 'Graph index unavailable — call paths, provenance, decisions, and change-coupling are omitted. Run analyze_codebase to (re)build it (a version upgrade resets the graph index until the next analyze).' }
       : {}),
@@ -1078,6 +1185,7 @@ export async function handleOrient(
         } }
       : {}),
     relevantFiles,
+    ...(generatedFiles.length ? { generatedFiles } : {}),
     relevantFunctions,
     coverage,
     ...(emptyResult ? { emptyResult } : {}),
@@ -1137,11 +1245,19 @@ export async function handleOrient(
     ...(landmarks !== undefined ? { landmarks } : {}),
     ...(behavioralHotspots !== undefined ? { behavioralHotspots } : {}),
     ...(regionStyle !== undefined ? { regionStyle } : {}),
+    ...(specLinkage ? { specLinkage } : {}),
+    ...(contracts !== undefined ? { contracts } : {}),
+    ...(infrastructure !== undefined ? { infrastructure } : {}),
     nextSteps,
   };
   return tokenBudget
-    ? fitOrientToBudget(absDir, result, tokenBudget, extras, llmCtx)
+    ? fitOrientToBudget(absDir, result, tokenBudget, extras, llmCtx, generatedByFile)
     : withIndexStaleness(absDir, result, llmCtx);
+}
+
+/** The generated-file marks for `files`, in their order; empty when none is generated. */
+function generatedFilesFor(files: readonly string[], byFile: ReadonlyMap<string, GeneratedFileFact>): GeneratedFileFact[] {
+  return files.map(f => byFile.get(f)).filter((f): f is GeneratedFileFact => f !== undefined);
 }
 
 /**
@@ -1188,7 +1304,7 @@ async function evaluatePushedMemories(
  * synced decisions), the file scope the answer was computed for, and next steps.
  */
 const ORIENT_BUDGET_TRIM_ORDER = [
-  'behavioralHotspots', 'landmarks', 'changeCoupling', 'specLinkedFunctions', 'inlineSpecs',
+  'infrastructure', 'contracts', 'behavioralHotspots', 'landmarks', 'changeCoupling', 'specLinkedFunctions', 'inlineSpecs',
   'insertionPoints', 'staleTriggeredMemories', 'injectedMemories', 'specDomains', 'relevantFunctions',
 ] as const;
 
@@ -1212,6 +1328,7 @@ async function fitOrientToBudget(
   tokenBudget: number,
   extras: Array<{ fn: OrientFunction; path: OrientCallPath }>,
   llmCtx: Awaited<ReturnType<typeof readCachedContext>>,
+  generatedByFile: ReadonlyMap<string, GeneratedFileFact> = new Map(),
 ): Promise<Record<string, unknown>> {
   // The final response with its receipt settled: `estimatedTokens` is the size of exactly this rendering,
   // so every candidate is measured as it would be sent.
@@ -1233,9 +1350,12 @@ async function fitOrientToBudget(
   if (fitsBudget(baseFinal)) {
     const extend = (count: number) => {
       const added = extras.slice(0, count);
+      const relevantFiles = [...new Set([...payload.relevantFiles, ...added.map(pair => pair.fn.filePath)])];
+      const generatedFiles = generatedFilesFor(relevantFiles, generatedByFile);
       return {
         ...payload,
-        relevantFiles: [...new Set([...payload.relevantFiles, ...added.map(pair => pair.fn.filePath)])],
+        ...(generatedFiles.length ? { generatedFiles } : {}),
+        relevantFiles,
         relevantFunctions: [...payload.relevantFunctions, ...added.map(pair => pair.fn)],
         callPaths: [...payload.callPaths, ...added.map(pair => pair.path)],
       };

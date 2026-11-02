@@ -40,9 +40,15 @@ import {
 } from './http-route-parser.js';
 import { mapFilesBounded } from './bounded-file-scan.js';
 import type { CfgSpill } from './cfg-spill.js';
-import { buildProjectedIac } from './iac/index.js';
+import { buildIacGraph } from './iac/index.js';
+import { projectIacGraph } from './iac/project.js';
+import { bindDeployHandlers, type UnresolvedDeployBinding } from './iac/deploy-binding.js';
+import { projectContracts, contractDisclosure, emptyContractProjection, type ProjectedContracts } from './contract/project.js';
+import { generatedClientFunctionsFor } from './contract/generated-client.js';
+import { isProjectedLanguage, isDeclarationEdgeKind } from './projected-language.js';
 import { isIacLanguage } from './iac/types.js';
 import { isTestFile } from './test-file.js';
+import { hasRustTestAttribute } from './rust-test-attributes.js';
 import { type FunctionCfg, type CfgNode } from './cfg.js';
 import { stableSymbolId, stableClassId } from '../scip/moniker.js';
 import { synthesizeTypeHierarchyEdges, type RawMethodCall } from './cha.js';
@@ -5646,6 +5652,21 @@ export interface CallGraphBuilderOptions {
    * field left undefined is on, so production is unchanged).
    */
   resolution?: CallGraphResolutionToggles;
+  /**
+   * Interface-specification candidates (change: add-contract-node-projection): the repository's
+   * OpenAPI/Swagger documents, path + content. They are NOT source files — no grammar parses
+   * them and they never enter Pass 1 — so they ride beside `files` rather than in it. Absent
+   * (the watcher's per-file rebuilds, tests, any embedded caller) means no contract projection.
+   */
+  contractFiles?: ReadonlyArray<{ path: string; content: string }>;
+  /** Specification candidates the caller did not retain, so the projection discloses the cap. */
+  contractFilesOmitted?: number;
+  /**
+   * The project's declared build-output mapping (change: add-iac-deploy-binding-commands), so a
+   * deployed handler naming a built file (`dist/orders.handler`) binds to its source. Absent means
+   * no mapping: a built path then binds only if it is itself indexed.
+   */
+  buildOutput?: import('./iac/build-output.js').BuildOutputMap;
 }
 
 export class CallGraphBuilder {
@@ -5655,12 +5676,18 @@ export class CallGraphBuilder {
   private readonly legacyLatePassesForTesting: boolean;
   /** Every mechanism on unless a test/calibration caller explicitly turned one off. */
   private readonly resolution: Required<CallGraphResolutionToggles>;
+  private readonly contractFiles: ReadonlyArray<{ path: string; content: string }>;
+  private readonly contractFilesOmitted: number;
+  private readonly buildOutput: import('./iac/build-output.js').BuildOutputMap | undefined;
 
   constructor(options: CallGraphBuilderOptions = {}) {
     this.extractionOptions = options.extraction;
     this.pass1Cache = options.pass1Cache;
     this.cfgSpill = options.cfgSpill;
     this.legacyLatePassesForTesting = options.legacyLatePassesForTesting === true;
+    this.contractFiles = options.contractFiles ?? [];
+    this.contractFilesOmitted = options.contractFilesOmitted ?? 0;
+    this.buildOutput = options.buildOutput;
     this.resolution = {
       typeInference: options.resolution?.typeInference !== false,
       reExport: options.resolution?.reExport !== false,
@@ -6505,8 +6532,21 @@ export class CallGraphBuilder {
 
     // Pass 2b: HTTP cross-language edges (JS/TS caller → Python handler)
     const httpClientDegradations: HttpExtractionDegradation[] = [...pass1HttpDegradations];
+    // The same registrations and call sites the contract projection binds to declared operations
+    // (change: add-contract-node-projection) — extracted once, here. Retained only when a
+    // specification exists: on a repository with none, holding the whole route and call list
+    // across Passes 3-8 would be memory spent for nothing.
+    const projectContractsFor = this.contractFiles.length > 0 || this.contractFilesOmitted > 0;
+    let httpRoutes: RouteDefinition[] = [];
+    let httpCalls: HttpCall[] = [];
+    /** Why the route/call extraction is not complete — withholds every "unmatched" conclusion. */
+    const extractionNotAssessed = new Set<string>();
     try {
-      const { edges: httpEdges, degradations } = await extractAllHttpEdges(structuralFiles, httpCallFacts);
+      const { edges: httpEdges, routes, calls, degradations } = await extractAllHttpEdges(structuralFiles, httpCallFacts);
+      if (projectContractsFor) {
+        httpRoutes = routes;
+        httpCalls = calls;
+      }
       httpClientDegradations.push(...degradations);
       // Group once, then look up per edge. Rebuilt per edge this was an O(edges × nodes) scan.
       const httpNodesByFile = new Map<string, FunctionNode[]>();
@@ -6564,14 +6604,26 @@ export class CallGraphBuilder {
         });
       }
     } catch {
-      // HTTP edge extraction is best-effort; don't fail the whole build
+      // HTTP edge extraction is best-effort; don't fail the whole build. The contract projection
+      // reads the same routes and calls, so a failure here is not "nothing serves this operation".
+      extractionNotAssessed.add('the route and client-call extraction failed, so no registration or call site was assessed');
+    }
+    if (projectContractsFor && httpClientDegradations.length) {
+      extractionNotAssessed.add(`${httpClientDegradations.length} file(s) hit a parse budget or failed to parse, so their routes and call sites were not assessed`);
     }
 
     // Pass 2c: Infrastructure-as-Code projection (spec-07).
     // IaC resources/references project onto the existing node/edge primitives.
     let iacClasses: ClassNode[] = [];
+    let unresolvedDeployBindings: UnresolvedDeployBinding[] = [];
+    // Named failures, never a silent empty projection. Before this, a single throw anywhere in
+    // Pass 2c erased every resource, reference and deploy binding, and nothing said so: orient
+    // reported no infrastructure (read as "no resource runs a function in scope") and
+    // `unresolvedDeployBindings` was absent (read as "every binding resolved").
+    const iacFailures: string[] = [];
     try {
-      const iac = buildProjectedIac(structuralFiles);
+      const iacGraph = buildIacGraph(structuralFiles, iacFailures);
+      const iac = projectIacGraph(iacGraph);
       for (const n of iac.nodes) if (!allNodes.has(n.id)) allNodes.set(n.id, n);
       edges.push(...iac.edges);
       iacClasses = iac.classes;
@@ -6583,8 +6635,15 @@ export class CallGraphBuilder {
       // boundary end-to-end. Standalone IaC (.tf/.yaml) has no co-located code, so
       // no edge is created — those stay infra-only components, exactly as today.
       edges.push(...linkCodeToInfra(iac.nodes, allNodes));
-    } catch {
-      // IaC extraction is best-effort; never fail the whole build
+
+      // Pass 2c.2: function resources → the code they run (change: add-iac-deploy-binding).
+      const codeNodes = [...allNodes.values()].filter(n => !n.isExternal && !isIacLanguage(n.language));
+      const deploys = bindDeployHandlers(iacGraph, codeNodes, this.buildOutput);
+      edges.push(...deploys.edges.filter(e => allNodes.has(e.callerId)));
+      unresolvedDeployBindings = deploys.unresolved;
+    } catch (error) {
+      // Best-effort still: a failure never fails the whole build. But it is disclosed.
+      iacFailures.push(`projection: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     // Transport sends no indexed consumer selects, disclosed as boundary sites below.
@@ -6625,6 +6684,12 @@ export class CallGraphBuilder {
     const seenPairs = new Set<string>();
     for (const edge of edges) {
       if (edge.confidence === 'synthesized') continue;
+      // A declaration binding is not a call. Contract edges are pushed after this loop for
+      // exactly that reason, but `deploys_symbol` is pushed in Pass 2c, before it: the deployed
+      // handler was given a fan-in of 1 by its own manifest, which removed it from the entry
+      // points and left the YAML stanza as the only entry point of the repository. The store's
+      // `recomputeStructuralMetrics` excludes the same set, so both copies agree.
+      if (isDeclarationEdgeKind(edge.kind)) continue;
       const pairKey = `${edge.callerId}\0${edge.calleeId}`;
       if (seenPairs.has(pairKey)) continue;
       seenPairs.add(pairKey);
@@ -6634,10 +6699,107 @@ export class CallGraphBuilder {
       if (callee) callee.fanIn++;
     }
 
+    // Pass 3c: interface-contract projection (change: add-contract-node-projection).
+    //
+    // Declared operations become ordinary graph nodes, bound to the handler that serves each and
+    // to the function that calls it. Deliberately AFTER Pass 3: a contract edge is not a call, so
+    // it must not change any function's fan-in or fan-out (the metrics every hub/entry-point/
+    // significance ranking rests on). The nodes still land in `allNodes` before Pass 4 reads it.
+    let contractProjection: ProjectedContracts | undefined;
+    if (projectContractsFor) {
+      try {
+        // Code nodes by file, for the enclosing-function lookup a client call needs.
+        const codeNodesByFile = new Map<string, FunctionNode[]>();
+        for (const n of allNodes.values()) {
+          // A PROJECTED declaration is not code. IaC nodes are already in `allNodes` here (Pass
+          // 2c runs before this), and Bicep exposes a bare symbol name — so a `var getOrder` in
+          // a .bicep file whose header named the specification was bound as a "generated client
+          // function", linking a declaration to a declaration. The pre-existing `resolveCaller`
+          // path was safe only by accident: it is driven by extracted HTTP calls, which come
+          // from code files. The generated-client rule consults this map directly.
+          if (n.isExternal || isProjectedLanguage(n.language)) continue;
+          const at = codeNodesByFile.get(n.filePath);
+          if (at) at.push(n); else codeNodesByFile.set(n.filePath, [n]);
+        }
+        const projection = projectContracts({
+          files: this.contractFiles,
+          filesOmitted: this.contractFilesOmitted,
+          ...(extractionNotAssessed.size ? { extractionNotAssessed: [...extractionNotAssessed] } : {}),
+          routes: httpRoutes,
+          calls: httpCalls,
+          // The same handler rule the http_endpoint edges use: the route's own file first, then a
+          // UNIQUE non-external match elsewhere (a routes file separate from its handlers). A name
+          // colliding across files stays unresolved — never guessed.
+          resolveHandler: route => {
+            const simple = route.handlerName.split('.').pop() ?? route.handlerName;
+            const candidates = trie.findBySimpleName(simple).filter(n => !n.isExternal);
+            return candidates.find(n => n.filePath === route.file)
+              ?? (candidates.length === 1 ? candidates[0] : undefined);
+          },
+          // One header slice per code file per specification. The projector calls this once per
+          // specification, so no memo is needed — an earlier one here never hit.
+          generatedClientFunctions: specPath =>
+            generatedClientFunctionsFor(specPath, codeNodesByFile, f => fileContents.get(f), isTestFile),
+          resolveCaller: call => {
+            const inFile = codeNodesByFile.get(call.file);
+            if (!inFile) return undefined;
+            if (call.offset !== undefined) return findEnclosingFunction(inFile, call.offset);
+            const content = fileContents.get(call.file);
+            if (!content) return undefined;
+            let offset = 0;
+            const lines = content.split('\n');
+            for (let i = 0; i < call.line - 1 && i < lines.length; i++) offset += lines[i].length + 1;
+            return findEnclosingFunction(inFile, offset);
+          },
+        });
+        // Edges first, then nodes: a loop, not a spread — a large repository's edge list exceeds
+        // the engine's argument limit, and a throw mid-spread would leave orphan operation nodes
+        // in the graph with no edges and no disclosure (the same lesson as Pass 7a). Operation ids
+        // are `<spec file>::<METHOD path>`, so a collision with a code node is not reachable; the
+        // filter below keeps the invariant explicit rather than assumed.
+        const projectedIds = new Set(projection.nodes.map(n => n.id));
+        const projected: CallEdge[] = [];
+        for (const e of projection.edges) {
+          // The callee is always a projected declaration. The caller is either CODE (a handler
+          // or a client function, already in `allNodes`) or another projected declaration — a
+          // named schema referencing a named schema. Requiring the caller to pre-exist in
+          // `allNodes` silently dropped every schema → schema edge, since the projected nodes
+          // are added on the next line (change: add-contract-schema-elements).
+          if (!projectedIds.has(e.calleeId)) continue;
+          if (!allNodes.has(e.callerId) && !projectedIds.has(e.callerId)) continue;
+          projected.push(e);
+        }
+        for (const n of projection.nodes) if (!allNodes.has(n.id)) allNodes.set(n.id, n);
+        for (const e of projected) edges.push(e);
+        contractProjection = projection;
+      } catch (err) {
+        // Best-effort: never fail the whole build — but a crash must not read as "this repository
+        // declares no operations", so the failure itself is the disclosure.
+        contractProjection = {
+          ...emptyContractProjection(),
+          notAssessed: [`the contract projection failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`],
+        };
+      }
+    }
+
     // Pass 4 (prep): Mark test-file nodes before tested_by derivation
     const nodes = Array.from(allNodes.values());
+    // Rust's dominant convention is an inline `#[cfg(test)] mod tests`, which no path shows. The
+    // attribute on each test function does, and the source is still in hand here. Split each
+    // Rust file once, not once per function (change: fix-rust-test-detection).
+    const rustLines = new Map<string, string[]>();
     for (const n of nodes) {
       if (!n.isExternal && isTestFile(n.filePath)) n.isTest = true;
+      else if (!n.isExternal && n.language === 'Rust' && n.startLine) {
+        let lines = rustLines.get(n.filePath);
+        if (!lines) {
+          const content = fileContents.get(n.filePath);
+          if (content === undefined) continue;
+          lines = content.split('\n');
+          rustLines.set(n.filePath, lines);
+        }
+        if (hasRustTestAttribute(lines, n.startLine)) n.isTest = true;
+      }
     }
 
     // Pass 3b: Derive tested_by edges — reverse edges from production fn ← test fn
@@ -6753,19 +6915,32 @@ export class CallGraphBuilder {
 
     // Pass 4: Derive hub functions, entry points, layer violations
     // External and test nodes are excluded from structural stats
-    const internalNodes = nodes.filter(n => !n.isExternal && !n.isTest);
+    // A projected element is a DECLARATION, not a code unit: it is never a hub, an entry point,
+    // or a term in the average fan-in/fan-out (change: add-contract-node-projection). Scoped to
+    // contract languages only, this missed INFRASTRUCTURE entirely — 48 of this repository's
+    // 1,121 entry points were GitHub Actions jobs, Helm templates, Bicep modules and Serverless
+    // stanzas, and `CODEBASE.md` prints that table under "the natural starting point for any
+    // task".
+    const internalNodes = nodes.filter(n => !n.isExternal && !n.isTest && !isProjectedLanguage(n.language));
 
     const hubFunctions = internalNodes
       .filter(n => n.fanIn >= HUB_THRESHOLD)
       .sort((a, b) => b.fanIn - a.fanIn);
 
-    const calledIds = new Set(edges.map(e => e.calleeId));
+    // A declaration binding does not make a function "called": a `deploys_symbol` edge out of a
+    // manifest cost the deployed handler its entry-point status, leaving the YAML stanza as the
+    // only entry point of the repository. Same exclusion as the degree loop, and as the store's
+    // `recomputeStructuralMetrics`.
+    const calledIds = new Set(edges.filter(e => !isDeclarationEdgeKind(e.kind)).map(e => e.calleeId));
     const entryPoints = internalNodes
       .filter(n => !calledIds.has(n.id))
       .sort((a, b) => b.fanOut - a.fanOut);
 
     const layerViolations = layers
-      ? this.detectLayerViolations(edges, allNodes, layers)
+      // A declaration is not a layer member: a binding edge into a specification file or a
+      // manifest that happens to sit inside a configured layer is not an architecture violation
+      // (change: add-contract-node-projection).
+      ? this.detectLayerViolations(edges.filter(e => !isDeclarationEdgeKind(e.kind)), allNodes, layers)
       : [];
 
     const totalFanIn = internalNodes.reduce((s, n) => s + n.fanIn, 0);
@@ -6968,6 +7143,9 @@ export class CallGraphBuilder {
         ? [...grammarUnavailableByLanguage.values()].sort((a, b) => a.language < b.language ? -1 : a.language > b.language ? 1 : 0)
         : undefined,
       ambiguousSites: ambiguousSites.length > 0 ? ambiguousSites : undefined,
+      unresolvedDeployBindings: unresolvedDeployBindings.length > 0 ? unresolvedDeployBindings : undefined,
+      iacNotAssessed: iacFailures.length > 0 ? iacFailures : undefined,
+      ...(contractProjection ? { contracts: contractDisclosure(contractProjection) } : {}),
       extractionLane,
       pass1Cache,
     };
@@ -7331,6 +7509,15 @@ export function serializeCallGraph(result: CallGraphResult): SerializedCallGraph
     // disclose them (change: harden-call-resolution-ambiguity). Omitted when empty.
     ...(result.ambiguousSites && result.ambiguousSites.length > 0
       ? { ambiguousSites: result.ambiguousSites }
+      : {}),
+    ...(result.contracts ? { contracts: result.contracts } : {}),
+    ...(result.unresolvedDeployBindings && result.unresolvedDeployBindings.length > 0
+      ? { unresolvedDeployBindings: result.unresolvedDeployBindings }
+      : {}),
+    // An ecosystem whose extraction threw: its resources are NOT absent, they were not
+    // assessed. Carried into llm-context.json so serve-time consumers can say which.
+    ...(result.iacNotAssessed && result.iacNotAssessed.length > 0
+      ? { iacNotAssessed: result.iacNotAssessed }
       : {}),
   };
 }

@@ -29,6 +29,10 @@ New here? Start with [install.md](install.md) — one command wires your agent a
 | Find important code no test reaches | [coverage-gaps.md](coverage-gaps.md) |
 | See what changes together / churn | [change-coupling.md](change-coupling.md) |
 | Review a diff structurally | [structural-diff.md](structural-diff.md) |
+| Know which files are generated, and their source | [generated-files.md](generated-files.md) |
+| Catch invented imports, exports, and packages | [phantom-references.md](phantom-references.md) |
+| See when a diff weakens a test, a suppression, or a check config | [check-weakening.md](check-weakening.md) |
+| Learn when code you read changed under you, or an edit loops | [session-ledger.md](session-ledger.md) |
 | Trace impact across code ↔ infrastructure | [cross-domain-impact.md](cross-domain-impact.md) |
 | Map cross-service API topology | [cross-service-topology.md](cross-service-topology.md) |
 

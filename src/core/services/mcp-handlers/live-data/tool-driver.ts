@@ -112,6 +112,8 @@ export const TOOL_REGISTRY: Record<string, ToolPlan> = {
   certify_provenance: { kind: 'read', buildArgs: dirOnly },
   certify_merge: { kind: 'read', buildArgs: (f) => ({ directory: f.directory, ours: 'HEAD', theirs: 'HEAD' }) },
   fleet_status: { kind: 'read', buildArgs: dirOnly },
+  // Reading the board only: a declare would write to the clone's shared board.
+  declare_footprint: { kind: 'read', buildArgs: (f) => ({ directory: f.directory, action: 'list' }) },
 
   // ── function/symbol tools ────────────────────────────────────────────────
   get_subgraph: {
@@ -171,6 +173,16 @@ export const TOOL_REGISTRY: Record<string, ToolPlan> = {
   get_style_fingerprint: {
     kind: 'read',
     // Whole-repo descriptive idiom profile over the cached repo's fingerprint.
+    buildArgs: (f) => ({ directory: f.directory }),
+  },
+  certify_service_contract: {
+    kind: 'read',
+    // Contract surface and route parity of the repo's OpenAPI documents (surface mode).
+    buildArgs: (f) => ({ directory: f.directory }),
+  },
+  get_handoff_briefing: {
+    kind: 'read',
+    // Session-succession briefing of the working tree's in-flight state.
     buildArgs: (f) => ({ directory: f.directory }),
   },
   briefing_since: {

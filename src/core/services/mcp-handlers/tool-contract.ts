@@ -77,6 +77,7 @@ export const TOOL_OUTPUT_CLASS: Record<string, ToolOutputClass> = {
   certify_provenance: 'conclusion',
   certify_merge: 'conclusion',
   fleet_status: 'conclusion',
+  declare_footprint: 'conclusion',
   search_code: 'conclusion',
   suggest_insertion_points: 'conclusion',
   search_specs: 'conclusion',
@@ -124,6 +125,8 @@ export const TOOL_OUTPUT_CLASS: Record<string, ToolOutputClass> = {
   certify_public_surface: 'conclusion',
   get_style_fingerprint: 'conclusion',
   briefing_since: 'conclusion',
+  get_handoff_briefing: 'conclusion',
+  certify_service_contract: 'conclusion',
 };
 
 /** The tools intentionally allowed to emit raw topology, sorted for stable assertions. */
@@ -254,7 +257,9 @@ export const TOOL_CAPABILITY_FAMILY: Record<string, CapabilityFamily> = {
   change_impact_certificate: 'change',
   certify_provenance: 'change',
   certify_public_surface: 'change',
+  certify_service_contract: 'change',
   briefing_since: 'change',
+  get_handoff_briefing: 'change',
   detect_changes: 'change',
 
   // --- remember: durable, code-anchored facts (memory + decision lifecycle) ---
@@ -274,6 +279,7 @@ export const TOOL_CAPABILITY_FAMILY: Record<string, CapabilityFamily> = {
   map_in_flight_conflicts: 'coordinate',
   certify_merge: 'coordinate',
   fleet_status: 'coordinate',
+  declare_footprint: 'coordinate',
 
   // --- federate: cross-repo / spec-store conclusions ---
   federation_status: 'federate',

@@ -34,6 +34,7 @@
  */
 
 import { Command } from 'commander';
+import { setActiveToolSurface } from '../../core/services/mcp-handlers/active-surface.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
@@ -47,8 +48,9 @@ import { releaseContextCache, validateDirectory, waitForGraphRebuild } from '../
 import { EdgeStore } from '../../core/services/edge-store.js';
 import { McpWatcher } from '../../core/services/mcp-watcher.js';
 import { readOpenLoreConfig } from '../../core/services/config-manager.js';
-import { registerRepairHost, registerRepairBuilder, hasAnalysis, autoInitSuppression } from '../../core/services/cold-start-bootstrap.js';
+import { registerRepairHost, registerRepairBuilder, hasAnalysis, autoInitSuppression, repairInBackground, startBackgroundVectorPass } from '../../core/services/cold-start-bootstrap.js';
 import { startDetachedIndexBuild } from '../../core/services/one-shot-index-build.js';
+import { seedFromSiblingCheckout, servingSeededIndex } from '../../core/runtime/seed-from-sibling.js';
 import { acquireLockAt, isLockHeld } from '../../core/runtime/advisory-lock.js';
 import { openloreAnalyze } from '../../api/analyze.js';
 import { TOOL_DEFINITIONS, TOOL_PRESETS, presetMembershipError, selectActiveTools } from './mcp.js';
@@ -549,6 +551,12 @@ async function runServe(options: ServeCliOptions): Promise<ServeOutcome> {
       : selectActiveTools(TOOL_DEFINITIONS, { preset: presetName })
     ).map((t) => t.name),
   );
+  // Tell the guidance renderers what THIS process serves, exactly as `openlore mcp` does.
+  // Without it the daemon kept prescribing `record_decision` and `check_spec_drift`, which it
+  // then refuses with a preset-membership error — and because `openlore mcp` delegates to a
+  // running daemon with no flag, the stdio default regressed as soon as a daemon was warm
+  // (change: fix-orient-guidance-preset).
+  setActiveToolSurface(activeNames);
 
   // Idle self-shutdown: a request resets the timer; firing tears down and exits.
   // Bounds orphaned-daemon lifetime so they can't accumulate in RAM (see
@@ -714,7 +722,11 @@ async function runServe(options: ServeCliOptions): Promise<ServeOutcome> {
     }
     logger.discovery(`[serve] rebuilding graph index (${directory})`);
     const rebuild = openloreAnalyze({ rootPath: directory, force: true })
-      .then(() => logger.discovery(`[serve] graph index rebuilt (${directory})`))
+      .then(() => {
+        logger.discovery(`[serve] graph index rebuilt (${directory})`);
+        // The forced rebuild publishes keyword-only indexes; put the local vectors back.
+        startBackgroundVectorPass(directory);
+      })
       .catch((err) => logger.warning(`[serve] graph rebuild failed: ${err instanceof Error ? err.message : String(err)}`))
       .finally(() => {
         rebuildPromises.delete(directory);
@@ -1035,7 +1047,18 @@ async function runServe(options: ServeCliOptions): Promise<ServeOutcome> {
       // build outlives this daemon's lifetime; it self-suppresses outside a git work tree or
       // when auto-init is opted out. `stale-region` when an analysis exists but its graph store
       // is missing (a partial/interrupted build), `index-absent` for a truly fresh repo.
-      if (!autoInitSuppression(root)) {
+      // A new worktree first copies a sibling checkout's verified index and rebuilds over it
+      // (change: seed-worktree-index-from-sibling-checkout).
+      const autoInitAllowed = !autoInitSuppression(root);
+      if (autoInitAllowed && !hasAnalysis(root)) await seedFromSiblingCheckout(root);
+      if (autoInitAllowed && await servingSeededIndex(root)) {
+        repairInBackground(root, 'seeded', {
+          analyze: async dir => {
+            triggerRebuild(dir);
+            await rebuildPromises.get(dir);
+          },
+        });
+      } else if (autoInitAllowed) {
         const build = startDetachedIndexBuild(root, hasAnalysis(root) ? 'stale-region' : 'index-absent');
         if (build.state === 'started') {
           logger.discovery('[serve] No call-graph index — building it in the background (non-blocking, no API key).');

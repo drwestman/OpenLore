@@ -301,6 +301,111 @@ function largestFittingJsonCut(text: string, budget: number): number {
  * print a forged OpenLore verdict. Newlines are the signature listing's own structure,
  * so they are kept.
  */
+/**
+ * Fit an object result into `maxBytes` by dropping the TAILS of its array fields, newest-dropped
+ * last, and disclosing exactly how many items each list lost (change:
+ * fix-whole-repo-answers-under-budget).
+ *
+ * The lists these tools return are ranked — most significant first — so a prefix is the useful
+ * part and a count is the honest statement of what is missing. Returns `undefined` when there is
+ * nothing to shrink, or when even the arrays-emptied shape does not fit; the caller then falls
+ * back to the partial envelope.
+ *
+ * Deterministic: fields are considered in descending serialized size, and ties by key name, so
+ * the same input always trims the same way.
+ */
+function fitByTrimmingArrays(result: unknown, maxBytes: number): { text: string; truncated: boolean } | undefined {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return undefined;
+  const obj = result as Record<string, unknown>;
+  const arrayKeys = Object.keys(obj)
+    .filter(k => k !== 'responseBudget' && Array.isArray(obj[k]) && (obj[k] as unknown[]).length > 0)
+    .sort((a, b) => {
+      const size = (k: string) => Buffer.byteLength(JSON.stringify(obj[k]) ?? '', 'utf8');
+      return size(b) - size(a) || (a < b ? -1 : 1);
+    });
+  if (!arrayKeys.length) return undefined;
+
+  const kept = new Map<string, number>(arrayKeys.map(k => [k, (obj[k] as unknown[]).length]));
+  const omitted = (): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const k of arrayKeys) {
+      const dropped = (obj[k] as unknown[]).length - (kept.get(k) ?? 0);
+      if (dropped > 0) out[k] = dropped;
+    }
+    return out;
+  };
+  // The receipt lives under its own key and NOTHING else is rewritten. Writing `truncated` /
+  // `omitted` / `truncationNote` at the top level collided with payloads that already define
+  // them: `get_architecture_overview`'s partial-index answer carries an `omitted` ARRAY of
+  // field names beside an `omittedBecause` explaining it, and `certify_public_surface`,
+  // `blast_radius` and `plan_parallel_work` each declare a `truncated` or `truncationNote` of
+  // their own shape. Overwriting those destroyed a disclosure and changed its type.
+  const build = (): Record<string, unknown> => {
+    const out: Record<string, unknown> = { ...obj };
+    for (const k of arrayKeys) out[k] = (obj[k] as unknown[]).slice(0, kept.get(k) ?? 0);
+    const dropped = omitted();
+    if (Object.keys(dropped).length) {
+      out.responseBudget = {
+        trimmed: true,
+        omitted: dropped,
+        note: 'Lists were shortened to fit the response byte budget. Each entry in `omitted` '
+          + 'counts the items dropped from the END of that list, which the tool ranked least '
+          + 'significant; `omitted` is exact. Every other field, including this tool\'s own '
+          + 'truncation disclosures, is unchanged. Narrow the query (a specific symbol, file, '
+          + 'or domain) for the rest.',
+      };
+    }
+    return out;
+  };
+  const bytes = (v: unknown): number => Buffer.byteLength(JSON.stringify(v, null, 2), 'utf8');
+
+  // Everything dropped still does not fit: the summary alone is over budget, so the caller's
+  // partial envelope is the honest answer.
+  for (const k of arrayKeys) kept.set(k, 0);
+  if (bytes(build()) > maxBytes) return undefined;
+
+  // Grow the lists back by FAIR SHARE, smallest list first.
+  //
+  // The previous loop ran largest-first with every other list still at zero, so the biggest
+  // list took the whole budget and every other list was served EMPTY — on a `get_mapping`
+  // answer, 1,549 `linked` rows filled 256 KB and the `ambiguous` / `stale` / `unmapped` lanes
+  // the tool exists to surface were all zeroed. Each list now gets an equal share of what is
+  // left, and a list that does not need its share rolls the remainder to the next one — so a
+  // short list survives whole and the dominant list is the one bounded hardest, which is what
+  // this loop always claimed to do.
+  const headroom = () => maxBytes - bytes(build());
+  for (let i = 0; i < arrayKeys.length; i++) {
+    const k = arrayKeys[arrayKeys.length - 1 - i];
+    const remainingKeys = arrayKeys.length - i;
+    const share = Math.floor(headroom() / remainingKeys);
+    const ceiling = maxBytes - headroom() + share;
+    const total = (obj[k] as unknown[]).length;
+    let lo = 0;
+    let hi = total;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      kept.set(k, mid);
+      if (bytes(build()) <= ceiling) lo = mid; else hi = mid - 1;
+    }
+    kept.set(k, lo);
+  }
+  // Any share no list could use is spent on the largest list, so the budget is not left idle.
+  for (const k of arrayKeys) {
+    const total = (obj[k] as unknown[]).length;
+    let lo = kept.get(k) ?? 0;
+    let hi = total;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      kept.set(k, mid);
+      if (bytes(build()) <= maxBytes) lo = mid; else hi = mid - 1;
+    }
+    kept.set(k, lo);
+  }
+  const text = JSON.stringify(build(), null, 2);
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) return undefined;
+  return { text, truncated: Object.keys(omitted()).length > 0 };
+}
+
 export function capStructuredResult(result: unknown, maxBytes: number): { text: string; truncated: boolean } {
   if (typeof result === 'string') {
     return capOutput(sanitizeForTerminal(result, { keepNewlines: true }), maxBytes);
@@ -323,17 +428,47 @@ export function capStructuredResult(result: unknown, maxBytes: number): { text: 
       // Serialize the enclosing shape ONCE with the field emptied; the field's own
       // contribution is then pure arithmetic. `""` in the shell is the 2 quote bytes
       // the real field also pays, so the shell's size needs no adjustment.
+      //
+      // `truncated: true` is this branch's long-standing receipt and stays the default. But it
+      // must not OVERWRITE a tool that declares a `truncated` of its own shape
+      // (`certify_public_surface`'s `{ omitted }`, `blast_radius`'s, `plan_parallel_work`'s) —
+      // that replaced an object with a boolean and erased the count it carried. Where the field
+      // is already taken, the receipt goes under `responseBudget`, as the list-trimming one
+      // does, and the tool's own disclosure is left exactly as it was
+      // (change: fix-budget-receipt-collision).
+      const receipt = 'truncated' in obj
+        ? {
+          responseBudget: {
+            trimmed: true,
+            note: 'One field was cut to fit the response byte budget; it ends with a marker '
+              + "saying so. This tool's own `truncated` disclosure is unchanged. Narrow the "
+              + 'query for the whole value.',
+          },
+        }
+        : { truncated: true };
       const shellBytes = Buffer.byteLength(
-        JSON.stringify({ ...obj, [key]: '', truncated: true }, null, 2), 'utf8',
+        JSON.stringify({ ...obj, [key]: '', ...receipt }, null, 2), 'utf8',
       );
       const best = largestFittingJsonCut(field, maxBytes - shellBytes - jsonEscapedBytes(marker));
-      const capped = { ...obj, [key]: field.slice(0, best) + marker, truncated: true };
+      const capped = { ...obj, [key]: field.slice(0, best) + marker, ...receipt };
       const text = JSON.stringify(capped, null, 2);
       if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { text, truncated: true };
     }
   }
 
-  // Fallback (arrays / no dominant string field): a valid JSON envelope around the partial.
+  // Before giving up on the shape: SHRINK the lists. A whole-repository answer
+  // (`get_architecture_overview`'s clusters, `get_refactor_report`'s candidates,
+  // `get_mapping`'s requirements) is a summary plus ranked arrays, and those arrays are
+  // sorted most-significant-first by the tool that built them. Dropping their tails keeps
+  // the summary, the shape, and the top of every list, and says exactly how many items it
+  // dropped — which is a usable answer. Replacing all of it with a JSON string cut
+  // mid-structure is not, and on a mid-size repository that is what an agent got
+  // (change: fix-whole-repo-answers-under-budget).
+  const trimmed = fitByTrimmingArrays(result, maxBytes);
+  if (trimmed) return trimmed;
+
+  // Fallback (no arrays to shrink, or a summary that cannot fit alone): a valid JSON
+  // envelope around the partial.
   const note =
     'output exceeded the response byte budget; narrow the query (add a filePattern, lower a ' +
     'limit/maxDepth/maxResults, or query a specific symbol/file).';

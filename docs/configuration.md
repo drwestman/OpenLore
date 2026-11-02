@@ -68,7 +68,8 @@ Expansion is enabled by default. Disable it without rebuilding the index:
 ```
 
 Disabling expansion restores ordinary keyword ranking. Semantic retrieval remains the higher-recall
-opt-in path, and the `openlore embed --local` guidance stays visible in both keyword modes.
+path; `openlore status` and `openlore doctor` name it in both keyword modes. Agent responses report
+`retrievalMode` only, with no advice to change it.
 `openlore prove --estimate` reports a separately labeled recall@10 comparison over up to 100 of the
 repository's own symbol/doc-comment pairs; it is not an agent-cost benchmark.
 
@@ -288,6 +289,18 @@ The governable finding codes (the **finding-code catalogue** — every code defa
 | `memory-anchor-lost` | memory-freshness | advisory | A recorded memory has an anchor that is lost or ambiguous (`needs-human-reselection`), so `recall` withholds it. One finding per memory, with the memory id as subject; `openlore enforce` always collects it, and `recall` also returns it in `findings`. Set to `blocking` or `frozen`, it also fails the gate when the check is incomplete: no analysis, an unreadable memory store, or an anchored file whose content differs from what the analysis recorded (a file the index has no content key for, such as one from an imported bundle, is disclosed but does not fail it). `openlore enforce` never renames a torn `notes.json` or `decisions/pending.json`; it stays in place and is reported until repaired, and the corpus-integrity codes (blocking by default) fail on it, so a commit is blocked until it is fixed. |
 | `declining-health` | health-map | advisory | A high-complexity function in a churned file never got simpler and ended more complex over its sampled recent commits (`rising` in `get_health_map`'s `complexityTrend`). |
 | `deprecated-symbol-use` | structural-diff | advisory | A diff adds a call into a symbol marked deprecated by its language's standard marker (see `deprecationMarkers` in [language support](language-support.md)). Calls that were already there do not fire it. `structural_diff` returns these findings in `deprecatedCalls`, classified by this policy. |
+| `unresolved-internal-import` | phantom-references | advisory | A diff adds a relative import whose target is not a file in this repository. A path alias the resolver cannot follow is disclosed instead. `verify_change` returns these in `findings`, classified by this policy; `openlore enforce` does not collect them. See [phantom references](phantom-references.md). |
+| `unresolved-internal-symbol` | phantom-references | advisory | A diff adds a named import the target module does not export, read from the target's current content. A target that re-exports from somewhere unfollowable is disclosed instead. |
+| `undeclared-dependency` | phantom-references | advisory | A diff adds an import of an external package no manifest in scope declares, and that is not the standard library. An ecosystem with no readable manifest is disclosed instead. |
+| `unpinned-dependency` | phantom-references | advisory | A diff adds an import of a package its changed manifest declares but the lockfile beside it does not pin. An absent or unparseable lockfile yields no finding. |
+| `generated-file-edited` | generated-file-guard | advisory | A diff edits a generated or vendored file without its source or the config entry that regenerates it, or changes a lockfile without its manifest. A newly added generated file does not fire it. `verify_change` returns these in `findings`, classified by this policy; `openlore enforce` does not collect it. See [generated files](generated-files.md). |
+| `test-removed` | check-weakening | advisory | A test case or test file present at the baseline (the merge-base) is gone; a case renamed with the same body does not fire it. `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
+| `test-disabled` | check-weakening | advisory | A skip marker (`it.skip`, `xit`, `@pytest.mark.skip`, `t.Skip`, `@Disabled`) or a focus marker (`.only`, `fit`) was added to a test. `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
+| `assertions-reduced` | check-weakening | advisory | A test has fewer assertion calls than at the baseline. `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
+| `expected-value-changed` | check-weakening | advisory | A literal argument of a test's assertions changed while no production symbol the test file reaches changed. `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
+| `suppression-added` | check-weakening | advisory | A suppression comment or annotation was added (`@ts-ignore`, `eslint-disable`, `# noqa`, `# type: ignore`, `//nolint`, `@SuppressWarnings`, …). `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
+| `error-swallowed` | check-weakening | advisory | A new catch/except (or Go `if err != nil`) block that is empty, or only logs and returns at most a constant, around a call. `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
+| `check-config-relaxed` | check-weakening | advisory | A test-runner, coverage, lint, or CI config was relaxed (exclude added, rule off, threshold lowered or removed, `continue-on-error` or `if: false` added, test step removed or changed, config deleted), or `.openlore/config.json` lowered the enforcement class of a check-weakening code. `structural_diff` and `verify_change` return it, classified by this policy; `openlore enforce` does not collect it. See [check weakening](check-weakening.md). |
 | `orphans-anchored-decision` | blast-radius | advisory | The change orphans one or more anchored architectural decisions. |
 | `surface-info` | impact-certificate | advisory | The change opens a new path into a declared covering surface marked `info`. |
 | `surface-warn` | impact-certificate | advisory | The change opens a new path into a declared covering surface marked `warn`. |
@@ -295,6 +308,7 @@ The governable finding codes (the **finding-code catalogue** — every code defa
 | `parallel-work-conflict` | plan-parallel-work | advisory | Two tasks proposed for concurrent work have a write-write (WAW) conflict; `plan_parallel_work` schedules them into different waves. |
 | `parallel-work-cycle` | plan-parallel-work | advisory | A set of proposed tasks forms an unorderable read-after-write cycle; `plan_parallel_work` schedules the members mutually exclusive and the circular dependency should be resolved. |
 | `cross-actor-conflict` | interference-map | advisory | Two in-flight changes (branches/PRs/agent tasks, within or across a federation) have a write-write (WAW) conflict on a shared symbol; `map_in_flight_conflicts` reports them as must-not-land-concurrently. A CI check can name this code to warn when a new PR collides with an open one. |
+| `duplicate-intent` | declare-footprint | advisory | Two live agents on the peer board intend to create the same symbol name or file. |
 | `export-removed` | public-surface | advisory | An exported symbol was removed from the public surface. |
 | `export-renamed` | public-surface | advisory | An exported symbol was renamed; consumers binding the old name break. |
 | `export-visibility-reduced` | public-surface | advisory | An exported symbol is still defined but no longer exported. |
@@ -304,12 +318,33 @@ The governable finding codes (the **finding-code catalogue** — every code defa
 | `param-type-narrowed` | public-surface | advisory | A parameter type of an exported signature was narrowed. |
 | `return-type-narrowed` | public-surface | advisory | The return type of an exported signature was narrowed. |
 | `signature-unprovable` | public-surface | advisory | An exported signature changed and its compatibility cannot be proven from the available types; emitted at severity `warning`, never breaking-classed. |
+| `contract-breaking` | service-contract | advisory | An API schema element changed in a way existing clients may not handle (a breaking or dangerous rule of `certify_service_contract`). |
+| `contract-declared-unimplemented` | service-contract | advisory | An API operation is declared in a specification but no indexed route handler serves it. |
+| `contract-implemented-undeclared` | service-contract | advisory | A route handler serves a path under one the specification covers, but the specification does not declare it. |
 
 > **Note on the surface codes.** The change-impact certificate's *own* `--json` finding codes are `surface-newly-reached` / `surface-critical` (see [mcp-tools.md](mcp-tools.md)); the enforcement gate governs the **per-severity** codes `surface-info` / `surface-warn` / `surface-critical` (one per declared surface severity). To block a surface via `enforcement.policy`, name the per-severity code (e.g. `"surface-critical": "blocking"`), not `surface-newly-reached` — an unrecognized code is retained but governs nothing.
 
 > **Note on the public-surface codes.** The nine `public-surface` codes are the finding-bearing rule codes of `certify_public_surface` (one finding per rule per changed export, in its `findings[]`): the eight breaking-classed codes at severity `error`, and `signature-unprovable` at severity `warning`. Like the parallel-work codes, they are emitted only by that tool, which needs a base ref; `openlore enforce` does not run it. `export-added` is a rule code on the verdict but not a finding.
 
 > **Note on the parallel-work / cross-actor codes.** `parallel-work-conflict` / `parallel-work-cycle` (from `plan_parallel_work`) and `cross-actor-conflict` (from `map_in_flight_conflicts`) are emitted **only** by those MCP tools, which `openlore enforce` never runs (the gate is diff-based; these tools need a caller-supplied task list or live git/PR state). Naming them in `enforcement.policy` lets the **caller that invokes the tool** classify its `findings[]` with `resolveEnforcementClass` and block in its own CI — e.g. a CI check that warns when a new PR's footprint collides with an open one; the bundled commit gate never produces or blocks on them.
+
+### Agent-loop hooks
+
+`openlore install` wires four agent-loop moments in a repository's Claude Code settings (see
+[install](install.md#agent-loop-hooks)). Each is on unless turned off here:
+
+```json
+{ "hooks": { "before-edit": true, "after-tools": true, "before-stop": false } }
+```
+
+| Key | Moment |
+|-----|--------|
+| `before-edit` | before an edit tool runs: generated, vendored, or lockfile target; unresolved references in the pending text |
+| `after-tools` | after an edit: session-ledger record and facts, check weakening, phantom references, peer changes to declared or served symbols |
+| `before-stop` | before the agent stops: the `verify_change` receipt (blocks only on policy-blocking findings) |
+| `after-compact` | after the conversation is compacted: the handoff briefing of the in-flight change |
+| `before-subagent` | before an `Agent`/`Task` call: queues the sub-agent's task (prints nothing) |
+| `subagent-start` | when a sub-agent starts: its task-scoped briefing and the live peers on the board |
 
 ### Task-scoped context injection
 

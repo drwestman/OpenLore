@@ -36,8 +36,10 @@ import {
 } from '../../core/services/mcp-handlers/tool-guard.js';
 
 import { sanitizeMcpError, validateDirectory } from '../../core/services/mcp-handlers/utils.js';
+import { setActiveToolSurface } from '../../core/services/mcp-handlers/active-surface.js';
 import { createTracker, updateTracker, updatePanic, resetPanicOnOrient, getFreshnessSignal, trackerToPanicState } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemic-lease.js';
+import { SessionLedger, servedItems } from '../../core/services/session-ledger.js';
 import {
   registerRepairBuilder,
   registerRepairHost,
@@ -689,10 +691,11 @@ export const TOOL_DEFINITIONS = [
     description:
       'USE THIS BEFORE asserting a structural fact ("X is dead", "Y calls Z", "this is safe to change") ' +
       'or citing a decision ("ADR abc12345 governs this"). ' +
-      'Returns a deterministic verdict (confirmed | refuted | unverifiable) + a citation receipt (spans, ' +
-      'content hashes, index commit) — a graph computation, never an LLM guess. kinds: calls, reaches, ' +
+      'Returns a deterministic verdict (confirmed | refuted | unverifiable) + a citation receipt — a ' +
+      'graph computation, never an LLM guess. kinds: calls, reaches, ' +
       'impacts, dead, safe-to-change (structural); decision-current (is a recorded decision still ' +
-      'authoritative, or superseded/rejected?). "unverifiable" is first-class when the claim hits a ' +
+      'authoritative or superseded?); decision-governed (a symbol); endpoint-implemented, ' +
+      'endpoint-consumed ("METHOD /path"). "unverifiable" is first-class when the claim hits a ' +
       'dynamic-dispatch blind spot or names an unknown decision — hedge or read the source. Run ' +
       'analyze_codebase first for structural kinds.',
     inputSchema: {
@@ -702,10 +705,10 @@ export const TOOL_DEFINITIONS = [
         directory: { type: 'string', description: DIR_DESC },
         kind: {
           type: 'string',
-          enum: ['calls', 'reaches', 'dead', 'impacts', 'safe-to-change', 'decision-current'],
-          description: 'The kind of claim to verify (structural, or decision-current for decision authority).',
+          enum: ['calls', 'reaches', 'dead', 'impacts', 'safe-to-change', 'decision-current', 'decision-governed', 'endpoint-implemented', 'endpoint-consumed', 'lease-current'],
+          description: 'The kind of claim to verify.',
         },
-        subject: { type: 'string', description: 'What the claim is about: a function/method name for structural kinds, or an 8-character decision id for decision-current.' },
+        subject: { type: 'string', description: 'A symbol; a decision id; "METHOD /path"; or a leaseToken.' },
         object: { type: 'string', description: 'The second symbol — required for relational kinds (calls, reaches, impacts).' },
       },
       required: ['kind', 'subject'],
@@ -1748,6 +1751,28 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'declare_footprint',
+    description:
+      'USE THIS WHEN: several agents work in worktrees of one clone and you start a task. Publishes ' +
+      'your writeSet/readSet (symbols or files; unknown names = intended creations) to the clone\'s ' +
+      'peer board and returns hazards vs live peers (the plan_parallel_work classes plus ' +
+      'duplicate-intent). action: release when done, list to read. Entries end on release, merged or ' +
+      'deleted branch, or 30 min idle. Advisory; peer text is local-unreviewed.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        action: { type: 'string', enum: ['declare', 'release', 'list'], description: 'declare (default), release, or list.' },
+        actorId: { type: 'string', description: 'Stable agent id (default <branch>@<worktree>).' },
+        title: { type: 'string', description: 'Task title (120 chars).' },
+        writeSet: { type: 'array', items: { type: 'string' } },
+        readSet: { type: 'array', items: { type: 'string' } },
+        writeMode: { type: 'string', enum: ['modify', 'append'] },
+      },
+    },
+  },
+  {
     name: 'fleet_status',
     description:
       'USE THIS WHEN: coordinating parallel agents/branches off a moving base — "which of my recorded ' +
@@ -1798,6 +1823,7 @@ export const TOOL_DEFINITIONS = [
             required: ['id'],
           },
         },
+        includeBoard: { type: 'boolean', description: 'Also plan the live peer-board agents (declare_footprint) as tasks board:<actorId>.' },
       },
       required: ['tasks'],
     },
@@ -1939,6 +1965,50 @@ export const TOOL_DEFINITIONS = [
         communityId: { type: 'string', description: 'Profile one community/region by id (list ids with get_map).' },
         filePath: { type: 'string', description: 'Profile a single file (exact path or a unique path suffix). Most specific scope: if both filePath and communityId are given, filePath wins.' },
         language: { type: 'string', description: 'Restrict the returned languages to this one (e.g. "TypeScript").' },
+      },
+    },
+  },
+  {
+    name: 'certify_service_contract',
+    description:
+      'USE THIS WHEN: you change an OpenAPI/Swagger schema or the routes serving it. Unlike ' +
+      'certify_public_surface (exported code), this certifies the HTTP contract. No baseRef: declared ' +
+      'operations and parity with indexed route handlers. With baseRef: a closed-table verdict per ' +
+      'changed element vs the merge-base (breaking | dangerous | non-breaking | potentially-breaking), ' +
+      'breaking ones with their in-repo client call sites, and a suggestedBump. An unreadable spec is ' +
+      'notAssessed, never unchanged. Advisory findings can be gated by enforcement.policy.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Compare with this ref (its merge-base with HEAD).' },
+        maxResults: { type: 'number', description: 'Cap per list (default 100, max 1000).' },
+        allowBaseFallback: { type: 'boolean', description: 'Fall back to the default branch when baseRef does not resolve (disclosed).' },
+        federation: { type: 'boolean', description: 'Also census client call sites in indexed sibling repositories (.openlore/federation.json). A service\'s consumers are usually not in its own repository; every sibling not censused is disclosed.' },
+        federationRepos: { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Limit the federation census to these registry repo names (default: all).' },
+      },
+    },
+  },
+  {
+    name: 'get_handoff_briefing',
+    description:
+      'USE THIS WHEN: you take over in-flight work in a fresh context (after compaction, a cleared ' +
+      'session, or another machine) and need the state of the change, not a prose summary. Unlike ' +
+      'blast_radius (reviews a pending diff), briefing_since (catches up on others\' landed changes) ' +
+      'and orient (starts a task), this hands an in-flight change over: the symbols touched (working ' +
+      'tree, plus those this session committed when a session ledger is live) with callers, the open ' +
+      'openspec changes naming them with unchecked tasks quoted, the tests that reach them, anchored ' +
+      'memories and decisions in scope (orphaned ones withheld), specs that may go stale, and the ' +
+      'uncommitted files and index lease. Every element names the call that expands it; a budget trims ' +
+      'the least central sections first with omission receipts. Deterministic: the same repository ' +
+      'state gives the same briefing. A clean tree says nothing is in flight. Reads no transcript.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        tokenBudget: { type: 'number', description: 'Approximate token budget for the briefing (default 1500, 300-8000).' },
       },
     },
   },
@@ -2148,9 +2218,11 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'record_decision',
     description:
-      'Record a DRAFT architectural decision — a proposal, not a final record. ' +
+      'Record an architectural decision. ' +
       'Call this on a significant design choice: data structure, library, API contract, auth strategy. ' +
-      'Diff-grounded consolidation then promotes it (possibly rewording it, keeping your text as ' +
+      'Under decision autopilot (the default unless a blocking decisions gate is installed) it is accepted ' +
+      'at once as auto-approved and a human reviews it later; otherwise it is a DRAFT, and ' +
+      'diff-grounded consolidation then promotes it (possibly rewording it, keeping your text as ' +
       'authorStatement), merges it, or rejects it — always with a stated reason. The response returns ' +
       'the draft id and the command that reads the verdict; re-recording a decided draft returns that ' +
       'verdict instead of a second draft. Use supersedes when a later decision replaces an earlier one.',
@@ -2446,6 +2518,7 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | t
   detect_changes: _RO, get_health_map: _RO, get_surprising_connections: _RO, record_decision: _RW, list_decisions: _RO,
   approve_decision: _RWI, reject_decision: _RWDI, sync_decisions: _RWI,
   remember: _RW, recall: _RO, verify_claim: _RO,
+  declare_footprint: _RW,
   // Audited writers (change: adopt-mcp-protocol-conformance): `persist: true` writes a certificate,
   // and federation_status adopts newly indexed fingerprints into the federation manifest.
   spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RWI, federation_status: _RWI,
@@ -2456,6 +2529,8 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | t
   certify_public_surface: _RO,
   get_style_fingerprint: _RO,
   briefing_since: _RO,
+  get_handoff_briefing: _RO,
+  certify_service_contract: _RO,
   find_clones: _RO,
   analyze_error_propagation: _RO,
   analyze_env_impact: _RO,
@@ -2578,7 +2653,7 @@ export const TOOL_PRESETS: Record<string, Set<string>> = {
   // (mcp-quality: minimize the tools an agent must consider; changes: add-parallel-work-plan,
   // add-cross-actor-interference-map).
   coordination: new Set([
-    'orient', 'plan_parallel_work', 'map_in_flight_conflicts', 'certify_merge', 'fleet_status', 'analyze_impact', 'find_path',
+    'orient', 'plan_parallel_work', 'map_in_flight_conflicts', 'certify_merge', 'fleet_status', 'declare_footprint', 'analyze_impact', 'find_path',
   ]),
   // The navigation core plus governance reads (change: unify-navigation-and-governance-substrate;
   // architecture: UnifiedStructuralSubstrate). The `navigation` graph-traversal core
@@ -2623,9 +2698,9 @@ export const STANDING_CONTEXT_BUDGETS: Record<string, {
   memory: { baselineTokens: 1_510, maxTokens: 1_610, rationale: 'Re-baselined from 1,216 for remember\'s trigger and pinned inputs (change: add-memory-trigger-predicates), then from 1,399 for its bounded claims input (change: add-memory-claim-verdicts), plus 6.6% headroom.' },
   verify: { baselineTokens: 2_075, maxTokens: 2_220, rationale: 'Grew with verify_change then certify_provenance (add-verification-feedback-loop, add-change-provenance-certificate); exact measured baseline plus 7.0% headroom.' },
   federation: { baselineTokens: 3_837, maxTokens: 4_100, rationale: 'Exact v1 wire baseline plus 6.9% headroom.' },
-  coordination: { baselineTokens: 3_171, maxTokens: 3_400, rationale: 'Grew with certify_merge then fleet_status (add-merge-semantic-certificate, add-fleet-coordination-arc); exact measured baseline plus 7.2% headroom.' },
+  coordination: { baselineTokens: 3_476, maxTokens: 3_720, rationale: 'Grew with certify_merge, fleet_status, then declare_footprint (add-merge-semantic-certificate, add-fleet-coordination-arc, add-peer-footprint-board); exact measured baseline plus 7.0% headroom.' },
   substrate: { baselineTokens: 5_131, maxTokens: 5_500, rationale: 'Exact v1 wire baseline plus 7.2% headroom.' },
-  full: { baselineTokens: 25_848, maxTokens: 27_000, rationale: 'Grew with verify_change, certify_provenance, and certify_merge; exact measured baseline plus 4.5% headroom.' },
+  full: { baselineTokens: 27_125, maxTokens: 28_400, rationale: 'Grew with verify_change, certify_provenance, certify_merge, get_handoff_briefing, certify_service_contract, and declare_footprint; re-baselined at 27,125 measured (add-peer-footprint-board) plus 4.7% headroom.' },
 };
 
 /**
@@ -2821,6 +2896,9 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
   }
   const activePreset = resolvePresetName(selectorOpts);
   const activeToolNames = new Set(activeTools.map((tool) => tool.name));
+  // Tell the guidance renderers what this process actually serves, so `orient` cannot
+  // prescribe a tool this preset does not expose (change: fix-orient-guidance-preset).
+  setActiveToolSurface(activeToolNames);
   // Advertise breadth once via server instructions only when the active surface
   // IS the lean default (LEAN_DEFAULT_PRESET) — whether reached by no selector or
   // an explicit `--preset <that name>` (how install wires it). Adds no tool schemas.
@@ -2844,6 +2922,20 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
 
   // --watch-auto: start the watcher on the first tool call that carries a directory
   let autoWatcher: import('../../core/services/mcp-watcher.js').McpWatcher | undefined;
+  let autoWatcherRoot = '';
+
+  // Session ledger (change: add-session-structural-ledger): the symbols this session served and
+  // the versions edited symbols took. One per directory, like the tracker; removed on shutdown.
+  let ledger: SessionLedger | undefined;
+  const ledgerFor = (dir: string): SessionLedger => {
+    const root = resolve(dir);
+    if (!ledger || ledger.root !== root) {
+      ledger?.dispose();
+      ledger = new SessionLedger(root);
+    }
+    ledger.setWatcherActive(autoWatcherRoot === root);
+    return ledger;
+  };
 
   // change: fix-process-exit-lifecycle
   // The stdio server's lifetime is its stdin. Every long-lived resource acquired
@@ -2853,6 +2945,7 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
   // event loop alive after the client closes the pipe, leaking a zombie process
   // per agent session.
   const lifecycle = createShutdownCoordinator();
+  lifecycle.register(async () => { ledger?.dispose(); });
   enableChildProcessBuilds();
   lifecycle.register(stopChildProcessBuilds);
 
@@ -2984,10 +3077,22 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
           // the session warms up on its own. Non-blocking and fail-soft. We inject
           // install's full buildIndex (init + analyze + BM25 search index, no API
           // key) so orient is warmed to full parity, not just the structural graph.
-          const { bootstrapAnalysisInBackground } = await import('../../core/services/cold-start-bootstrap.js');
-          bootstrapAnalysisInBackground(resolve(dir), {
-            analyze: buildIndexInChildProcess,
-          });
+          const { bootstrapAnalysisInBackground, hasAnalysis, repairInBackground } = await import('../../core/services/cold-start-bootstrap.js');
+          // A new worktree first copies a sibling checkout's verified index, awaited so this
+          // very call answers from it; the rebuild then reuses its per-file memo
+          // (change: seed-worktree-index-from-sibling-checkout).
+          const { seedFromSiblingCheckout, servingSeededIndex } = await import('../../core/runtime/seed-from-sibling.js');
+          const root = resolve(dir);
+          if (!hasAnalysis(root) && !autoInitSuppression(root)) await seedFromSiblingCheckout(root);
+          if (await servingSeededIndex(root)) {
+            repairInBackground(root, 'seeded', {
+              analyze: (d, buildOpts) => buildIndexInChildProcess(d, { repair: true, mode: buildOpts?.mode }),
+            });
+          } else {
+            bootstrapAnalysisInBackground(root, {
+              analyze: buildIndexInChildProcess,
+            });
+          }
           const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
           const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
           const watchConfig = await readOpenLoreConfig(resolve(dir));
@@ -3002,8 +3107,14 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
             // HEAD change / budget-exceeded stale region — the graph stays fresh
             // without a post-commit hook or a running daemon.
             selfRebuild: true,
+            // Each re-indexed file's new symbol versions feed the session ledger.
+            onFilesReindexed: files => {
+              if (ledger && ledger.root === resolve(dir)) void ledger.recordReindexed(files);
+            },
           });
           const watcherStart = autoWatcher.start();
+          // The ledger takes versions from the watcher only once it is running.
+          void watcherStart.then(() => { autoWatcherRoot = resolve(dir); ledger?.setWatcherActive(ledger.root === autoWatcherRoot); }, () => {});
           void watcherStart.catch(error => {
             process.stderr.write(`[mcp-watcher] startup failed: ${(error as Error).message}\n`);
           });
@@ -3036,6 +3147,10 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
       // Invariant: only MCP tool calls (this path) feed panic. CLI commands (panic-check,
       // telemetry) are separate processes that read state but never call updateTracker —
       // no recursive panic feedback loop from openlore internal commands.
+      // The ledger samples what changed since the last call before panic reads its loops.
+      const sessionLedger = directory ? ledgerFor(directory) : undefined;
+      if (sessionLedger) await sessionLedger.refresh().catch(() => {});
+
       if (tracker && directory) {
         const isOrient = name === 'orient';
         updateTracker(tracker, name, directory, typeof filePath === 'string' ? filePath : undefined);
@@ -3056,6 +3171,8 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
               staleDepth: tracker.staleDepth,
               directory,
               tool: name,
+              // Taken only here, where panic reads them, so a loop is never consumed unread.
+              editOscillation: sessionLedger?.takeNewOscillations().length ?? 0,
             });
           }
           // Locked read-modify-write so this per-call score/level update cannot clobber a
@@ -3139,6 +3256,8 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
           }
           throw err;
         }
+        // What this response served, with each symbol's version now (hashed off the response path).
+        if (sessionLedger) void sessionLedger.recordServed(servedItems(name, result));
         // orient emits navigation telemetry tied to the MCP session's agent.
         if (name === 'orient' && result && typeof result === 'object') {
           const r = result as Record<string, unknown>;
@@ -3186,6 +3305,9 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
       if (signal?.prepend) content.push({ type: 'text', text: signal.text });
       content.push({ type: 'text', text });
       if (signal && !signal.prepend) content.push({ type: 'text', text: signal.text });
+      // Named background changes and edit loops: a separate neutral note, each fact stated once.
+      const ledgerNote = sessionLedger?.takeNote();
+      if (ledgerNote) content.push({ type: 'text', text: ledgerNote });
 
       // Index self-healing disclosure (change: make-index-self-healing). When a
       // read-path staleness signal has triggered a background repair for this repo,
@@ -3350,7 +3472,7 @@ export const mcpCommand = new Command('mcp')
   .option('--watch-debounce <ms>', 'Debounce delay in ms before re-indexing after a file change (default: 400)', '400')
   .option('--watch-no-embed', 'Watch signatures only — skip live vector re-embedding (embeddings refresh at commit). Large repos auto-degrade to this.')
   .option('--minimal', 'Expose only core 6 tools (orient, search_code, record_decision, detect_changes, check_spec_drift, get_health_map). Pair with alwaysLoad: true in Claude Code for always-visible core tools.')
-  .option('--preset <name>', `Expose a named tool preset. Default (no preset) is the "${LEAN_DEFAULT_PRESET}" surface — the graph-traversal core (orient, search_code, get_subgraph, trace_execution_path, analyze_impact, suggest_insertion_points, get_function_skeleton, get_landmarks, get_map, find_path), spec preparation (prepare_spec_generation + prepare_spec_repair), and governance reads (recall + verify_claim + blast_radius) — NOT the full registry. "navigation" = the lean navigate-only escape (the graph-traversal core alone, no governance or spec-workflow reads); "minimal" = orient+search+governance; "memory" = orient+remember+recall; "verify" = orient+search+verify_claim; "federation" = orient + federation_status + spec_store_status + working_set_context + change_impact_certificate + map_in_flight_conflicts + the four cross-repo conclusion tools; "coordination" = orient + plan_parallel_work + map_in_flight_conflicts + analyze_impact + find_path; "full" = all ${TOOL_DEFINITIONS.length} tools (the prior default). Takes precedence over --minimal.`)
+  .option('--preset <name>', `Expose a named tool preset. Default (no preset) is the "${LEAN_DEFAULT_PRESET}" surface — the graph-traversal core (orient, search_code, get_subgraph, trace_execution_path, analyze_impact, suggest_insertion_points, get_function_skeleton, get_landmarks, get_map, find_path), spec preparation (prepare_spec_generation + prepare_spec_repair), and governance reads (recall + verify_claim + blast_radius) — NOT the full registry. "navigation" = the lean navigate-only escape (the graph-traversal core alone, no governance or spec-workflow reads); "minimal" = orient+search+governance; "memory" = orient+remember+recall; "verify" = orient+search+verify_claim; "federation" = orient + federation_status + spec_store_status + working_set_context + change_impact_certificate + map_in_flight_conflicts + the four cross-repo conclusion tools; "coordination" = orient + plan_parallel_work + map_in_flight_conflicts + certify_merge + fleet_status + declare_footprint + analyze_impact + find_path; "full" = all ${TOOL_DEFINITIONS.length} tools (the prior default). Takes precedence over --minimal.`)
   .option('--all-tools', `Expose the full surface — all ${TOOL_DEFINITIONS.length} tools (alias for --preset full). Opt-in breadth; the "${LEAN_DEFAULT_PRESET}" default is recommended.`)
   .option('--list-tools', 'Print the active tool surface grouped by capability family (navigate/change/remember/verify/coordinate/federate) and exit — does not start the server. Respects --preset / --all-tools.')
   .action((options: McpServerOptions) => startMcpServer(options));

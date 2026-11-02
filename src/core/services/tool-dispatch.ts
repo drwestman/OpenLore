@@ -164,8 +164,29 @@ export async function dispatchTool(
     const checked = enforceConclusionContract(canonical, result, (msg) => logger.warning(msg));
     // Data-dependent next-call receipts (change: add-conclusion-followup-hints).
     const hinted = withFollowupHints(canonical, checked);
-    return withPartialIndexReceipt(await redactSourceToolResult(canonical, hinted, directory), directory);
+    const leased = await withLeaseToken(canonical, hinted, args, directory);
+    return withPartialIndexReceipt(await redactSourceToolResult(canonical, leased, directory), directory);
   });
+}
+
+/**
+ * `orient` and `recall` carry a `leaseToken` naming what they served, so another process can ask
+ * `verify_claim` (`lease-current`) whether it is still current (change: add-session-lease-tokens).
+ * Best effort: no token is attached when nothing was served or the token cannot be written.
+ */
+async function withLeaseToken(tool: string, result: unknown, args: Record<string, unknown>, directory: string): Promise<unknown> {
+  if ((tool !== 'orient' && tool !== 'recall') || !result || typeof result !== 'object' || Array.isArray(result) || 'error' in result) return result;
+  try {
+    const { resolve } = await import('node:path');
+    const { existsSync } = await import('node:fs');
+    const root = resolve(typeof args.directory === 'string' ? args.directory : directory);
+    if (!existsSync(resolve(root, '.openlore'))) return result;
+    const { servedForLease, issueLeaseToken } = await import('./lease-tokens.js');
+    const token = await issueLeaseToken(root, servedForLease(tool, result));
+    return token ? { ...(result as Record<string, unknown>), leaseToken: token } : result;
+  } catch {
+    return result;
+  }
 }
 
 /**
@@ -487,6 +508,12 @@ async function dispatchToolImpl(
   } else if (name === 'certify_merge') {
     const { directory, ours, theirs, base, maxFindings } = args as { directory: string; ours: string; theirs: string; base?: string; maxFindings?: number };
     return handleCertifyMerge({ directory, ours, theirs, base, maxFindings });
+  } else if (name === 'declare_footprint') {
+    const { directory, action, actorId, title, writeSet, readSet, writeMode } = args as {
+      directory: string; action?: 'declare' | 'release' | 'list'; actorId?: string; title?: string; writeSet?: string[]; readSet?: string[]; writeMode?: 'append' | 'modify';
+    };
+    const { handleDeclareFootprint } = await import('./mcp-handlers/declare-footprint.js');
+    return handleDeclareFootprint({ directory, action, actorId, title, writeSet, readSet, writeMode });
   } else if (name === 'fleet_status') {
     const { directory, branches } = args as { directory: string; branches?: string[] };
     return handleFleetStatus({ directory, branches });
@@ -528,9 +555,9 @@ async function dispatchToolImpl(
       args as { directory: string; kind: ClaimKind; subject: string; object?: string };
     return handleVerifyClaim({ directory, kind, subject, object });
   } else if (name === 'plan_parallel_work') {
-    const { directory, tasks, readMaxDistance, affectedMaxDepth, ambientFanInPercentile } =
-      args as { directory: string; tasks: TaskDescriptor[]; readMaxDistance?: number; affectedMaxDepth?: number; ambientFanInPercentile?: number };
-    return handlePlanParallelWork({ directory, tasks, readMaxDistance, affectedMaxDepth, ambientFanInPercentile });
+    const { directory, tasks, readMaxDistance, affectedMaxDepth, ambientFanInPercentile, includeBoard } =
+      args as { directory: string; tasks: TaskDescriptor[]; readMaxDistance?: number; affectedMaxDepth?: number; ambientFanInPercentile?: number; includeBoard?: boolean };
+    return handlePlanParallelWork({ directory, tasks, readMaxDistance, affectedMaxDepth, ambientFanInPercentile, includeBoard });
   } else if (name === 'map_in_flight_conflicts') {
     const { directory, baseRef, includeBranches, branches, includePullRequests, tasks, maxChanges, readMaxDistance, affectedMaxDepth, ambientFanInPercentile, federation, federationRepos } =
       args as {
@@ -555,6 +582,15 @@ async function dispatchToolImpl(
     const { directory, communityId, filePath, language } =
       args as { directory: string; communityId?: string; filePath?: string; language?: string };
     return handleGetStyleFingerprint({ directory, communityId, filePath, language });
+  } else if (name === 'certify_service_contract') {
+    const { directory, baseRef, maxResults, allowBaseFallback, federation, federationRepos } =
+      args as { directory: string; baseRef?: string; maxResults?: number; allowBaseFallback?: boolean; federation?: boolean; federationRepos?: string[] };
+    const { handleCertifyServiceContract } = await import('./mcp-handlers/service-contract.js');
+    return handleCertifyServiceContract({ directory, baseRef, maxResults, allowBaseFallback, federation, federationRepos });
+  } else if (name === 'get_handoff_briefing') {
+    const { directory, tokenBudget } = args as { directory: string; tokenBudget?: number };
+    const { handleGetHandoffBriefing } = await import('./mcp-handlers/handoff.js');
+    return handleGetHandoffBriefing({ directory, tokenBudget });
   } else if (name === 'briefing_since') {
     const { directory, baseRef, filePattern, maxResults } =
       args as { directory: string; baseRef?: string; filePattern?: string; maxResults?: number };

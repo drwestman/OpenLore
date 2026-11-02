@@ -44,6 +44,7 @@ export const COMMAND_GROUPS: ReadonlyArray<{ title: string; commands: readonly s
       'impact-certificate',
       'check-edit',
       'certify-public-surface',
+      'certify-service-contract',
       'enforce',
       'review',
       'review-corpus',
@@ -54,6 +55,7 @@ export const COMMAND_GROUPS: ReadonlyArray<{ title: string; commands: readonly s
       'coverage-gaps',
       'working-set',
       'briefing-since',
+      'footprint',
     ],
   },
   {

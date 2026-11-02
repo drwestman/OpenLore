@@ -85,6 +85,35 @@ async function loadInventory(absDir: string): Promise<EnvVar[] | null> {
  * offline. Returns `unknown` (additive-by-cast), conclusion-shaped — read sites +
  * blast radius + reaching tests + disclosed boundaries, never a graph.
  */
+/**
+ * Why the inventory is empty, when it is.
+ *
+ * "Run analyze first" is advice that cannot help a repository the scan does not cover: the
+ * extractor reads TS/JS/Python/Go/Ruby only, so a Rust or Java repository reads env vars the
+ * inventory will never hold however many times it is analyzed. Name the boundary instead
+ * (change: fix-env-scope-hint).
+ */
+async function emptyInventoryHint(absDir: string): Promise<string> {
+  const RUN_ANALYZE = 'No environment variables in the inventory. Run analyze_codebase first.';
+  try {
+    const { readCachedContext } = await import('./utils.js');
+    const { ENV_SOURCE_EXTENSIONS } = await import('../../analyzer/env-extractor.js');
+    const cached = await readCachedContext(absDir);
+    const nodes = cached?.callGraph?.nodes ?? [];
+    if (!nodes.length) return RUN_ANALYZE;
+    const inScope = nodes.some(n => {
+      const dot = n.filePath.lastIndexOf('.');
+      return dot >= 0 && ENV_SOURCE_EXTENSIONS.has(n.filePath.slice(dot).toLowerCase());
+    });
+    if (inScope) return RUN_ANALYZE;
+    return 'No file in this repository is in scope for environment-variable scanning, which reads '
+      + `${[...ENV_SOURCE_EXTENSIONS].sort().join(' ')} only. Re-running analyze will not change `
+      + 'that; a read in another language is a disclosed boundary, not a missing index.';
+  } catch {
+    return RUN_ANALYZE;
+  }
+}
+
 export async function handleAnalyzeEnvImpact(input: AnalyzeEnvImpactInput): Promise<unknown> {
   const absDir = await validateDirectory(input.directory);
 
@@ -113,7 +142,7 @@ export async function handleAnalyzeEnvImpact(input: AnalyzeEnvImpactInput): Prom
       candidates,
       hint: candidates.length
         ? (fuzzy.length ? 'Did you mean one of these?' : 'Not in the inventory. Known variables include:')
-        : 'No environment variables in the inventory. Run analyze_codebase first.',
+        : await emptyInventoryHint(absDir),
     };
   }
 
@@ -249,6 +278,31 @@ export async function handleAnalyzeEnvImpact(input: AnalyzeEnvImpactInput): Prom
       'externally-consumed exports can add callers not enumerated here.',
   );
 
+  // ── Where infrastructure sets it (change: add-iac-code-binding) ──────────────
+  // Keys and locations only: no value is read into the output.
+  const { scanEnvDeclarations } = await import('../env-declaration-scan.js');
+  const iac = await scanEnvDeclarations(absDir);
+  for (const b of iac.boundaries) boundaries.add(b);
+  // Repository text (resource names, paths) is screened before it reaches output.
+  const { emittedText } = await import('../generated-file-guard.js');
+  const declaredBy = iac.declarations.filter(d => d.name === name)
+    .map(d => ({ ecosystem: d.ecosystem, resource: emittedText(d.resource), file: emittedText(d.file), line: d.line, literalValue: d.literalValue }));
+  // A `.env`-style declaration file that lists the name (even with an empty value) declares it.
+  const inEnvFile = entry.hasDefault || entry.files.some(f => /(?:^|\/)\.env(?:\.[^/]*)?$/.test(f));
+  const declaration = declaredBy.length || inEnvFile ? 'declared' : 'undeclared-in-corpus';
+  if (declaration === 'undeclared-in-corpus') {
+    boundaries.add(
+      'undeclared-in-corpus: no file in this repository sets this variable. It is not "unset": it may be ' +
+        'injected at runtime, by a secret store, or by CI variables defined outside the repository.',
+    );
+  }
+  if (iac.opaque.length) {
+    boundaries.add(
+      `${iac.opaque.length} infrastructure source(s) set variables this scan cannot list (envFrom, env_file, ` +
+        'or a map built by an expression); see opaqueEnvSources — the variable may be set there.',
+    );
+  }
+
   return {
     variable: {
       name,
@@ -263,11 +317,16 @@ export async function handleAnalyzeEnvImpact(input: AnalyzeEnvImpactInput): Prom
       requiredReadSites: requiredSites,
       moduleLevelReadSites: moduleLevelCount,
       readingFunctions: readingFnIds.size,
+      declaredBy: declaredBy.length,
       affectedFunctions: affectedFunctions.length,
       affectedFiles: affectedFiles.size,
       reachingTests: reachingTests.length,
     },
     readSites: resolvedSites,
+    declaration,
+    declaredBy: declaredBy.slice(0, MAX_LIST),
+    ...(declaredBy.length > MAX_LIST ? { declaredByTruncated: declaredBy.length - MAX_LIST } : {}),
+    ...(iac.opaque.length ? { opaqueEnvSources: iac.opaque.slice(0, 20).map(o => ({ ...o, resource: emittedText(o.resource), file: emittedText(o.file) })) } : {}),
     affectedFunctions: affectedFunctions.slice(0, MAX_LIST),
     reachingTests: reachingTests.slice(0, MAX_LIST),
     affectedFiles: [...affectedFiles].sort(),
@@ -279,7 +338,8 @@ export async function handleAnalyzeEnvImpact(input: AnalyzeEnvImpactInput): Prom
       'readSites = where this env var is read (file/line/enclosing function; module-level = read at ' +
       'import time). affectedFunctions = upstream callers that transitively reach a read (the blast ' +
       'radius). reachingTests = tests to run. requiredReadSites = reads with no site-local fallback ' +
-      '(a hard break if the var is removed). Computed live from the cached graph + a re-read of the ' +
+      '(a hard break if the var is removed). declaredBy = infrastructure files that set it (key and ' +
+      'location only, never the value). Computed live from the cached graph + a re-read of the ' +
       "var's files — re-run analyze_codebase after edits.",
   };
 }

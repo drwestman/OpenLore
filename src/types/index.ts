@@ -72,8 +72,10 @@ export interface OpenLoreConfig {
    * Optional governance behavior (change: add-decision-autopilot). With
    * `autopilot: true`, the decisions commit gate auto-accepts verified decisions
    * (distinct `auto-approved` status, actor recorded on an append-only ledger),
-   * syncs them to specs, and never blocks a commit; blocking human review is the
-   * behavior when absent/false. Autopilot never touches a human-rejected decision.
+   * syncs them to specs, and never blocks a commit; `false` means blocking human
+   * review. Absent means on, unless a blocking decisions gate is installed
+   * (`resolveAutopilotMode`, change: default-decision-autopilot-with-visible-trace).
+   * Autopilot never touches a human-rejected decision.
    */
   governance?: {
     autopilot?: boolean;
@@ -120,9 +122,23 @@ export interface OpenLoreConfig {
   workspace?: WorkspaceConfig;
   /** Pi extension settings, including who owns daemon spawn authority. */
   pi?: PiConfig;
+  /** Agent-loop hook moments; `false` turns one off (change: add-agent-loop-hook-surfaces). */
+  hooks?: HooksConfig;
+}
+
+/** Each agent-loop moment wired by `openlore install`; absent or `true` is on, `false` is off. */
+export interface HooksConfig {
+  'before-edit'?: boolean;
+  'after-tools'?: boolean;
+  'before-stop'?: boolean;
+  'after-compact'?: boolean;
+  'before-subagent'?: boolean;
+  'subagent-start'?: boolean;
 }
 
 export interface PiConfig {
+  /** Repository-wide architecture/spec context injection. Default `'on-demand'`; `'full'` restores every-turn injection. */
+  contextMode?: 'on-demand' | 'full';
   /**
    * Whether the Pi extension may spawn its own daemon when none is discovered. Default `true`.
    * Set to `false` when a supervising host already runs one daemon per working tree: an
@@ -134,8 +150,9 @@ export interface PiConfig {
   /**
    * Which OpenLore tools are active when a Pi session starts. Default `'lean'`: the tools of the
    * MCP `substrate` preset plus `openlore_configure` and `openlore_activate_tools`, which turns on
-   * the other tool groups on demand. `'all'` activates every OpenLore tool at session start
-   * (change: add-pi-lean-tool-surface).
+   * the other tool groups on demand. If the user has Pi's native `tool_search` active, OpenLore
+   * instead keeps only `orient` and `search_code` directly visible and defers specialist tools
+   * to search. `'all'` activates every OpenLore tool at session start (change: add-pi-lean-tool-surface).
    */
   toolSurface?: 'lean' | 'all';
 }
@@ -283,10 +300,13 @@ export interface EmbeddingConfig {
    *    API key. The model is lazily downloaded and cached on first use. `model`
    *    is optional (defaults to a pinned small model); `baseUrl`/`apiKey` are
    *    ignored.
+   *  - `'none'`: keyword only. Opts out of the local vectors OpenLore otherwise adds in
+   *    the background, and wins over `EMBED_*` environment variables.
    * Omitting `provider` keeps the historical behaviour: a remote endpoint when
-   * `baseUrl` + `model` are present, otherwise no embeddings (keyword default).
+   * `baseUrl` + `model` are present, otherwise the keyword index, to which background
+   * builds add local vectors when the optional package is installed.
    */
-  provider?: 'remote' | 'local';
+  provider?: 'remote' | 'local' | 'none';
   /** Base URL of the OpenAI-compatible embeddings endpoint (remote provider) */
   baseUrl?: string;
   /** Embedding model name (required for remote; optional override for local) */
@@ -790,6 +810,7 @@ export type DecisionDisposition = 'pending' | 'promoted' | 'merged-into' | 'reje
 export type DecisionDispositionReason =
   | 'promoted-as-recorded'
   | 'promoted-with-rewrite'
+  | 'auto-accepted-on-record'
   | 'merged-into-consolidated'
   | 'superseded-by-later-draft'
   | 'not-in-consolidated-set'

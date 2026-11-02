@@ -3113,6 +3113,314 @@ perform.
 - **THEN** the content remains unchanged
 - **AND** the CLI reports the ownership conflict or warning
 
+### Requirement: RepoOnlyWiringIsOfferedTheUserScope
+
+The system SHALL detect when OpenLore is wired for a repository but not for the user scope, or when
+the user-scope wiring predates the current shape. `openlore doctor` SHALL report it as a warning
+with the user-scope install as its remedy, and `openlore status` SHALL report the wiring scope.
+`openlore doctor --fix`, and `openlore update` after a successful upgrade on an interactive
+terminal, SHALL offer that remedy; `--yes` accepts it.
+
+#### Scenario: A repo-only install is noticed
+
+- **GIVEN** a repository with OpenLore-managed `.mcp.json` wiring and no user-scope OpenLore entry
+- **WHEN** the user runs `openlore doctor`
+- **THEN** a "User-scope wiring" warning names the gap ("new repositories and worktrees will not
+  reach OpenLore") and the `doctor --fix` remedy
+
+#### Scenario: An upgrade offers the rewire once
+
+- **GIVEN** the same machine, on an interactive terminal
+- **WHEN** `openlore update` upgrades successfully
+- **THEN** it asks once whether to wire the user scope, and writes nothing unless the user agrees
+  or passed `--yes`
+
+### Requirement: OnlyAHumanRunCommandWritesUserConfiguration
+
+User-level configuration SHALL be written only by an explicit, human-run command. A hook, the MCP
+server, the serve daemon and auto-initialization SHALL NOT write it.
+
+#### Scenario: Agent-driven paths never write the home directory
+
+- **GIVEN** any hook, MCP or serve call in a repository with repo-only wiring
+- **WHEN** the call completes
+- **THEN** no file outside the repository and the OpenLore cache was written
+
+### Requirement: NewWorktreeIsSeededFromASiblingCheckout
+
+When a directory inside a git work tree has no index, and another checkout of the same repository
+(the same git common directory) holds a published index that verifies and attests healthy, the
+first build SHALL seed from that index, serve it at once, and start a background rebuild that reuses
+the seeded per-file memo. Each answer during the rebuild SHALL carry the repair reason `seeded`, and
+each cited file whose content differs from the seed SHALL be reported behind the working tree.
+
+#### Scenario: A new worktree answers on its first call
+
+- **GIVEN** a main checkout with a healthy index, and a new linked worktree of the same repository
+  with no `.openlore` directory
+- **WHEN** the first `orient` call runs in the worktree
+- **THEN** it returns functions and call paths from the seeded index, with a repair marker naming
+  `seeded`, and a background rebuild has started
+
+#### Scenario: Files the worktree changed are named, not hidden
+
+- **GIVEN** a seeded worktree whose branch changed one file relative to the seed
+- **WHEN** an answer cites that file before the rebuild finishes
+- **THEN** that file, and only that file, is reported behind the working tree
+
+### Requirement: SeedingCopiesOnlyVerifiedArtifacts
+
+Seeding SHALL copy only the known analysis artifacts, never symbolic links or runtime state. Any
+failure to find, verify or copy a seed SHALL fall back to the cold build. Seeding SHALL obey the same
+opt-outs as auto-initialization.
+
+#### Scenario: An unverifiable seed is never used
+
+- **GIVEN** a sibling index whose manifest fails to verify, or that is mid-build
+- **WHEN** the worktree's first call runs
+- **THEN** no artifact is copied and the ordinary cold build starts
+
+### Requirement: AutopilotIsTheDefaultForAutoInitializedRepositories
+
+When background auto-initialization creates a repository's configuration, it SHALL record
+`governance.autopilot: true` in it, unless a blocking decisions gate is installed or the directory is
+a linked worktree whose main checkout sets the key. An absent key SHALL keep meaning blocking review,
+so a gate OpenLore cannot see (a CI-only gate, a hook manager, a fresh clone) never turns into
+auto-accept. The resolved mode and its reason SHALL be reported wherever governance state is shown.
+
+#### Scenario: A repository nobody configured runs on autopilot
+
+- **GIVEN** a git repository that auto-init indexed, with no prior OpenLore configuration and no gate
+- **WHEN** governance state is reported
+- **THEN** the configuration carries `governance.autopilot: true`, and the mode is autopilot with the
+  reason "governance.autopilot is true — set it to false to require review"
+
+#### Scenario: An unset key never flips a gate it cannot see
+
+- **GIVEN** a configuration with no `governance.autopilot` and no OpenLore hook in the checkout
+- **WHEN** a decision is recorded
+- **THEN** it stays a draft for review
+
+### Requirement: AWorktreeFollowsTheMainCheckoutsGovernance
+
+When a linked worktree's own configuration has no `governance.autopilot`, the main checkout's value
+SHALL apply, and the reason SHALL name the main checkout. The commit gate lives in hooks that every
+worktree shares, while the configuration is per checkout, so a worktree created after the user chose
+a mode SHALL NOT silently get the opposite one. A worktree's own value SHALL still win.
+
+#### Scenario: An agent worktree auto-accepts like its main checkout
+
+- **GIVEN** a main checkout with `governance.autopilot: true` and the decisions gate installed
+- **AND** a new linked worktree whose configuration has no `governance` block
+- **WHEN** an agent records a decision there and commits
+- **THEN** the decision is auto-accepted and the commit is not blocked
+
+### Requirement: RecordedDecisionsAreAcceptedWithoutAGate
+
+Under autopilot, a decision recorded with a title and rationale SHALL move directly to
+`auto-approved` with actor `agent`, its timestamp and the HEAD commit. It SHALL be appended to the
+ledger and synced to specs in the background, with no git hook and no LLM call. Only deterministic
+checks SHALL gate it (anchored files exist; a superseded decision is live). A decision failing them
+SHALL stay `draft` with the reason. A human rejection SHALL never be re-accepted.
+
+#### Scenario: A recorded decision is accepted at once
+
+- **GIVEN** an autopilot repository with no gate and no API key
+- **WHEN** an agent runs `openlore decisions record --title … --rationale …`
+- **THEN** the decision is `auto-approved`, a ledger entry with actor `agent` exists, and the spec
+  sync runs in the background
+
+### Requirement: GovernanceTraceIsVisibleWithoutAsking
+
+`openlore status` SHALL report the governance mode, the auto-accepted and unreviewed counts, and
+the newest ledger entries. The status line and Pi footer SHALL show the unreviewed count when it is
+above zero. The session primer SHALL name decisions auto-accepted since the previous session in at
+most one line. Each surface SHALL point to `openlore decisions review`.
+
+#### Scenario: The user sees what was accepted
+
+- **GIVEN** two decisions auto-accepted since the last session
+- **WHEN** a new session starts and the user runs `openlore status`
+- **THEN** the primer has one line naming both, the status line shows "2 to review", and `status`
+  lists the ledger entries with the review command
+
+### Requirement: LoopMomentsReceiveBudgetedReceipts
+
+`openlore install` SHALL wire into a repository's Claude Code settings an `openlore hook <moment>`
+command for the moments before an edit (`PreToolUse` on the edit tools), after an edit
+(`PostToolUse` on the edit tools), and before stopping (`Stop`), and SHALL NOT wire them in the user
+scope, where they would run in every repository. Each command SHALL read the harness payload, print
+at most one receipt as the event's `additionalContext` within that moment's budget (keeping the most
+severe items and counting the rest), print nothing when it has no new item, and not repeat a fact
+already delivered under the same harness `session_id`. Facts SHALL compare with the commit the
+harness session started from. At `Stop`, the advisory receipt SHALL be shown to the user, not to
+the agent. The before-edit moment SHALL NOT write the
+target file. The after-edit moment SHALL record the edited file for the session ledger. Each moment
+SHALL be turned off by `hooks.<moment>: false` in `.openlore/config.json`, and `openlore status`
+SHALL list the wired moments.
+
+#### Scenario: A generated file is named before the edit
+
+- **GIVEN** a pending edit to a file whose header says it is generated from `order.proto`
+- **WHEN** the before-edit hook runs on the edit tool's payload
+- **THEN** it states the file is generated and names `order.proto`, and the file is unchanged
+
+#### Scenario: An edit gets only new facts
+
+- **GIVEN** an agent session where the after-edit hook already reported a skipped test
+- **WHEN** the same file is edited again with nothing new
+- **THEN** the hook prints nothing
+
+#### Scenario: Nothing new prints nothing
+
+- **GIVEN** an edit that produces no finding and no ledger fact
+- **WHEN** the after-edit hook runs
+- **THEN** it prints nothing and exits 0
+
+### Requirement: LoopHooksAreAdvisoryUnlessPolicyBlocks
+
+Every `openlore hook <moment>` command SHALL exit 0, and SHALL print nothing on timeout or error,
+whatever the policy. Only when the repository's `enforcement.policy` names one or more finding codes
+as blocking MAY the before-stop hook block, and its message SHALL list the blocking findings and
+their next actions; it SHALL NOT block when the payload says a stop hook is already active. The hook
+SHALL add no imperative of its own; receipt next actions SHALL be carried as labeled data. The
+hook's standard output SHALL carry only the receipt.
+
+#### Scenario: Stop does not block by default
+
+- **GIVEN** no blocking codes in `enforcement.policy` and a session diff with a `test-disabled`
+  finding
+- **WHEN** the before-stop hook runs
+- **THEN** it shows the receipt including the finding to the user and does not block
+
+#### Scenario: A team can make one finding blocking
+
+- **GIVEN** `enforcement.policy` naming `test-disabled` as blocking
+- **WHEN** the before-stop hook runs on the same diff
+- **THEN** the hook blocks the stop and its message names the finding
+
+### Requirement: HandoffBriefingIsDeterministicAndReplayable
+
+`openlore handoff [--json]` SHALL produce the session-succession briefing deterministically: the
+same repository state (working tree, index, stores) yields a byte-identical briefing, with no
+timestamps or ordering nondeterminism, so a successor can regenerate and diff it. A clean
+working tree SHALL return an explicit nothing-in-flight statement with the current lease state,
+never an empty payload, and an index trailing the working tree SHALL carry the standard
+staleness disclosure. The command SHALL read only the repository — never any conversation
+transcript — and SHALL NOT persist briefings.
+
+#### Scenario: Regeneration is byte-identical
+
+- **GIVEN** a repository with uncommitted edits and no further changes
+- **WHEN** `openlore handoff --json` runs twice
+- **THEN** the two outputs are byte-identical
+
+#### Scenario: A clean tree says so
+
+- **GIVEN** a clean working tree
+- **WHEN** `openlore handoff` runs
+- **THEN** the output states nothing is in flight and reports the lease state — not an empty
+  object
+
+### Requirement: SubagentsStartWithATaskScopedBriefing
+
+For Claude Code, `openlore install` SHALL wire a `before-subagent` moment on the parent's `Agent`
+or `Task` tool call that queues the sub-agent's task and prints nothing, and a `subagent-start`
+moment on `SubagentStart` that gives the starting sub-agent the task-scoped `orient` briefing for
+its own task and the live peers of other worktrees on the footprint board. A queued task SHALL be
+given only when it is the one live task of the sub-agent's session and agent type (ambiguity gives
+no task briefing, never another agent's task), taken once, kept only under `.openlore/` with
+credentials redacted, not stored when sub-agent briefings or injection are off, and dropped after
+two minutes.
+
+#### Scenario: A sub-agent gets its own task's briefing
+
+- **GIVEN** a parent that calls `Agent` with the prompt "Find where parseConfig is called"
+- **WHEN** the `Explore` sub-agent starts
+- **THEN** its context holds the task-scoped briefing for that prompt, and the parent's tool call
+  printed nothing
+
+#### Scenario: Ambiguous parallel sub-agents get no task briefing
+
+- **GIVEN** two `Explore` calls and one `Plan` call queued in one turn
+- **WHEN** the three sub-agents start
+- **THEN** the `Plan` sub-agent gets the plan task, and the two `Explore` sub-agents get no task
+  briefing rather than each other's task
+
+### Requirement: PendingEditsAreGradedBeforeTheWrite
+
+The before-edit moment SHALL grade the references a pending `Write`, `Edit`, or `MultiEdit` would
+add, on the pending text in memory against the file's current text, and state each unresolved one
+before the tool writes. It SHALL write nothing, and SHALL skip an edit whose replacement it cannot
+apply exactly (an old string that is absent, or not unique without replace-all).
+
+#### Scenario: An invented import is stated before the write
+
+- **GIVEN** a pending edit whose new text imports `formatDate` from `./utils`, which does not
+  export it
+- **WHEN** the before-edit hook runs on the edit tool's payload
+- **THEN** it prints the unresolved-symbol fact, and the target file is unchanged by the hook
+
+#### Scenario: A valid edit is quiet
+
+- **GIVEN** a pending edit that adds no reference
+- **WHEN** the before-edit hook runs
+- **THEN** it prints nothing
+
+### Requirement: CodexReceivesLoopReceipts
+
+In a repository install, `openlore install` SHALL wire Codex's `.codex/hooks.json` with the
+before-edit (`PreToolUse` on `apply_patch`), after-edit (`PostToolUse` on `apply_patch` and `Bash`),
+before-stop (`Stop`), and after-compact (`SessionStart`, `compact`) moments, keeping every other
+hook and removing only its own on uninstall. An `apply_patch` payload SHALL be read as the files
+its patch touches, never as a shell command.
+
+#### Scenario: A Codex patch onto a generated file is stated before it lands
+
+- **GIVEN** a repository installed for Codex and a generated file `src/gen.ts`
+- **WHEN** Codex's `PreToolUse` hook runs on an `apply_patch` that updates `src/gen.ts`
+- **THEN** the receipt names `src/gen.ts` as generated
+
+#### Scenario: Uninstall keeps the user's hooks
+
+- **GIVEN** a `.codex/hooks.json` with the user's own `PreToolUse` hook and OpenLore's moments
+- **WHEN** OpenLore is uninstalled
+- **THEN** only the user's hook remains
+
+### Requirement: PiToolResultsCarryTheAfterEditReceipt
+
+The Pi extension SHALL append the after-edit receipt to the result of Pi's `edit`, `write`,
+`bash`, and `powershell` tools in an OpenLore project, computed by `openlore hook after-tools` in a
+node child process so that no analyzer loads in the Pi process, and SHALL keep the tool's
+machine-readable result. A refused edit, another tool, a nested call, `json` or `print` mode, a
+silent hook, a failure, an abort, or a 20-second timeout SHALL leave the tool result unchanged.
+
+#### Scenario: A Pi edit of a generated file
+
+- **GIVEN** a Pi session with OpenLore's extension and a generated file `src/gen.ts`
+- **WHEN** Pi's `edit` tool changes `src/gen.ts`
+- **THEN** the tool result the agent reads ends with the receipt naming `src/gen.ts` as generated
+
+#### Scenario: Unrelated tools are untouched
+
+- **GIVEN** a Pi `read` tool result
+- **WHEN** the extension sees it
+- **THEN** the result is unchanged and no child process runs
+
+### Requirement: PiResumesFromTheHandoffAfterCompaction
+
+After Pi compacts a session in an OpenLore project, the Pi extension SHALL compute the handoff
+briefing with `openlore hook after-compact` in a node child process without holding the compaction
+open, and SHALL add the latest compaction's briefing to the next prompt as a conversation message,
+so the agent resumes from the change's computed state. A silent hook, a failure, `json` or `print`
+mode, `hooks.after-compact: false`, or a directory outside an OpenLore project SHALL add nothing.
+
+#### Scenario: Pi compacts a session
+
+- **GIVEN** a Pi session in an OpenLore project with an in-flight change
+- **WHEN** Pi compacts the session
+- **THEN** the next prompt carries the latest handoff briefing as a conversation message, once
+
 ## Technical Notes
 
 - **Dependencies**: ora, logger, ProgressIndicator, showNextSteps, @inquirer/prompts
@@ -3129,7 +3437,7 @@ openlore emits SCIP for interop with external indexers but never imports it; the
 
 **Consequences:** SCIP consumers get a snapshot; openlore never depends on SCIP being read back.
 
-### MCP exposes a curated navigation tool preset, not all 80 tools
+### MCP exposes a curated navigation tool preset, not all 83 tools
 
 **Status:** Approved
 **Date:** 2026-06-01

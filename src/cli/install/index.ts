@@ -22,6 +22,7 @@ import { cursorAdapter } from './adapters/cursor.js';
 import { clineAdapter } from './adapters/cline.js';
 import { continueAdapter } from './adapters/continue.js';
 import { piAdapter } from './adapters/pi.js';
+import { codexAdapter } from './adapters/codex.js';
 import type { ProveEligibility } from '../../core/agent-eval/tasks.js';
 
 const ADAPTERS: Record<AgentName, Adapter> = {
@@ -31,6 +32,7 @@ const ADAPTERS: Record<AgentName, Adapter> = {
   cline: clineAdapter,
   continue: continueAdapter,
   pi: piAdapter,
+  codex: codexAdapter,
 };
 
 async function loadTemplate(): Promise<string> {
@@ -89,6 +91,12 @@ export interface InstallOptions {
    * is node even for a bun-installed `openlore`, whose CLI starts with a node shebang.
    */
   runtime?: string;
+  /**
+   * Wire only the user scope: no repository file, git hook, or index is touched. The
+   * remedy `doctor --fix` and `update` offer a repository wired before user scope
+   * shipped (change: upgrade-repo-only-wiring).
+   */
+  userOnly?: boolean;
   /** User-scope root. Defaults to the user's home directory; a test seam, not a flag. */
   home?: string;
 }
@@ -407,6 +415,11 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
     }
   }
 
+  if (opts.userOnly && opts.repoOnly) {
+    logger.error('--user-only and --repo-only exclude each other.');
+    return 2;
+  }
+
   let runtimeExecutable: string;
   try {
     runtimeExecutable = resolveRuntimeExecutable(
@@ -436,11 +449,14 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
   } else {
     surfaces = await detect(cwd);
   }
+  if (opts.userOnly) surfaces = [];
 
   logger.discovery(
-    `${opts.uninstall ? 'Uninstalling' : 'Installing'} for ${surfaces.length} surface(s): ${surfaces
-      .map((s) => s.agent)
-      .join(', ')}`
+    opts.userOnly
+      ? `${opts.uninstall ? 'Uninstalling' : 'Installing'} the user scope only`
+      : `${opts.uninstall ? 'Uninstalling' : 'Installing'} for ${surfaces.length} surface(s): ${surfaces
+        .map((s) => s.agent)
+        .join(', ')}`
   );
 
   let conflict = false;
@@ -457,9 +473,15 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
     'This guidance is written for that surface; re-run `openlore install --preset <name>` to change it ' +
     'and regenerate these instructions.\n';
 
+  // Adapters that de-duplicate against the user scope (Codex's proposal hook) must see it even
+  // under --repo-only, which never WRITES there. Reading is fail-soft: no home, no de-duplication.
+  const userScopeForReading = (): string => {
+    try { return resolveUserScopeRoot(opts.home); } catch { return ''; }
+  };
   const contextFor = (root: string, scope: InstallScope): ApplyContext => ({
     root,
     scope,
+    userScopeRoot: home || userScopeForReading() || undefined,
     platform: process.platform,
     platformCommandRuntime: {
       nodeExecutable: runtimeExecutable,
@@ -511,7 +533,7 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
         // Deliberately NOT "pass --force": most user-scope conflicts are refusals
         // (an unparseable file, a symlink, a concurrent write) that --force does not
         // and must not override. The adapter's own warning names the actual cause.
-        allWarnings.push('The user scope was left untouched — see the message(s) above. This repository was still wired.');
+        allWarnings.push(`The user scope was left untouched — see the message(s) above.${opts.userOnly ? '' : ' This repository was still wired.'}`);
       } else {
         conflict = true;
       }
@@ -568,7 +590,18 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
     await runAdapter(ADAPTERS[surface.agent], contextFor(surface.root, 'repo'));
   }
 
-  printSummary(allChanges, allWarnings, !!opts.dryRun, !!opts.uninstall);
+  // The verdict comes BEFORE the summary. A conflict that is reachable on an otherwise
+  // successful install — a `.mcp.json` someone else wired — printed "OpenLore install
+  // complete.", then a "Wired surface" line claiming the guidance matches a preset no MCP
+  // registration had been written for, and then "Install did not complete". Three conclusions,
+  // two of them wrong (change: fix-install-conflict-verdict).
+  printSummary(allChanges, allWarnings, !!opts.dryRun, !!opts.uninstall, conflict);
+  if (conflict) {
+    logger.error(
+      'Install did not complete — the file(s) named above were left exactly as they are.'
+    );
+    return 1;
+  }
   reportScopes({
     uninstall: !!opts.uninstall,
     dryRun: !!opts.dryRun,
@@ -589,23 +622,18 @@ export async function runInstall(opts: InstallOptions): Promise<number> {
     );
   }
 
-  if (conflict) {
-    logger.error(
-      'Hand-edited OpenLore block(s) detected. Re-run with --force to overwrite, or revert your edits.'
-    );
-    return 1;
-  }
-
   // The decisions gate belongs to `openlore install`, not to any one agent
   // surface, so only a WHOLE-install removal takes it out. `connect remove cursor`
   // has nothing to do with git hooks, and used to delete a decisions gate the user
   // may have installed years ago through a different command entirely
   // (change: unify-onboarding-entrypoint).
-  const removingEverything = opts.uninstall && !opts.agent && !opts.agents?.length;
+  const removingEverything = opts.uninstall && !opts.agent && !opts.agents?.length && !opts.userOnly;
   if (!opts.dryRun && removingEverything) await unwireGovernanceGate(cwd);
 
   // One-command setup: build the index so orient() works on the first session.
   // Opt out with --no-analyze; never runs for dry-run or uninstall.
+  // --user-only touches no repository, so it neither builds an index nor wires a gate.
+  if (opts.userOnly) return wiringUserScope && userScopeClean ? 0 : 1;
   const shouldAnalyze = opts.analyze !== false && !opts.dryRun && !opts.uninstall;
   if (shouldAnalyze) {
     const indexBuilt = await buildIndex(cwd);
@@ -697,7 +725,9 @@ function printSummary(
   changes: PlannedChange[],
   warnings: string[],
   dryRun: boolean,
-  uninstall: boolean
+  uninstall: boolean,
+  /** A refusal happened: the run is reported as incomplete, never as complete. */
+  conflict = false,
 ): void {
   const verb = dryRun ? 'would' : 'did';
   for (const c of changes) {
@@ -720,15 +750,29 @@ function printSummary(
     }
   }
   for (const w of warnings) logger.warning(w);
-  if (dryRun) {
+  if (conflict) {
+    // Never "complete" when something was refused: the caller prints the reason next and
+    // exits non-zero.
+    logger.discovery(`OpenLore ${uninstall ? 'uninstall' : 'install'} incomplete — see below.`);
+  } else if (dryRun) {
     logger.discovery('Dry run — no files were written.');
   } else if (!uninstall) {
     logger.success('OpenLore install complete.');
   } else {
     logger.success('OpenLore uninstall complete.');
+    // Everything left behind, not just the one directory. `openspec/` and the `.gitignore`
+    // line were both left in place silently, so `git status` came back dirty after an
+    // uninstall that reported itself complete (change: fix-uninstall-leftovers).
     logger.info(
       'Kept data',
-      'The ".openlore/" directory remains (index, decisions, and memories). From the repository root, remove it with `rm -rf -- ./.openlore/` if you no longer need that data.'
+      'The ".openlore/" directory remains (index, decisions, and memories). From the repository '
+      + 'root, remove it with `rm -rf -- ./.openlore/` if you no longer need that data.'
+    );
+    logger.info(
+      'Also left in place',
+      'Any "openspec/" directory (your specs and changes), and the ".openlore/" line added to '
+      + '.gitignore — both are yours to keep or remove. Neither is touched by uninstall, so '
+      + '`git status` may still show .gitignore as modified.'
     );
   }
 }
@@ -764,10 +808,10 @@ export function formatProveGuidance(eligibility: ProveEligibility): { title: str
 
 export const installCommand = new Command('install')
   .description(
-    'One-command setup: configure agent surfaces (Claude Code, Cursor, Cline, Continue, Pi, AGENTS.md) ' +
+    'One-command setup: configure agent surfaces (Claude Code, Cursor, Cline, Continue, Pi, Codex, AGENTS.md) ' +
     'to call orient(), then build the index so orient works on your first session.'
   )
-  .option('--agent <name>', 'Install only for a specific surface (claude-code, cursor, cline, continue, pi, agents-md)')
+  .option('--agent <name>', 'Install only for a specific surface (claude-code, cursor, cline, continue, pi, codex, agents-md)')
   .option('--preset <name>', `Wire the registered MCP server to a tool preset (navigation, substrate, minimal, memory, verify, federation, coordination, or full). Default (no preset) wires the "${LEAN_DEFAULT_PRESET}" surface — the navigation core, prepare_spec_generation + prepare_spec_repair, and the governance reads recall + verify_claim + blast_radius; "navigation" is the lean navigate-only escape; pass "full" to wire the full surface (the prior default).`)
   .option('--all-tools', 'Wire the full surface (alias of --preset full). Matches `openlore mcp --all-tools`.')
   .option('--dry-run', 'Print the planned changes without writing any files', false)
@@ -784,6 +828,11 @@ export const installCommand = new Command('install')
       'Default: the runtime running this command, which is node even for a bun-installed openlore. ' +
       'Also read from OPENLORE_RUNTIME.',
   )
+  .option(
+    '--user-only',
+    'Wire only the user scope — leave this repository\'s files, git hooks, and index alone',
+    false,
+  )
   .option('--analyze', 'Build the index after configuring surfaces', true)
   .option('--no-analyze', 'Configure surfaces only; do not run init/analyze (run "openlore analyze" yourself later)')
   .addHelpText(
@@ -797,6 +846,7 @@ Examples:
   $ openlore install --dry-run       Preview changes without writing
   $ openlore install --repo-only     Wire this repository only (no user-scope entries)
   $ openlore install --runtime bun   Launch hooks and the MCP server with bun instead of node
+  $ openlore install --user-only     Wire the user scope only (no repository files)
   $ openlore install --uninstall     Remove OpenLore-managed entries (both scopes)
 
 Bare \`openlore install\` wires your USER scope as well as this repository: every

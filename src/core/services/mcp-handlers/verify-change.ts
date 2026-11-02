@@ -8,7 +8,13 @@
  *
  * Today it composes `blast_radius` — which itself already composes `select_tests` (tests to run)
  * and the spec/memory/decision drift passes — plus `structural_diff` (removed / re-signed functions
- * and new calls into deprecated code). It is advisory, read-only, offline, and grader-not-author:
+ * and new calls into deprecated code), the generated-file guard (`generated-file-edited`: a
+ * generated file or lockfile edited without its source; change: add-generated-file-guard), the
+ * phantom-reference check (imports, named exports, and packages the diff adds that resolve to
+ * nothing; change: add-phantom-reference-findings), and structural_diff's check-weakening facts (a
+ * test removed, skipped, or stripped of assertions, an expected value edited, a suppression or a
+ * discarded error added, a check config relaxed; change: add-check-weakening-findings). It is
+ * advisory, read-only, offline, and grader-not-author:
  * it names the tests to run and the breaks to fix; it never runs the tests or edits a file.
  *
  * NoRedundantConclusions: each component still answers its own question. verify_change only
@@ -17,6 +23,11 @@
 
 import { computeBlastRadius, type BlastRadiusBriefing } from './blast-radius.js';
 import { handleStructuralDiff } from './structural-diff.js';
+import { validateDirectory, readCachedContext } from './utils.js';
+import { guardDiff, type DiffGuardResult } from '../generated-file-guard.js';
+import { checkPhantomReferences, type PhantomReferenceResult } from '../phantom-references.js';
+import { readOpenLoreConfig } from '../config-manager.js';
+import { classifyFindings, effectivePolicy, type ClassifiedFinding, type EnforcementPolicy, type GovernanceFinding } from './enforcement-policy.js';
 
 type Severity = 'critical' | 'error' | 'warning' | 'info';
 const SEVERITY_RANK: Record<Severity, number> = { critical: 0, error: 1, warning: 2, info: 3 };
@@ -41,11 +52,27 @@ export interface VerifyChangeInput {
 
 const DEFAULT_ITEM_CAP = 25;
 
+/** The one next action for each phantom-reference code; the finding message carries the evidence. */
+const NEXT_ACTION_BY_CODE: Record<string, string> = {
+  'unresolved-internal-import': 'No file is at that path; create the module or correct the import.',
+  'unresolved-internal-symbol': 'The target does not export that name; export it there, or import a name it does export.',
+  'undeclared-dependency': 'No manifest declares that package; add it to the manifest, or use one that is declared.',
+  'unpinned-dependency': 'The lockfile does not pin it; run the package manager so the lockfile matches the manifest.',
+};
+
 interface StructuralDiffShape {
   summary?: { removedFunctions?: number; signatureChanges?: number; deprecatedCallsAdded?: number };
   removed?: Array<{ name?: string; file?: string }>;
   signatureChanged?: Array<{ name?: string; file?: string }>;
   deprecatedCalls?: { added?: Array<{ callerName?: string; calleeName?: string; file?: string }> };
+  checkWeakening?: {
+    baseline?: { ref: string; commit: string };
+    findings?: ClassifiedFinding[];
+    notAssessed?: Array<{ file: string; shapes: string[]; reason: string }>;
+    silenced?: Array<{ code: string; subject: string }>;
+    boundaries?: string[];
+    error?: string;
+  };
   error?: string;
 }
 
@@ -56,6 +83,10 @@ interface StructuralDiffShape {
 export function projectVerifyReceipt(
   b: BlastRadiusBriefing,
   sd: StructuralDiffShape,
+  guard?: DiffGuardResult | { error: string },
+  policy?: EnforcementPolicy,
+  references?: PhantomReferenceResult | { error: string },
+  payload?: { findings: GovernanceFinding[]; boundaries: string[]; notAssessed: number } | { error: string },
 ): Record<string, unknown> {
   const items: ReceiptItem[] = [];
   const boundaries: string[] = [...b.caveats];
@@ -110,6 +141,94 @@ export function projectVerifyReceipt(
     }
   }
 
+  // ── Generated files edited by hand (generated-file guard) ──
+  // Classified by the operator's enforcement.policy; a code set to `off` is dropped entirely.
+  const guardGate = guard && !('error' in guard) && guard.findings.length ? classifyFindings(guard.findings, policy) : undefined;
+  const guardFindings: ClassifiedFinding[] = guardGate ? guardGate.classified.filter(f => f.enforcementClass !== 'off') : [];
+  if (guard && 'error' in guard) boundaries.push(`generated-file guard unavailable: ${guard.error}`);
+  else if (guard) boundaries.push(...guard.boundaries);
+  const factsByFile = new Map((guard && !('error' in guard) ? guard.facts : []).map(f => [f.file, f]));
+  for (const f of guardFindings) {
+    const fact = factsByFile.get(f.subject);
+    const sources = fact && fact.generatedFrom !== 'unknown' ? fact.generatedFrom : [];
+    const regen = fact && fact.regenerateWith !== 'unknown' ? fact.regenerateWith : null;
+    items.push({
+      subject: f.message,
+      check: 'generated_file_guard',
+      severity: f.severity,
+      nextAction: fact?.kind === 'lockfile'
+        ? 'A lockfile changed without its manifest; confirm the change came from the package manager.'
+        : sources.length && fact?.sourceNotFound?.length !== sources.length
+          ? `Edit ${sources.join(', ')}${regen ? ` and regenerate with \`${regen}\`` : ' and regenerate'}; a hand edit here is lost on the next generator run.`
+          : sources.length
+            ? `The header names ${sources.join(', ')}, which is not at that path; find that source, edit it, and regenerate${regen ? ` with \`${regen}\`` : ''}.`
+            : regen
+              ? `The source is unknown; regenerate with \`${regen}\` instead of editing by hand, or confirm the hand edit survives it.`
+              : 'The source is unknown; confirm the hand edit survives the next generator run.',
+    });
+  }
+
+  // ── References the diff adds that resolve to nothing (phantom-reference check) ──
+  const refsOk = references && !('error' in references) ? references : undefined;
+  if (references && 'error' in references) boundaries.push(`reference check unavailable: ${references.error}`);
+  else if (refsOk) boundaries.push(...refsOk.boundaries);
+  const refGate = refsOk && refsOk.findings.length ? classifyFindings(refsOk.findings, policy) : undefined;
+  const refFindings: ClassifiedFinding[] = refGate ? refGate.classified.filter(f => f.enforcementClass !== 'off') : [];
+  for (const f of refFindings) {
+    items.push({
+      subject: f.message,
+      check: 'phantom_references',
+      severity: f.severity,
+      nextAction: NEXT_ACTION_BY_CODE[f.code] ?? 'The reference resolves to nothing; correct it before landing.',
+    });
+  }
+  // A reference that could not be judged is said once, with its count — never read as resolved.
+  if (refsOk && refsOk.notAssessed.length) {
+    boundaries.push(`${refsOk.notAssessed.length} added reference${refsOk.notAssessed.length === 1 ? '' : 's'} could not be assessed (${[...new Set(refsOk.notAssessed.map(n => n.reason))].slice(0, 3).join('; ')}).`);
+  }
+
+  // ── Request bodies in the changed files against their operations (add-contract-graph-projection) ──
+  if (payload && 'error' in payload) boundaries.push(`request-body check unavailable: ${payload.error}`);
+  else if (payload) {
+    boundaries.push(...payload.boundaries);
+    if (payload.notAssessed) boundaries.push(`${payload.notAssessed} request bod${payload.notAssessed === 1 ? 'y' : 'ies'} in the changed files could not be read as a literal, so ${payload.notAssessed === 1 ? 'it was' : 'they were'} not checked.`);
+  }
+  const payloadGate = payload && !('error' in payload) && payload.findings.length ? classifyFindings(payload.findings, policy) : undefined;
+  const payloadFindings: ClassifiedFinding[] = payloadGate ? payloadGate.classified.filter(f => f.enforcementClass !== 'off') : [];
+  for (const f of payloadFindings) {
+    items.push({
+      subject: f.message,
+      check: 'contract_payload',
+      severity: f.severity,
+      nextAction: 'Send the required property, or correct the specification.',
+    });
+  }
+
+  // ── Checks weakened by the diff (structural_diff's check-weakening facts) ──
+  // Already classified by structural_diff against the same policy; `off` codes are already dropped.
+  const weakening = sd.error ? undefined : sd.checkWeakening;
+  const weakeningFindings = weakening?.findings ?? [];
+  if (weakening?.error) boundaries.push(weakening.error);
+  if (weakening?.silenced?.length) {
+    boundaries.push(`${weakening.silenced.length} check-weakening finding(s) are turned off by enforcement.policy (${[...new Set(weakening.silenced.map(x => x.code))].join(', ')}).`);
+  }
+  if (weakening?.baseline && weakening.baseline.ref !== b.resolvedBaseRef) {
+    boundaries.push(`Check weakening compares against the merge-base with ${weakening.baseline.ref} (${weakening.baseline.commit.slice(0, 12)}), so a weakening committed earlier on the branch is included; the rest of this receipt compares against ${b.resolvedBaseRef}.`);
+  }
+  if (weakening?.boundaries) boundaries.push(...weakening.boundaries);
+  if (weakening?.notAssessed?.length) {
+    const files = weakening.notAssessed.map(n => n.file);
+    boundaries.push(`Check weakening was not assessed for ${files.length} file(s) (${files.slice(0, 5).join(', ')}${files.length > 5 ? ', …' : ''}); see structural_diff checkWeakening.notAssessed.`);
+  }
+  for (const f of weakeningFindings) {
+    items.push({
+      subject: f.message,
+      check: 'check_weakening',
+      severity: f.severity,
+      nextAction: f.remediation ?? 'Confirm the check change is intended.',
+    });
+  }
+
   // ── Spec drift (composed inside blast_radius) ──
   for (const s of b.specs.items.slice(0, 10)) {
     items.push({
@@ -151,14 +270,71 @@ export function projectVerifyReceipt(
       removedFunctions: sd.summary?.removedFunctions ?? 0,
       signatureChanges: sd.summary?.signatureChanges ?? 0,
       deprecatedCallsAdded: sd.summary?.deprecatedCallsAdded ?? 0,
+      generatedFilesEdited: guardFindings.length,
+      unresolvedReferences: refFindings.length,
+      payloadsMissingRequired: payloadFindings.length,
+      // null: the check did not run (structural_diff or check weakening failed), not "nothing weakened".
+      checksWeakened: weakening && !weakening.error ? weakeningFindings.length : null,
     },
     items: kept,
     ...(omitted > 0 ? { truncated: { omitted, note: 'Lower-severity items omitted; raise the cap to see them.' } } : {}),
     testsToRun,
-    boundaries,
+    // Registered governance findings (GovernanceFinding shape) an enforcement policy can name.
+    ...(guardFindings.length || refFindings.length || weakeningFindings.length || payloadFindings.length ? {
+      findings: [...guardFindings, ...refFindings, ...weakeningFindings, ...payloadFindings],
+      gated: (guardGate?.gated ?? false) || (refGate?.gated ?? false) || (payloadGate?.gated ?? false) || weakeningFindings.some(f => f.enforcementClass === 'blocking'),
+    } : {}),
+    ...(weakening?.baseline ? { checkWeakeningBaseline: weakening.baseline } : {}),
+    // The guard's disclosures can also reach blast_radius's caveats: say each once.
+    boundaries: [...new Set(boundaries)],
     // Grader, not author: these are actions for the caller to take — nothing was run or written.
     note: 'Advisory receipt. verify_change names the tests to run and the breaks to fix; it runs no tests and edits no files.',
   };
+}
+
+/** Root-relative files not yet added to git (not ignored). */
+async function untrackedFiles(root: string): Promise<string[]> {
+  try {
+    const { execFileGit } = await import('../../../utils/git-exec.js');
+    const { gitPathArgs } = await import('../../../utils/git-args.js');
+    const { stdout } = await execFileGit('git', gitPathArgs('ls-files', '-z', '--others', '--exclude-standard'), { cwd: root });
+    return String(stdout).split('\0').filter(Boolean);
+  } catch { return []; }
+}
+
+/** Per root-relative file, the line ranges (in the working tree) the diff against `base` added or changed. */
+async function addedLines(root: string, base: string, files: readonly string[]): Promise<Map<string, Array<[number, number]>>> {
+  const out = new Map<string, Array<[number, number]>>();
+  if (!files.length) return out;
+  try {
+    const { execFileGit } = await import('../../../utils/git-exec.js');
+    const { gitPathArgs } = await import('../../../utils/git-args.js');
+    // --relative: paths relative to the root, as the files are given.
+    const { stdout } = await execFileGit('git', gitPathArgs('diff', '-U0', '--no-color', '--relative', '--no-ext-diff', base, '--', ...files.slice(0, 500)), { cwd: root, maxBuffer: 64 * 1024 * 1024 });
+    let file: string | undefined;
+    for (const line of String(stdout).split('\n')) {
+      const f = /^\+\+\+ b\/(.+)$/.exec(line);
+      if (f) { file = f[1]; continue; }
+      const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (h && file) {
+        const start = Number(h[1]);
+        const count = h[2] === undefined ? 1 : Number(h[2]);
+        if (count > 0) (out.get(file) ?? out.set(file, []).get(file)!).push([start, start + count - 1]);
+      }
+    }
+  } catch { /* no ranges: nothing is attributed to the diff */ }
+  return out;
+}
+
+/** File paths the index knows, for the reference check's candidates; empty when it is unavailable. */
+async function corpusFiles(directory: string): Promise<string[]> {
+  try {
+    const ctx = await readCachedContext(await validateDirectory(directory));
+    const nodes = (ctx?.callGraph as { nodes?: Array<{ filePath?: unknown }> } | undefined)?.nodes ?? [];
+    return nodes.map(n => n.filePath).filter((f): f is string => typeof f === 'string');
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -168,10 +344,59 @@ export function projectVerifyReceipt(
 export async function handleVerifyChange(
   input: VerifyChangeInput,
 ): Promise<Record<string, unknown>> {
-  const briefing = await computeBlastRadius({ directory: input.directory, baseRef: input.baseRef });
+  // The guard runs inside blast_radius on the same diff read; its result is reused, not recomputed.
+  let shared: DiffGuardResult | undefined;
+  let sharedRefs: PhantomReferenceResult | undefined;
+  const briefing = await computeBlastRadius(
+    { directory: input.directory, baseRef: input.baseRef },
+    { guard: g => { shared = g; }, references: r => { sharedRefs = r; } },
+  );
   if ('error' in briefing) {
     return { tool: 'verify_change', posture: 'advisory', error: briefing.error };
   }
+  const b = briefing as BlastRadiusBriefing;
+  let references: PhantomReferenceResult | { error: string };
+  try {
+    references = sharedRefs ?? await checkPhantomReferences(
+      await validateDirectory(input.directory), b.resolvedBaseRef, undefined,
+      // The same corpus blast_radius passes, so candidate paths and the Go package check behave the
+      // same on this fallback path as on the shared one.
+      await corpusFiles(input.directory),
+    );
+  } catch (err) {
+    references = { error: err instanceof Error ? err.message : String(err) };
+  }
   const sd = (await handleStructuralDiff({ directory: input.directory, baseRef: input.baseRef })) as StructuralDiffShape;
-  return projectVerifyReceipt(briefing as BlastRadiusBriefing, sd);
+  // Best-effort like the other components: a failed guard is a boundary, never a failed receipt.
+  let guard: DiffGuardResult | { error: string };
+  try {
+    guard = shared ?? await guardDiff(await validateDirectory(input.directory), b.resolvedBaseRef);
+  } catch (err) {
+    guard = { error: err instanceof Error ? err.message : String(err) };
+  }
+  let policy: EnforcementPolicy | undefined;
+  try {
+    policy = effectivePolicy(await readOpenLoreConfig(await validateDirectory(input.directory)));
+  } catch {
+    policy = undefined; // an unreadable config is "no policy declared": source defaults apply
+  }
+  // Request bodies at call sites in the files the diff changes.
+  let payload: { findings: GovernanceFinding[]; boundaries: string[]; notAssessed: number } | { error: string };
+  try {
+    const root = await validateDirectory(input.directory);
+    const { getChangedFiles, getRepoPrefix, reframeRepoPath } = await import('../../drift/git-diff.js');
+    const prefix = (await getRepoPrefix(root)) ?? '';
+    const diff = await getChangedFiles({ rootPath: root, baseRef: b.resolvedBaseRef, includeUnstaged: true });
+    const tracked = diff.files.filter(f => f.status !== 'deleted').map(f => reframeRepoPath(f.path, prefix)).filter((f): f is string => f !== null);
+    // A file not yet added to git is all new (the agent often stops before `git add`).
+    const untracked = await untrackedFiles(root);
+    const added = await addedLines(root, b.resolvedBaseRef, tracked);
+    const { payloadFindingsForFiles } = await import('./service-contract.js');
+    // Only call sites on lines the diff added or changed: an older call in a touched file is not this change's.
+    payload = await payloadFindingsForFiles(root, [...new Set([...tracked, ...untracked])], (file, line) =>
+      untracked.includes(file) || (added.get(file)?.some(([from, to]) => line >= from && line <= to) ?? false));
+  } catch (err) {
+    payload = { error: err instanceof Error ? err.message : String(err) };
+  }
+  return projectVerifyReceipt(b, sd, guard, policy, references, payload);
 }

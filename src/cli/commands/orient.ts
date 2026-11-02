@@ -23,7 +23,8 @@ import { withQuietStdout } from '../../utils/quiet-stdout.js';
 import { dispatchTool } from '../../core/services/tool-dispatch.js';
 import { estimateTokens } from '../../core/services/llm-service.js';
 import { OPENLORE_ANALYSIS_REL_PATH } from '../../constants.js';
-import { buildInjection, extractPrompt, pointerLineFor } from './orient-inject.js';
+import { DECISIONS_REVIEW_COMMAND, takeAutoAcceptsSinceLastSession } from '../../core/decisions/autopilot.js';
+import { buildInjection, buildProposalOnlyInjection, extractPrompt, pointerLineFor } from './orient-inject.js';
 import {
   oneShotBuildNote,
   registerOneShotRepair,
@@ -32,7 +33,8 @@ import {
   type OneShotBuild,
 } from '../../core/services/one-shot-index-build.js';
 import { readStdin } from '../../utils/stdin.js';
-import { isInsideGitWorkTree } from '../../core/services/cold-start-bootstrap.js';
+import { autoInitSuppression, isInsideGitWorkTree, recordDetachedRepair } from '../../core/services/cold-start-bootstrap.js';
+import { seedFromSiblingCheckout, servingSeededIndex } from '../../core/runtime/seed-from-sibling.js';
 import { EdgeStore } from '../../core/services/edge-store.js';
 
 interface OrientCliOptions {
@@ -44,6 +46,7 @@ interface OrientCliOptions {
   json?: boolean;
   metrics?: boolean;
   inject?: boolean;
+  proposalOnly?: boolean;
   backgroundBuild?: boolean;
   backgroundRepair?: boolean;
 }
@@ -89,12 +92,30 @@ async function runInject(
     } : undefined));
     // Outside any git work tree (e.g. $HOME) with no index, say nothing: "run openlore
     // analyze" on every prompt there invites an agent to index the whole directory.
-    if (block === pointerLineFor('no-graph') && silentWithoutIndex) return;
     // With a build in flight, "run openlore analyze" is the wrong remedy: say what is happening.
-    if (block) console.log(buildNote && block === pointerLineFor('no-graph') ? `[OpenLore] ${safe(buildNote)}` : block);
+    // A propose prompt may carry the proposal instruction after the pointer line; keep it.
+    let out = block;
+    const noGraph = pointerLineFor('no-graph');
+    if (out.startsWith(noGraph)) {
+      const rest = out.slice(noGraph.length).trim();
+      if (silentWithoutIndex) out = rest;
+      else if (buildNote) out = [`[OpenLore] ${safe(buildNote)}`, rest].filter(Boolean).join('\n\n');
+    }
+    if (out) console.log(out);
   } catch {
     // buildInjection is fail-open, but guard the print path too: never throw.
   }
+}
+
+/** Emit only the short OpenSpec proposal instruction; Codex gates the full task in its hook. */
+async function runProposalOnly(directory: string, taskOpt: string | undefined): Promise<void> {
+  let prompt = taskOpt ?? '';
+  if (!prompt) {
+    try { prompt = extractPrompt(await readStdin()); }
+    catch { prompt = ''; }
+  }
+  const context = await withQuietStdout(() => buildProposalOnlyInjection(directory, prompt));
+  if (context) console.log(context);
 }
 
 /**
@@ -157,7 +178,19 @@ export function implicitOrientRoot(start: string): string {
 }
 
 /** Session-start primer printed when orient is invoked without a task. */
-function printPrimer(directory: string, asJson: boolean, buildNote?: string): void {
+/**
+ * One line naming the decisions autopilot accepted since the previous session, or
+ * undefined (change: default-decision-autopilot-with-visible-trace).
+ */
+export function autoAcceptLine(entries: ReadonlyArray<{ title: string }>): string | undefined {
+  if (entries.length === 0) return undefined;
+  const clip = (t: string) => (t.length > 60 ? `${t.slice(0, 59)}…` : t);
+  const named = entries.slice(0, 3).map((e) => `"${safe(clip(e.title))}"`).join(', ');
+  const more = entries.length > 3 ? ` and ${entries.length - 3} more` : '';
+  return `Decisions auto-accepted since last session (${entries.length}): ${named}${more} — review: ${DECISIONS_REVIEW_COMMAND}`;
+}
+
+function printPrimer(directory: string, asJson: boolean, buildNote?: string, decisionsLine?: string): void {
   const ready = hasAnalysis(directory);
   if (asJson) {
     console.log(
@@ -168,6 +201,7 @@ function printPrimer(directory: string, asJson: boolean, buildNote?: string): vo
             ? 'OpenLore architectural memory is active. Call orient with a task before reading source files.'
             : buildNote ?? 'OpenLore is installed but no analysis was found. Run "openlore analyze" to build the graph.',
           usage: 'openlore orient --json --task "<task description>"',
+          ...(decisionsLine ? { decisions: decisionsLine } : {}),
         },
         null,
         2
@@ -186,6 +220,7 @@ function printPrimer(directory: string, asJson: boolean, buildNote?: string): vo
     console.log('Run "openlore analyze" to build the graph, then:');
     console.log('  openlore orient --task "<task description>"');
   }
+  if (decisionsLine) console.log(decisionsLine);
 }
 
 /** Concise human-readable rendering of a handleOrient result. */
@@ -247,6 +282,7 @@ export const orientCommand = new Command('orient')
   .option('--json', 'Emit the full result as JSON instead of a human-readable summary', false)
   .option('--metrics', 'Report wall time and output size to stderr (opt-in; off by default)', false)
   .option('--inject', 'Emit a bounded, ignorable task-scoped orientation block for a pre-turn agent hook (reads the task from --task or stdin); always exits 0', false)
+  .option('--proposal-only', 'Emit the concise OpenSpec proposal instruction only when the submitted prompt invokes propose; always exits 0', false)
   .addOption(new Option('--background-build').hideHelp())
   .addOption(new Option('--background-repair').hideHelp())
   .addHelpText(
@@ -275,6 +311,13 @@ prints a short session-start primer (used by the install SessionStart hook).
       return;
     }
 
+    // Lightweight proposal trigger for hosts such as Codex whose prompt-submit hook matcher is
+    // ignored. It does no structural lookup and emits nothing for unrelated prompts.
+    if (opts.proposalOnly) {
+      await runProposalOnly(directory, task);
+      return;
+    }
+
     // One-shot self-bootstrap (change: bootstrap-index-from-one-shot-orient): start one
     // detached build for an absent index, and let the read path's staleness signals
     // start the same build. Neither waits.
@@ -287,8 +330,15 @@ prints a short session-start primer (used by the install SessionStart hook).
     // reason orient stayed degraded every turn and agents fell back to grep
     // (change: self-heal-empty-graph-index).
     let build: OneShotBuild | undefined;
+    // A new worktree first copies a sibling checkout's verified index, awaited here because
+    // this process exits as soon as it answers (change: seed-worktree-index-from-sibling-checkout).
+    if (!hasAnalysis(root) && !autoInitSuppression(root)) await seedFromSiblingCheckout(root);
     if (!hasAnalysis(root)) {
       build = startDetachedIndexBuild(root, 'index-absent');
+    } else if (await servingSeededIndex(root)) {
+      // Until the rebuild publishes, every answer is disclosed as served from the seed.
+      build = startDetachedIndexBuild(root, 'seeded');
+      if (build.state === 'started' || build.state === 'running') recordDetachedRepair(root, 'seeded');
     } else if (graphIndexUnusable(root)) {
       build = startDetachedIndexBuild(root, 'stale-region');
     }
@@ -306,7 +356,7 @@ prints a short session-start primer (used by the install SessionStart hook).
 
     // No task → session-start primer (keeps the install hook from erroring).
     if (!task) {
-      printPrimer(directory, asJson, buildNote());
+      printPrimer(directory, asJson, buildNote(), autoAcceptLine(await takeAutoAcceptsSinceLastSession(root)));
       return;
     }
 

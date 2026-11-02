@@ -86,6 +86,78 @@ describe('openlore install (end-to-end)', () => {
     expect(combined).toMatch(/\(new file\).+settings\.json/);
   });
 
+  // An `mcpServers.openlore` entry OpenLore did not write is someone's deliberate choice —
+  // a wrapper script, a pinned preset, another checkout's path. It used to be replaced with
+  // no warning at all. Matches what the Codex adapter already does for `mcp_servers.openlore`.
+  it('preserves an mcpServers.openlore entry it did not write, and says so', async () => {
+    await writeFile(
+      join(dir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          openlore: { command: 'my-wrapper', args: ['--my-flag'] },
+          other: { command: 'other-server' },
+        },
+      }, null, 2) + '\n',
+    );
+
+    const code = await runInstall({ cwd: dir, agent: 'claude-code', repoOnly: true, analyze: false });
+
+    expect(code).toBe(1);
+    const after = JSON.parse(await readFile(join(dir, '.mcp.json'), 'utf8'));
+    expect(after.mcpServers.openlore).toEqual({ command: 'my-wrapper', args: ['--my-flag'] });
+    expect(after._openlore).toBeUndefined();
+  });
+
+  // A conflict reachable on an otherwise successful install used to print THREE conclusions:
+  // "OpenLore install complete.", a "Wired surface" line claiming the guidance matches a preset
+  // no registration had been written for, and "Install did not complete"
+  // (change: fix-install-conflict-verdict).
+  it('states one verdict when a refusal happens, and never claims a wired surface', async () => {
+    await writeFile(
+      join(dir, '.mcp.json'),
+      JSON.stringify({ mcpServers: { openlore: { command: 'my-wrapper' } } }, null, 2) + '\n',
+    );
+    const lines: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    const origError = console.error;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stderr.write;
+    // The logger renders through console.error and console.log, so all sinks are captured.
+    const origLog = console.log;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    let code: number;
+    try {
+      code = await runInstall({ cwd: dir, agent: 'claude-code', repoOnly: true, analyze: false });
+    } finally {
+      process.stderr.write = origWrite;
+      console.error = origError;
+      console.log = origLog;
+    }
+    const out = lines.join('\n');
+
+    expect(code).toBe(1);
+    expect(out).toContain('install incomplete');
+    expect(out).toContain('Install did not complete');
+    expect(out).not.toContain('OpenLore install complete.');
+    expect(out, 'no registration was written, so no surface was wired').not.toContain('Wired surface');
+  });
+
+  it('--force takes over an mcpServers.openlore entry it did not write', async () => {
+    await writeFile(
+      join(dir, '.mcp.json'),
+      JSON.stringify({ mcpServers: { openlore: { command: 'my-wrapper' } } }, null, 2) + '\n',
+    );
+
+    const code = await runInstall({ cwd: dir, agent: 'claude-code', repoOnly: true, analyze: false, force: true });
+
+    expect(code).toBe(0);
+    const after = JSON.parse(await readFile(join(dir, '.mcp.json'), 'utf8'));
+    expect(after.mcpServers.openlore.command).not.toBe('my-wrapper');
+  });
+
   it('agent-md install creates AGENTS.md with managed block', async () => {
     const code = await runInstall({ cwd: dir, agent: 'agents-md', analyze: false });
     expect(code).toBe(0);
@@ -432,12 +504,14 @@ describe('openlore install (end-to-end)', () => {
     const code = await runInstall({ cwd: dir, agent: 'claude-code', analyze: false });
     expect(code).toBe(0);
     const settings = JSON.parse(await readFile(join(dir, '.claude/settings.json'), 'utf8'));
-    expect(settings.hooks.SessionStart).toHaveLength(2);
+    // The user's group, our session-start primer, and the after-compact handoff moment.
+    expect(settings.hooks.SessionStart).toHaveLength(3);
     expect(settings.hooks.SessionStart[0]).toEqual(userHook);
     expect(settings.hooks.SessionStart[1]._openlore).toBe(true);
     expect(settings.hooks.SessionStart[1].hooks[0].command).toBe(
       expectedHook(['orient', '--json'])
     );
+    expect(settings.hooks.SessionStart[2]).toMatchObject({ matcher: 'compact', _openloreHook: 'after-compact' });
 
     await runInstall({ cwd: dir, agent: 'claude-code', uninstall: true });
     const after = JSON.parse(await readFile(join(dir, '.claude/settings.json'), 'utf8'));
@@ -488,6 +562,34 @@ describe('openlore install (end-to-end)', () => {
     const after = JSON.parse(await readFile(join(dir, '.claude/settings.json'), 'utf8'));
     expect(after.hooks.UserPromptSubmit).toEqual([userHook]);
     expect(after.hooks.SessionStart).toBeUndefined();
+  });
+
+  it('claude-code install wires the agent-loop moments, each identified by its own marker', async () => {
+    await writeFile(join(dir, 'CLAUDE.md'), '# project\n');
+    await mkdir(join(dir, '.claude'), { recursive: true });
+    // The opt-in check-edit hook is also an `_openlore` group on PostToolUse: it must survive.
+    const checkEdit = { matcher: 'Edit|Write|MultiEdit|NotebookEdit', _openlore: true, hooks: [{ type: 'command', command: 'openlore check-edit --hook' }] };
+    await writeFile(join(dir, '.claude/settings.json'), JSON.stringify({ hooks: { PostToolUse: [checkEdit] } }, null, 2), 'utf8');
+
+    expect(await runInstall({ cwd: dir, agent: 'claude-code', analyze: false })).toBe(0);
+    await runInstall({ cwd: dir, agent: 'claude-code', analyze: false }); // idempotent
+    const settings = JSON.parse(await readFile(join(dir, '.claude/settings.json'), 'utf8'));
+    expect(settings.hooks.PreToolUse).toEqual([{
+      matcher: 'Edit|Write|MultiEdit|NotebookEdit', _openlore: true, _openloreHook: 'before-edit',
+      hooks: [{ type: 'command', command: expectedHook(['hook', 'before-edit']), timeout: 15 }],
+    }, {
+      matcher: 'Agent|Task', _openlore: true, _openloreHook: 'before-subagent',
+      hooks: [{ type: 'command', command: expectedHook(['hook', 'before-subagent']), timeout: 10 }],
+    }]);
+    expect(settings.hooks.SubagentStart).toEqual([{ matcher: '', _openlore: true, _openloreHook: 'subagent-start', hooks: [{ type: 'command', command: expectedHook(['hook', 'subagent-start']), timeout: 30 }] }]);
+    expect(settings.hooks.PostToolUse).toHaveLength(2);
+    expect(settings.hooks.PostToolUse[0]).toEqual(checkEdit);
+    expect(settings.hooks.PostToolUse[1]._openloreHook).toBe('after-tools');
+    expect(settings.hooks.Stop[0]).toMatchObject({ _openloreHook: 'before-stop', hooks: [{ command: expectedHook(['hook', 'before-stop']), timeout: 90 }] });
+
+    await runInstall({ cwd: dir, agent: 'claude-code', uninstall: true });
+    const after = JSON.parse(await readFile(join(dir, '.claude/settings.json'), 'utf8'));
+    expect(after.hooks).toEqual({ PostToolUse: [checkEdit] });
   });
 
   it('cursor install writes .cursor/mcp.json with mcpServers.openlore', async () => {

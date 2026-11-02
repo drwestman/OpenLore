@@ -36,6 +36,7 @@ import type {
   LLMConfig,
   OpenLoreConfig,
   PiConfig,
+  HooksConfig,
   RetrievalConfig,
   SpecStoreConfig,
   WorkspaceConfig,
@@ -141,7 +142,7 @@ const embeddingRule: ConfigRule = {
   kind: 'object',
   nullable: true,
   fields: fieldsFor<EmbeddingConfig>({
-    provider: { kind: 'enum', values: ['remote', 'local'] },
+    provider: { kind: 'enum', values: ['remote', 'local', 'none'] },
     baseUrl: stringRule,
     model: stringRule,
     apiKey: stringRule,
@@ -277,8 +278,26 @@ const workspaceRule: ConfigRule = {
 const piRule: ConfigRule = {
   kind: 'object',
   strict: true,
-  fields: fieldsFor<PiConfig>({ spawnDaemon: booleanRule, toolSurface: { kind: 'enum', values: ['lean', 'all'] } }),
+  fields: fieldsFor<PiConfig>({
+    contextMode: { kind: 'enum', values: ['on-demand', 'full'] },
+    spawnDaemon: booleanRule,
+    toolSurface: { kind: 'enum', values: ['lean', 'all'] },
+  }),
   required: requiredFor<PiConfig>({}),
+};
+
+const hooksRule: ConfigRule = {
+  kind: 'object',
+  strict: true,
+  fields: fieldsFor<HooksConfig>({
+    'before-edit': booleanRule,
+    'after-tools': booleanRule,
+    'before-stop': booleanRule,
+    'after-compact': booleanRule,
+    'before-subagent': booleanRule,
+    'subagent-start': booleanRule,
+  }),
+  required: requiredFor<HooksConfig>({}),
 };
 
 const CONFIG_RULE: Extract<ConfigRule, { kind: 'object' }> = {
@@ -306,6 +325,7 @@ const CONFIG_RULE: Extract<ConfigRule, { kind: 'object' }> = {
     bundle: bundleRule,
     workspace: workspaceRule,
     pi: piRule,
+    hooks: hooksRule,
   }),
   required: requiredFor<OpenLoreConfig>({
     version: true,
@@ -346,6 +366,7 @@ export const CONFIG_FIELD_KINDS: Record<keyof OpenLoreConfig, ConfigFieldKind> =
   bundle: 'object',
   workspace: 'object',
   pi: 'object',
+  hooks: 'object',
 };
 
 /** The known top-level config keys, derived from the type-bound field map. */

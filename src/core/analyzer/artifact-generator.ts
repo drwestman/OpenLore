@@ -28,6 +28,7 @@ import {
   ARTIFACT_PARSE_HEALTH,
   ARTIFACT_DYNAMIC_BOUNDARY,
   MAX_HTML_INLINE_SCRIPT_CHARS,
+  SOURCE_SCAN_MAX_FILE_BYTES,
 } from '../../constants.js';
 import { graphDigest, writeTraversalIndexArtifact } from './condensation.js';
 import { CfgSpill, sweepLeakedCfgSpills } from './cfg-spill.js';
@@ -445,6 +446,8 @@ export class AnalysisArtifactGenerator {
    * the same store handle that rebuilds the graph (change: optimize-hash-keyed-analyze).
    */
   private _pass1Memo?: Pass1MemoWrite;
+  /** SHA-256 of the bytes each analyzed file was read as; written beside the graph. */
+  private _fileHashes?: Map<string, string>;
   /** Off-heap overlay hand-off for this build; drained into `cfg_overlay` after `clearAll()`. */
   private _cfgSpill: CfgSpill | undefined;
   /** Files reused vs. re-extracted on the last build — surfaced by the analyze summary. */
@@ -695,7 +698,7 @@ export class AnalysisArtifactGenerator {
           const dbPath = join(this.options.outputDir, ARTIFACT_CALL_GRAPH_DB);
           await writeEdgesToSQLite(
             artifacts.llmContext.callGraph, dbPath, this.options.rootDir, artifacts.llmContext.cfgs,
-            this._pass1Memo, this._cfgSpill,
+            this._pass1Memo, this._cfgSpill, this._fileHashes,
           );
         }
       } catch {
@@ -705,6 +708,7 @@ export class AnalysisArtifactGenerator {
         // the whole corpus (tens of MB), and nothing after this point — continuity
         // carry-forward, the dependency-graph write, the fingerprint — has any use for them.
         this._pass1Memo = undefined;
+        this._fileHashes = undefined;
         // The spill has either been drained into the table or abandoned; either way the file is
         // temporary and must not outlive the build.
         await this._cfgSpill?.dispose();
@@ -1481,6 +1485,11 @@ export class AnalysisArtifactGenerator {
     const { detectDuplicates } = await import('./duplicate-detector.js');
     const { analyzeForRefactoring } = await import('./refactor-analyzer.js');
     const { classifyYaml, isDockerfilePath } = await import('./iac/index.js');
+    const { looksLikeOpenApi, MAX_SPEC_BYTES } = await import('./contract/openapi.js');
+    const { MAX_CONTRACT_FILES } = await import('./contract/project.js');
+    const { readBuildOutputMap } = await import('./iac/build-output.js');
+    /** Total specification bytes retained across the walk. */
+    const MAX_CONTRACT_BYTES = 64 * 1024 * 1024;
 
     const CALL_GRAPH_LANGS = new Set([
       'Python', 'TypeScript', 'JavaScript', 'Go', 'Rust', 'Ruby', 'Java', 'C++', 'Swift',
@@ -1494,6 +1503,8 @@ export class AnalysisArtifactGenerator {
       'GitHub Actions',
       // Azure IaC DSL (add-bicep-iac-graph).
       'Bicep',
+      // Serverless service manifests (add-iac-deploy-binding-commands).
+      'Serverless',
     ]);
     // Helm charts: every file under a directory containing Chart.yaml is Helm.
     const chartDirs = repoMap.allFiles
@@ -1524,6 +1535,14 @@ export class AnalysisArtifactGenerator {
     };
     const signatures: import('./signature-extractor.js').FileSignatureMap[] = [];
     const callGraphFiles: Array<{ path: string; content: string; language: string }> = [];
+    /** OpenAPI/Swagger candidates, projected onto graph nodes after the call graph is built. */
+    const contractFiles: Array<{ path: string; content: string }> = [];
+    /** The configs that declare where built output comes from (add-iac-deploy-binding-commands). */
+    const buildOutputConfigs = new Map<string, string>();
+    /** Candidates past a retention bound: counted so the projection can disclose the cap. */
+    let contractFilesOmitted = 0;
+    /** Retained specification bytes, bounded alongside the file count. */
+    let contractBytes = 0;
     // Files whose UTF-8 decode was lossy (contained U+FFFD) — a parse-health signal captured at the
     // one central read, since the call-graph extractors never see the raw bytes (change:
     // add-parse-health-boundary-disclosure).
@@ -1533,12 +1552,20 @@ export class AnalysisArtifactGenerator {
     // fix-analyze-native-abort-and-file-cost-budget).
     const sizeCapped: Array<{ path: string; language: string }> = [];
     const scriptContainerFiles: import('./sfc-script-extractor.js').ScriptContainerFileRecord[] = [];
+    // The baseline the read path compares a cited file against. Without it, freshness fell back
+    // to comparing mtimes, so a checkout, pull or new worktree that rewrote unchanged files made
+    // the whole index read as "behind the working tree" until a rebuild.
+    const fileHashes = new Map<string, string>();
+    const hashOf = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
     for (const file of repoMap.allFiles) {
       try {
         // Read raw bytes so an encoding fallback (invalid UTF-8) is detectable at the byte level —
         // a decoded string alone can't distinguish a lossy decode from a legit U+FFFD in the source.
         const bytes = await readFile(file.absolutePath);
+        // Above the freshness scan cap the read path will not hash a file, so a recorded hash
+        // could never be confirmed; such files keep the mtime fallback instead.
+        if (bytes.length <= SOURCE_SCAN_MAX_FILE_BYTES) fileHashes.set(file.path, hashOf(bytes));
         const content = bytes.toString('utf-8');
         const isTest = isTestFile(file.path);
         const scriptContainer = extractScriptContainer(file.path, content);
@@ -1550,6 +1577,38 @@ export class AnalysisArtifactGenerator {
             extractedScriptBlockCount: scriptContainer.extractedScriptBlockCount,
           });
         }
+
+        // Interface specifications (change: add-contract-node-projection): an OpenAPI/Swagger
+        // document is not source code — no grammar parses it and it never enters Pass 1 — so it
+        // rides beside the call-graph files. A document past the reader's byte cap is carried
+        // TRUNCATED rather than dropped, so the reader reports its size as the reason it is
+        // unread instead of the file reading as absent.
+        if (/\.(ya?ml|json)$/i.test(file.path) && looksLikeOpenApi(content)) {
+          // `looksLikeOpenApi` matches an `openapi`/`swagger` key ANYWHERE, so a dependency entry
+          // named `swagger` matches too. `readOpenApi` settles it by reading the top-level key —
+          // except past its byte cap, where it answers "too large" without ever looking. So an
+          // OVERSIZED candidate is retained only when the key is written at the top level (a
+          // nested one is indented further), or a big lockfile would be reported to the user as a
+          // specification OpenLore could not read.
+          const oversized = content.length > MAX_SPEC_BYTES;
+          const retainable = !oversized || /(?:^|\n)[ \t]{0,2}["']?(?:openapi|swagger)["']?[ \t]*:/.test(content.slice(0, 1 << 16));
+          // Two bounds, not one: a count (50) and a total (64 MB). One specification can be 4 MB,
+          // so a count alone let a specification-heavy monorepo hold ~200 MB of strings from the
+          // walk until the build returned.
+          const retained = oversized ? MAX_SPEC_BYTES + 1 : content.length;
+          if (retainable && contractFiles.length < MAX_CONTRACT_FILES && contractBytes + retained <= MAX_CONTRACT_BYTES) {
+            contractBytes += retained;
+            contractFiles.push({ path: file.path, content: oversized ? content.slice(0, MAX_SPEC_BYTES + 1) : content });
+          } else if (retainable) {
+            // Past a bound nothing more is retained, but the count travels, so the projection
+            // discloses the cap instead of reading as "this repository declares no operations".
+            contractFilesOmitted++;
+          }
+        }
+
+        // The project's own build-output mapping, for binding a deployed `dist/…` handler to its
+        // source (change: add-iac-deploy-binding-commands).
+        if (file.path === 'tsconfig.json' || file.path === 'package.json') buildOutputConfigs.set(file.path, content);
 
         // Signatures: exclude test files
         if (!isTest) {
@@ -1628,6 +1687,9 @@ export class AnalysisArtifactGenerator {
       const builder = new CallGraphBuilder({
         ...(memo ? { pass1Cache: memo.cache } : {}),
         ...(this._cfgSpill ? { cfgSpill: this._cfgSpill } : {}),
+        ...(contractFiles.length ? { contractFiles } : {}),
+        ...(contractFilesOmitted ? { contractFilesOmitted } : {}),
+        ...(buildOutputConfigs.size ? { buildOutput: readBuildOutputMap(buildOutputConfigs) } : {}),
       });
       // Tier 1 of the degradation ladder: when the overlay is shed, the decision is bound for the
       // WHOLE build via a build-scoped async-context store, and forwarded to each extraction worker
@@ -1642,6 +1704,7 @@ export class AnalysisArtifactGenerator {
     } finally {
       memo?.close();
     }
+    this._fileHashes = fileHashes;
     this._pass1Memo = memo
       ? { ...memo.cache.take(), analyzedPaths: callGraphFiles.map(f => f.path) }
       : undefined;
@@ -1868,6 +1931,7 @@ export async function writeEdgesToSQLite(
   cfgs?: Array<{ functionId: string; filePath: string; cfg: import('./cfg.js').FunctionCfg }>,
   pass1Memo?: Pass1MemoWrite,
   cfgSpill?: CfgSpill,
+  fileHashes?: ReadonlyMap<string, string>,
 ): Promise<void> {
   const { EdgeStore } = await import('../services/edge-store.js');
   // Analyze/write path: this is the one site allowed to drop-and-rebuild on a
@@ -1911,6 +1975,8 @@ export async function writeEdgesToSQLite(
     // (change: harden-analyze-rebuild-atomicity).
     await store.transactionAsync(async () => {
       store.clearAll();
+      // In the same transaction as the graph, so the hashes always describe the bytes it was built from.
+      if (fileHashes) store.setFileHashes([...fileHashes].map(([path, hash]) => [norm(path), hash]));
       store.insertNodes(prodNodes, hubIds, entryIds);
       store.insertEdges(prodEdges);
       store.insertInheritanceEdges(inheritanceEdges);

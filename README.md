@@ -10,10 +10,10 @@
   <a href="https://www.npmjs.com/package/openlore"><img src="https://img.shields.io/npm/v/openlore?color=2563eb&label=npm&logo=npm&logoColor=white" alt="npm version"></a>
   <a href="https://github.com/clay-good/OpenLore/actions/workflows/ci.yml"><img src="https://github.com/clay-good/OpenLore/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/npm/l/openlore?color=22c55e" alt="MIT License"></a>
-  <img src="https://img.shields.io/node/v/openlore?color=339933&logo=node.js&logoColor=white" alt="Node >=22.19">
+  <img src="https://img.shields.io/node/v/openlore?color=339933&logo=node.js&logoColor=white" alt="Node >=22.22">
   <br>
   <img src="https://img.shields.io/badge/MCP-ready-7c3aed?logo=anthropic&logoColor=white" alt="MCP ready">
-  <img src="https://img.shields.io/badge/languages-21%20%2B%2012%20IaC-f97316" alt="21 languages + 12 IaC ecosystems">
+  <img src="https://img.shields.io/badge/languages-21%20%2B%2013%20IaC-f97316" alt="21 languages + 13 IaC ecosystems">
   <img src="https://img.shields.io/badge/tests-5500%2B-success" alt="5500+ tests">
   <img src="https://img.shields.io/badge/API_key-not_required-0ea5e9" alt="No API key required">
   <a href="https://github.com/clay-good/OpenLore/stargazers"><img src="https://img.shields.io/github/stars/clay-good/OpenLore?style=social" alt="GitHub stars"></a>
@@ -111,7 +111,7 @@ The win scales with codebase size (round-trips without → with):
 
 ## What your agent reaches for (you rarely type these)
 
-Once wired, your agent calls these over MCP on its own. The default surface is the **`substrate`** preset — **15 tools**: the navigation core, the highest-value governance reads (`recall`, `verify_claim`, `blast_radius`), and the spec composites. The lean **`navigation`** preset (10 tools) and the full **80 tools** (`--preset full`) are one flag away.
+Once wired, your agent calls these over MCP on its own. The default surface is the **`substrate`** preset — **15 tools**: the navigation core, the highest-value governance reads (`recall`, `verify_claim`, `blast_radius`), and the spec composites. The lean **`navigation`** preset (10 tools) and the full **83 tools** (`--preset full`) are one flag away.
 
 | When the agent needs to… | Tool |
 |-----------|------|
@@ -127,7 +127,7 @@ Once wired, your agent calls these over MCP on its own. The default surface is t
 | Verify a fact before asserting it | `verify_claim` — deterministic verdict + citation |
 | Record an architectural choice | `record_decision` **before** writing the code |
 
-Full reference — all 80 tools: [docs/mcp-tools.md](docs/mcp-tools.md). Ships as a Claude Code [Skill](https://docs.claude.com/en/docs/claude-code/skills) at [`skills/openlore-orient/`](skills/openlore-orient/).
+Full reference — all 83 tools: [docs/mcp-tools.md](docs/mcp-tools.md). Ships as a Claude Code [Skill](https://docs.claude.com/en/docs/claude-code/skills) at [`skills/openlore-orient/`](skills/openlore-orient/).
 
 ---
 
@@ -169,11 +169,13 @@ Large monorepos take minutes rather than seconds, stated plainly in [Known limit
 
 ---
 
-## Languages & Infrastructure-as-Code
+## Languages, Infrastructure-as-Code & contracts
 
 **Languages**: TypeScript · JavaScript · Python · Go · Rust · Ruby · Java · C++ · Swift · C# · Kotlin · PHP · C · Scala · Dart · Lua · Elixir · Bash — call graphs ride the same primitives for every language. → [docs/language-support.md](docs/language-support.md)
 
-**Infrastructure-as-Code**: Terraform/HCL · Kubernetes · Helm · CloudFormation · Ansible · Pulumi · AWS CDK · CDKTF · Dockerfile · Docker Compose · GitHub Actions · Azure Bicep — IaC resources project onto the **same graph** as application code, so `orient`, `search_code`, and `analyze_impact` answer "what's the blast radius of changing this security group / IAM role / base image / CI job?" with zero new tooling. → [docs/iac.md](docs/iac.md)
+**Infrastructure-as-Code**: Terraform/HCL · Kubernetes · Helm · CloudFormation · Ansible · Pulumi · AWS CDK · CDKTF · Dockerfile · Docker Compose · GitHub Actions · Azure Bicep · Serverless Framework — IaC resources project onto the **same graph** as application code, so `orient`, `search_code`, and `analyze_impact` answer "what's the blast radius of changing this security group / IAM role / base image / CI job?" with zero new tooling. → [docs/iac.md](docs/iac.md)
+
+**Interface contracts**: OpenAPI 3.x · Swagger 2.0 — each declared operation projects onto the **same graph**, bound to the route handler that serves it and the function that calls it, so `orient` and `analyze_impact` cross the API boundary. Matching is literal, and everything unbound is disclosed. → [docs/contracts.md](docs/contracts.md)
 
 ---
 
@@ -183,7 +185,7 @@ We'd rather you know these up front.
 
 - **Static analysis only.** Polymorphic dispatch, event channels, and route→handler bindings *are* recovered (provenance-labeled `synthesized`). What isn't: reflective invocation with a non-literal target (`getattr(o, name)()`), `eval`, and DI/plugin registries with no visible binding — silently absent from the graph.
 - **LLM spec quality varies.** Generated spec *prose* reflects the model's understanding — review complex business logic. Structure, format, coverage, and drift are checked deterministically.
-- **Keyword (BM25) search is the default; semantic is an opt-in upgrade.** `orient`/`search_code` work immediately with no key. Add hybrid dense+BM25 with `openlore embed --local` (bundled, CPU-only, ~23 MB).
+- **Keyword (BM25) search answers first; local semantic follows in the background.** `orient`/`search_code` work immediately with no key. Background builds then add on-device vectors (CPU-only, ~23 MB model) when the optional package is installed; opt out with `"embedding": { "provider": "none" }`.
 - **Large monorepos** analyze one package at a time after the first full build (`openlore analyze --shard <name>`); the initial index is still a full analysis.
 - **Incremental updates converge or flag, never silently diverge.** When a change exceeds the per-save budget, the rest is marked explicitly stale and self-heals on later edits or a background re-analyze.
 
@@ -197,7 +199,7 @@ We'd rather you know these up front.
 |------------|-----|
 | **Install & wire my agent** (one command) | [install.md](docs/install.md) |
 | Understand *why* wiring an agent helps | [agent-setup.md](docs/agent-setup.md) |
-| See all **80 MCP tools** + parameters | [mcp-tools.md](docs/mcp-tools.md) |
+| See all **83 MCP tools** + parameters | [mcp-tools.md](docs/mcp-tools.md) |
 | Run the full **CLI reference** | [cli-reference.md](docs/cli-reference.md) |
 | Configure `.openlore/config.json` (incl. `enforcement.policy`) | [configuration.md](docs/configuration.md) |
 | Choose / configure an LLM provider (optional) | [providers.md](docs/providers.md) |
@@ -210,6 +212,7 @@ We'd rather you know these up front.
 | Enforce architecture / import rules | [architecture-invariants.md](docs/architecture-invariants.md) |
 | Gate commits / wire CI & PR review | [ci-cd.md](docs/ci-cd.md) · [preflight.md](docs/preflight.md) |
 | Understand IaC & cross-domain impact | [iac.md](docs/iac.md) · [cross-domain-impact.md](docs/cross-domain-impact.md) |
+| See declared API contracts in the graph | [contracts.md](docs/contracts.md) |
 | Query across repos (federation) | [federation.md](docs/federation.md) |
 | Share the index as a bundle | [shareable-bundle.md](docs/shareable-bundle.md) |
 | Export to Sourcegraph / SCIP tools | [scip-export.md](docs/scip-export.md) |

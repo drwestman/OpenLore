@@ -7929,6 +7929,416 @@ Without churn data the trend SHALL be withheld with the reason, never reported a
 - **WHEN** the trend is computed
 - **THEN** no label is given and the reason is `shallow-history`
 
+### Requirement: OpenTofuFilesAreTerraform
+
+Language detection SHALL classify files ending in `.tofu` or `.tofu.json` as Terraform, so the
+Terraform/HCL extractor projects them exactly as it projects `.tf` and `.tf.json` files.
+
+#### Scenario: An OpenTofu file yields the same resources
+
+- **GIVEN** a `main.tofu` file and a `main.tf` file with identical content in two otherwise identical
+  repositories
+- **WHEN** both repositories are analyzed
+- **THEN** both graphs contain the same Terraform resource nodes and edges
+
+### Requirement: IacResourcesBindToTheCodeTheyRun
+
+The IaC projection SHALL link a resource to the indexed function it runs, by a `deploys_symbol`
+edge, when the resource's handler names a source location literally: a Terraform
+`aws_lambda_function` or CloudFormation/SAM function handler in `<module>.<export>` form, resolved
+relative to its code location, the repository root, or the template's directory. An interpolated or otherwise non-literal handler SHALL be
+recorded as a disclosed unresolved binding, never dropped silently. A bound function SHALL count as
+an entry point for dead-code analysis.
+
+#### Scenario: A Lambda handler binds to its function
+
+- **GIVEN** a Terraform `aws_lambda_function` with `handler = "src/orders.handler"` and an exported
+  `handler` function in `src/orders.ts`
+- **WHEN** the repository is analyzed
+- **THEN** a `deploys_symbol` edge links the resource to the function, and `find_dead_code` does not
+  list the function
+
+#### Scenario: An interpolated handler is disclosed
+
+- **GIVEN** a Lambda resource with `handler = var.handler`
+- **WHEN** the repository is analyzed
+- **THEN** no edge is created and the resource is listed as an unresolved binding with the reason
+
+### Requirement: ContractOperationsAreGraphNodesBoundToHandlers
+
+The analyzer SHALL project each operation of a discovered OpenAPI or Swagger document onto the
+existing graph primitives, as infrastructure resources are projected: a node whose `language` is
+`OpenAPI` and whose address is `<METHOD> <path template>`, the servers base path included. A route
+handler extracted by the HTTP route parser SHALL be linked to the operation with the same method
+and normalized path template by an `implements_endpoint` edge. Matching SHALL be literal — no name
+similarity, no embeddings — and SHALL name exactly ONE declared operation: an address that names
+several binds nothing and is disclosed as ambiguous.
+
+#### Scenario: A handler is bound to its declared operation
+
+- **GIVEN** an OpenAPI document declaring `GET /v1/orders/{id}` and an Express handler registered
+  on `GET /v1/orders/:id`
+- **WHEN** the repository is analyzed
+- **THEN** the graph holds an `OpenAPI` node addressed `GET /v1/orders/{id}` and an
+  `implements_endpoint` edge from the handler to it
+
+#### Scenario: Similar but different routes are not bound
+
+- **GIVEN** a spec operation `GET /v1/orders/{id}` and a handler on `GET /v1/order/:id`
+- **WHEN** the repository is analyzed
+- **THEN** no `implements_endpoint` edge is created and both appear in the unmatched lists
+
+#### Scenario: A router mounted without the base path
+
+- **GIVEN** a specification whose servers base path is `/v1`, declaring `/orders/{id}`, and a
+  handler registered on `/orders/:id`
+- **WHEN** the repository is analyzed
+- **THEN** the handler is bound, because exactly one declared path across every specification has
+  that method and path and the path has a literal segment
+
+#### Scenario: Two operations that collapse to one address bind to neither
+
+- **GIVEN** two specifications that declare the same method and path for different services
+- **WHEN** the repository is analyzed
+- **THEN** no `implements_endpoint` edge is created and the address is disclosed as ambiguous
+
+### Requirement: ContractElementsAreGraphNodesBoundToHandlers
+
+Each NAMED schema a specification declares — `components/schemas` in OpenAPI 3, `definitions` in
+Swagger 2 — SHALL be projected as a graph node carrying the specification's path, the schema's
+declared line, its JSON pointer as the node name and its bare name as the signature. An operation
+SHALL be linked by a `references_schema` edge to each named schema it references directly across
+its parameters, body and responses, and a named schema SHALL be linked the same way to each named
+schema its own definition references directly. Transitive reachability SHALL be left to the graph
+rather than duplicated per node.
+
+Per-FIELD nodes SHALL NOT be projected: a named schema is the reusable unit, and the
+property-level verdict already belongs to `certify_service_contract`.
+
+A schema cycle SHALL terminate, each edge drawn once.
+
+A `references_schema` edge is a DECLARATION binding, so it SHALL contribute to no function's
+fan-in or fan-out, no entry-point or hub classification, no file-level dependency ranking and no
+layer violation; and a schema node SHALL be excluded from every candidate set that ranks source
+code, as every other projected declaration is.
+
+#### Scenario: A shared schema is one node with many referents
+
+- **GIVEN** a document declaring `Order` (which references `Customer`) and `OrderInput`, and
+  `POST /v1/orders` whose body references `OrderInput` and whose response references `Order`
+- **WHEN** the repository is analyzed
+- **THEN** three schema nodes exist, `POST /v1/orders` has a `references_schema` edge to `Order`
+  and to `OrderInput`, and `Order` has one to `Customer`
+
+#### Scenario: A declaration binding changes no code measurement
+
+- **GIVEN** the same repository analyzed with and without the specification
+- **WHEN** the two graphs are compared
+- **THEN** every code function's fan-in and fan-out, the structural averages, the entry points and
+  the hubs are identical, and no schema node appears among the entry points or hubs
+
+#### Scenario: A reference through a reusable component is followed; a documented one is not
+
+- **GIVEN** an operation referencing `components/parameters/OrderId`, whose schema is
+  `OrderId`, and a response whose `example` references `Legacy`
+- **WHEN** the repository is analyzed
+- **THEN** the operation has a `references_schema` edge to `OrderId`, none to `Legacy`, and
+  nothing is disclosed as unresolved
+
+#### Scenario: A dangling reference is disclosed, not invented
+
+- **GIVEN** a schema whose property references `#/components/schemas/Missing`, which the document
+  does not declare
+- **WHEN** the repository is analyzed
+- **THEN** no node is created for it, no edge is drawn, and the projection discloses the
+  unresolved reference
+
+### Requirement: UnboundContractElementsAreDisclosed
+
+Everything the contract projection could not bind SHALL be disclosed on the build rather than
+dropped: operations no route serves and no call consumes, routes no operation declares, a route or
+call that matched an operation but whose code node could not be pinned, client call sites whose
+method or path is not literal, addresses that name more than one declared operation, a
+specification that declared itself one and could not be read, and every cap the projection stopped
+at. Each list SHALL be bounded and carry its exact total, so a disclosure cannot itself overwhelm
+the artifact that carries it.
+
+An "unmatched" conclusion SHALL be WITHHELD, not asserted, while any input that could have matched
+was not assessed — the route extraction failed or degraded, a specification could not be read, or
+an operation fell past the cap. A projection that fails outright SHALL disclose the failure, so no
+build reports "no operations" for a repository whose specification merely failed to parse.
+
+#### Scenario: An unreadable specification is disclosed
+
+- **GIVEN** a file declaring itself an OpenAPI document that cannot be parsed
+- **WHEN** the repository is analyzed
+- **THEN** the file is disclosed as unread with its reason, and its operations are not reported
+  as absent
+
+#### Scenario: An operation nothing serves
+
+- **GIVEN** a specification declaring two operations, a route serving one of them, and every
+  input assessed
+- **WHEN** the repository is analyzed
+- **THEN** the other operation is disclosed as unmatched
+
+#### Scenario: A conclusion is withheld rather than guessed
+
+- **GIVEN** a repository whose route extraction failed
+- **WHEN** the repository is analyzed
+- **THEN** no operation is reported as unmatched, and the reason it could not be assessed is
+  disclosed
+
+#### Scenario: A handler that matched but could not be resolved
+
+- **GIVEN** a route that matches a declared operation whose handler name resolves to no single
+  indexed function
+- **WHEN** the repository is analyzed
+- **THEN** no edge is created, the route is not called unmatched, and the unresolved binding is
+  disclosed
+
+### Requirement: ContractReferencesAreStructuralAndAttributedByAddress
+
+A reference SHALL be followed through a reusable component to the named schema it names, SHALL be
+ignored where it appears only in documentation, and SHALL be attributed to an operation by that
+operation's address. A reference to a schema that was not projected SHALL be disclosed with its
+reason, and a cap SHALL be reported against the DECLARED count.
+
+Keeping parameters and responses in `components` is the style the specification recommends, so an
+operation that does so depends on those schemas exactly as if they were inline. A reference inside
+a `description` or an `example` is prose about a type, not a dependency on it. An `operationId` is
+required to be unique and a document may still repeat one, so it is not an identity.
+
+#### Scenario: A reference through a reusable component is followed
+
+- **GIVEN** an operation referencing `components/parameters/OrderId`, whose schema is `OrderId`,
+  and a response referencing `components/responses/OrderOut`, whose schema is `Order`
+- **WHEN** the repository is analyzed
+- **THEN** the operation has a `references_schema` edge to `OrderId` and to `Order`, and nothing
+  is disclosed as unresolved
+
+#### Scenario: A reference written only in documentation draws no edge
+
+- **GIVEN** a response whose `example` references `Legacy`, which the document declares
+- **WHEN** the repository is analyzed
+- **THEN** `Legacy` is a node, and no operation has a `references_schema` edge to it
+
+#### Scenario: A repeated operationId attributes nothing across operations
+
+- **GIVEN** two operations in one document declaring the same `operationId`, each referencing a
+  different schema
+- **WHEN** the repository is analyzed
+- **THEN** each operation references only its own schema
+
+#### Scenario: A cap reports what the document declared
+
+- **GIVEN** a document declaring more named schemas than the reader's own cap admits
+- **WHEN** the repository is analyzed
+- **THEN** the number disclosed as not projected is the declared count minus the projected count
+
+### Requirement: ContractElementsAreNotRankedAsCode
+
+A contract element is a declaration, not a code unit. A contract node SHALL be excluded from
+EVERY candidate set that ranks or counts source code, and a contract edge SHALL NOT change any
+function's fan-in or fan-out, in the in-memory build and in the persisted graph every tool reads.
+A caller that NAMES a projected language SHALL still be served it.
+
+The exclusion SHALL be keyed on the node's projected LANGUAGE and the edge's declaration KIND, in
+one shared predicate, so a newly projected language is covered the day it is added rather than the
+day each surface remembers it. The surfaces in scope are the hubs, entry points, dead code,
+coverage gaps, change significance and file-level dependency rankings; the retrieval surfaces
+(`search_code`, `suggest_insertion_points`, `orient`); the structural health signals (betweenness
+bridges, untested hotspots); the refactoring report; and the counts the generated digest prints as
+functions.
+A contract node SHALL reach an agent as a typed cross-domain neighbour, never inside a list of
+functions it could edit or test. A handler bound to a declared operation SHALL be treated as
+invoked from outside the code, so it is a reachability root rather than dead code.
+
+#### Scenario: Projecting a specification changes no metric
+
+- **GIVEN** a repository analyzed with and without its specification
+- **WHEN** the two graphs are compared
+- **THEN** every function's fan-in and fan-out, the hubs, the entry points, and the structural
+  averages are identical, and no contract node appears among them
+
+#### Scenario: A declaration never competes with code for a ranked slot
+
+- **GIVEN** a document declaring more named schemas than the repository has functions
+- **WHEN** `search_code`, `suggest_insertion_points`, `orient` or the structural health map ranks
+  candidates without being asked for a projected language
+- **THEN** no schema or operation appears among the results, the code's own scores are unchanged
+  including a normalised betweenness, and naming a projected language explicitly serves it again
+
+#### Scenario: A recursive schema is not reported as a cycle to break
+
+- **GIVEN** two named schemas whose definitions reference each other
+- **WHEN** the refactoring report and the generated architecture document are produced
+- **THEN** no dependency cycle is reported, and the count of functions analyzed excludes both
+  declarations
+
+#### Scenario: The served graph classifies a declaration the same way
+
+- **GIVEN** a persisted graph holding an operation node that nothing binds to, and one that eight
+  handlers bind to
+- **WHEN** the structural metrics are recomputed
+- **THEN** neither is an entry point and neither is a hub, and no handler's fan-out counts its
+  contract edge
+
+#### Scenario: An operation reaches the agent as a contract neighbour
+
+- **GIVEN** a handler bound to a declared operation
+- **WHEN** `analyze_impact` runs on the handler
+- **THEN** the operation is reported as a typed contract neighbour, not among the code functions
+  downstream
+
+#### Scenario: A declared handler is not dead code
+
+- **GIVEN** a handler that no indexed code calls and that serves a declared operation
+- **WHEN** `find_dead_code` runs
+- **THEN** the handler is not a candidate, and neither is the operation node
+
+### Requirement: ClientCallsAreBoundToTheOperationsTheyConsume
+
+The function enclosing a client call site extracted by the HTTP projection SHALL be linked by a
+`consumes_endpoint` edge to the operation with the same method and normalized path, whether or not
+a handler for that operation is in the repository. A concrete value written where the
+specification writes a path parameter SHALL bind, matched segment by segment and only when exactly
+one declared operation accepts the path; an exactly declared path always wins. A call written to
+an absolute URL SHALL bind only when its host is one the matched document declares, so a call to
+another service is never read as a call to this one. A call whose method or path is not literal
+SHALL be left unbound.
+
+A generated client builds its URL from a base variable, so no literal path is extracted and
+nothing binds by path. Where a module's HEADER declares a specification as the source it was
+generated from, a function in that module whose name is exactly an `operationId` of that
+specification SHALL be linked by a `consumes_endpoint` edge to that operation, and that edge SHALL
+record that it was bound by `operationId` rather than by a literal path.
+
+The header declaration SHALL require all of: the reference appears in a COMMENT within the
+header, so a specification path used in ordinary code (a loader that reads it at runtime) is not
+a claim; the same line carries a generation marker, so a prose mention is not a claim; and the
+reference matches on path boundaries, so one specification's header never names another whose
+base name is a substring of it. A name match alone SHALL NOT bind. Projected declarations (an
+infrastructure resource, a contract element) and test modules SHALL NOT be candidates. Where the
+name matches more than one function node, or the document declares one `operationId` twice,
+nothing SHALL bind and the case SHALL be disclosed.
+
+#### Scenario: Calls to an external API are visible
+
+- **GIVEN** a vendored OpenAPI document for an external service declaring `POST /v1/charges`, and a
+  client `POST` call to a literal `/v1/charges` path with no handler in the repository
+- **WHEN** the repository is analyzed
+- **THEN** a `consumes_endpoint` edge links the calling function to `POST /v1/charges`
+
+#### Scenario: A concrete value fills a declared parameter
+
+- **GIVEN** a specification declaring `GET /v1/orders/{id}` and a client call to the literal path
+  `/v1/orders/7`
+- **WHEN** the repository is analyzed
+- **THEN** a `consumes_endpoint` edge links the calling function to `GET /v1/orders/{id}`
+
+#### Scenario: A generated client binds by operationId
+
+- **GIVEN** a specification declaring `GET /v1/orders/{id}` with `operationId: getOrder`, and a
+  module whose header reads `@generated from openapi.yaml` holding a `getOrder` function that
+  fetches a URL built from a base variable
+- **WHEN** the repository is analyzed
+- **THEN** a `consumes_endpoint` edge links `getOrder` to `GET /v1/orders/{id}`
+
+#### Scenario: A hand-written function of the same name is not bound
+
+- **GIVEN** the same specification and a module with NO header naming it, holding its own
+  `getOrder` function
+- **WHEN** the repository is analyzed
+- **THEN** no `consumes_endpoint` edge is created for it
+
+#### Scenario: A prose mention is not a generation claim
+
+- **GIVEN** a hand-written module whose header reads `See api/openapi.yaml for the wire contract
+  these mirror.` and holds a `getOrder` function
+- **WHEN** the repository is analyzed
+- **THEN** no `consumes_endpoint` edge is created for it
+
+#### Scenario: One specification's header never names another
+
+- **GIVEN** `api/openapi.yaml` and `third-party/stripe/openapi.yaml`, each declaring an operation
+  with `operationId: getOrder`, and a module whose header reads `@generated from
+  api/openapi.yaml`
+- **WHEN** the repository is analyzed
+- **THEN** the only `consumes_endpoint` edge is to the operation of `api/openapi.yaml`
+
+#### Scenario: An operation bound by a generated client is not reported unmatched
+
+- **GIVEN** a specification whose operation is consumed only by a generated client
+- **WHEN** the repository is analyzed
+- **THEN** the operation is absent from `unmatchedOperations`
+
+#### Scenario: A call to another host is not bound
+
+- **GIVEN** a specification whose servers name `api.example.com`, and a client call to
+  `https://other-vendor.example.com/v1/charges`
+- **WHEN** the repository is analyzed
+- **THEN** no edge is created and the call site is disclosed as unbound
+
+#### Scenario: A call whose base is not literal is disclosed
+
+- **GIVEN** a client call written to `${base}/orders/7`
+- **WHEN** the repository is analyzed
+- **THEN** no edge is created and the call site is disclosed as unbound with its reason
+
+### Requirement: ServerlessFunctionsBindToTheirHandlers
+
+The analyzer SHALL read a Serverless Framework service manifest (`serverless.yml`, `.yaml`, or
+`.json`, corroborated by its content) and project each `functions.<name>` as a resource grouped
+under the service, whose `<module>.<export>` handler binds to the indexed function it names by a
+`deploys_symbol` edge, resolved relative to the manifest's own directory and the repository root.
+A function that runs a container image, declares no handler, or builds its handler from a
+Serverless variable SHALL be recorded as an unresolved binding with that reason.
+
+#### Scenario: A Serverless function binds to its handler
+
+- **GIVEN** a `serverless.yml` declaring `functions.createOrder.handler: src/orders.create` and an
+  indexed `create` in `src/orders.ts`
+- **WHEN** the repository is analyzed
+- **THEN** the graph holds a `deploys_symbol` edge from `function.createOrder` to `create`
+
+#### Scenario: A variable handler is disclosed, not guessed
+
+- **GIVEN** a function whose handler is `${self:custom.base}.handler`
+- **WHEN** the repository is analyzed
+- **THEN** no edge is created and the binding is disclosed as unresolved, naming the variable as
+  the reason
+
+#### Scenario: A Serverless manifest's environment block sets a variable
+
+- **GIVEN** a `serverless.yml` whose `provider.environment` sets `TABLE_NAME`
+- **WHEN** the environment-declaration scan runs
+- **THEN** the site is reported as setting `TABLE_NAME`, with its resource, file and line, and
+  without its value
+
+### Requirement: BuiltHandlersResolveThroughTheProjectsOwnMapping
+
+A deployed handler that names built output SHALL resolve to its source only through a mapping the
+project itself declares in the repository root's `tsconfig.json` or `package.json` — TypeScript's
+`outDir` with `rootDir`, or `main` paired with `source`. An `extends` chain is not followed, and
+the unresolved reason SHALL name what was read rather than assert the project declares no mapping. A path under a declared `outDir` that the project maps to no input SHALL
+remain an unresolved binding naming the missing mapping; it SHALL NOT be matched to a
+same-basename source file.
+
+#### Scenario: A built handler reaches its source
+
+- **GIVEN** a handler `dist/orders.handler`, a `tsconfig.json` with `outDir: dist` and
+  `rootDir: src`, and an indexed `handler` in `src/orders.ts`
+- **WHEN** the repository is analyzed
+- **THEN** the resource has a `deploys_symbol` edge to `handler` in `src/orders.ts`
+
+#### Scenario: An unmapped build output is disclosed
+
+- **GIVEN** the same handler and a `tsconfig.json` declaring `outDir` but no `rootDir`, and no
+  `main`/`source` pair
+- **WHEN** the repository is analyzed
+- **THEN** no edge is created and the unresolved binding names the missing mapping
+
 ## Sub-components
 
 > `SignatureExtractor` is an orchestrator. Each sub-component below implements one logical block.

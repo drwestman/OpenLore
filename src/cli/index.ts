@@ -21,6 +21,9 @@ import './node-version-bootstrap.js';
 // does essentially no wasted work before handing off to the larger-heap child. Fail-open and
 // at-most-once — see heap-sizing.ts.
 import './heap-bootstrap.js';
+// Render an unexpected failure as one legible stderr line instead of a V8 stack trace. Bound
+// here, before the command modules load, so a throw while they evaluate is covered too.
+import './crash-reporter.js';
 import { allowInsecureTls } from '../core/services/tls-scope.js';
 
 import { Command } from 'commander';
@@ -57,8 +60,12 @@ import { specStoreCommand } from './commands/spec-store.js';
 import { workingSetCommand } from './commands/working-set.js';
 import { impactCertificateCommand } from './commands/impact-certificate.js';
 import { checkEditCommand } from './commands/check-edit.js';
+import { hookCommand } from './commands/hook.js';
+import { handoffCommand } from './commands/handoff.js';
+import { footprintCommand } from './commands/footprint.js';
 import { coverageGapsCommand } from './commands/coverage-gaps.js';
 import { certifyPublicSurfaceCommand } from './commands/certify-public-surface.js';
+import { certifyServiceContractCommand } from './commands/certify-service-contract.js';
 import { styleFingerprintCommand } from './commands/style-fingerprint.js';
 import { briefingSinceCommand } from './commands/briefing-since.js';
 import { findClonesCommand } from './commands/find-clones.js';
@@ -80,6 +87,7 @@ import { gryphWatchCommand } from './commands/gryph-watch.js';
 import { updateCommand } from './commands/update.js';
 import { featuresCommand } from './commands/features.js';
 import { statusCommand } from './commands/status.js';
+import { statuslineCommand } from './commands/statusline.js';
 import { changeStatusCommand } from './commands/change-status.js';
 import { searchCommand } from './commands/search.js';
 import { applyJobGroupedHelp } from './help-groups.js';
@@ -230,6 +238,7 @@ program.addCommand(viewCommand);
 program.addCommand(doctorCommand);
 program.addCommand(featuresCommand);
 program.addCommand(statusCommand);
+program.addCommand(statuslineCommand);
 program.addCommand(setupCommand);
 program.addCommand(refreshStoriesCommand);
 program.addCommand(auditCommand);
@@ -249,8 +258,12 @@ program.addCommand(specStoreCommand);
 program.addCommand(workingSetCommand);
 program.addCommand(impactCertificateCommand);
 program.addCommand(checkEditCommand);
+program.addCommand(hookCommand);
+program.addCommand(handoffCommand);
+program.addCommand(footprintCommand);
 program.addCommand(coverageGapsCommand);
 program.addCommand(certifyPublicSurfaceCommand);
+program.addCommand(certifyServiceContractCommand);
 program.addCommand(styleFingerprintCommand);
 program.addCommand(briefingSinceCommand);
 program.addCommand(findClonesCommand);

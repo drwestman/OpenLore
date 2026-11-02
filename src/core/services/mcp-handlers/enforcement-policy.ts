@@ -225,6 +225,29 @@ export const FINDING_CODE_REGISTRY: Record<string, FindingCodeSpec> = {
     description: 'An exported signature changed and its compatibility cannot be proven from the available types (potentially-breaking, never breaking-classed).',
     remediation: 'Unprovable signature change: {subject}; restore the type annotations so compatibility can be classified, or review consumers by hand.',
   },
+  // ── service contract certification (add-service-contract-certification) ──
+  // Emitted only by `certify_service_contract`; `openlore enforce` does not run it.
+  'contract-breaking': {
+    defaultClass: 'advisory', source: 'service-contract',
+    description: 'An API schema element changed in a way existing clients may not handle (breaking or dangerous rule).',
+    remediation: 'Contract change {subject}: version the API, keep the old shape, or update the listed consumers.',
+  },
+  'contract-declared-unimplemented': {
+    defaultClass: 'advisory', source: 'service-contract',
+    description: 'An API operation is declared in a specification but no indexed route handler serves it.',
+    remediation: 'Declared but not served: {subject}; add the route, or remove the operation from the specification.',
+  },
+  // Also returned and classified by verify_change, for call sites on lines the diff adds or changes.
+  'contract-payload-missing-required': {
+    defaultClass: 'advisory', source: 'service-contract',
+    description: 'A client call site sends a literal request body that lacks a property the operation requires.',
+    remediation: 'Request body at {subject} is missing a required property; add it, or correct the specification.',
+  },
+  'contract-implemented-undeclared': {
+    defaultClass: 'advisory', source: 'service-contract',
+    description: 'A route handler serves a path under one the specification covers, but the specification does not declare it.',
+    remediation: 'Served but not declared: {subject}; declare the operation, or move the route out of the covered path.',
+  },
   // ── dynamic-boundary disclosure (disclose-dynamic-boundary-regions) ──
   'dynamic-boundary-in-conclusion-scope': {
     // Advisory, like every non-corpus code: blocking is always opt-in. A team that wants CI to
@@ -336,6 +359,84 @@ export const FINDING_CODE_REGISTRY: Record<string, FindingCodeSpec> = {
     description: 'A high-complexity function in a churned file never got simpler and ended more complex over its sampled recent commits (rising) and is at or above the high-complexity threshold.',
     remediation: 'Rising complexity: {subject}; split or simplify it before adding more branches.',
   },
+  // ── phantom references (add-phantom-reference-findings) ──
+  // Returned and classified by verify_change; `openlore enforce` does not collect them.
+  'unresolved-internal-import': {
+    defaultClass: 'advisory',
+    source: 'phantom-references',
+    description: 'A diff adds a relative import whose target is not a file in this repository, so the module does not exist. A path alias the resolver cannot follow is disclosed instead, never reported.',
+    remediation: 'Import of {subject} resolves to no file; create the module or correct the path.',
+  },
+  'unresolved-internal-symbol': {
+    defaultClass: 'advisory',
+    source: 'phantom-references',
+    description: "A diff adds a named import that the target module does not export, read from the target's current content. A target that re-exports from somewhere unfollowable is disclosed instead, never reported.",
+    remediation: 'The module does not export {subject}; export it there, or import a name it does export.',
+  },
+  'undeclared-dependency': {
+    defaultClass: 'advisory',
+    source: 'phantom-references',
+    description: 'A diff adds an import of an external package that no manifest in scope declares, and that is not the language\'s standard library — the shape an invented (and squattable) package name takes. An ecosystem with no readable manifest is disclosed instead.',
+    remediation: 'Nothing declares {subject}; add it to the manifest, or use a package that is declared.',
+  },
+  'unpinned-dependency': {
+    defaultClass: 'advisory',
+    source: 'phantom-references',
+    description: 'A diff adds an import of a package its manifest declares, but the lockfile beside that changed manifest does not pin it, so a clean install will not have it. An absent or unparseable lockfile yields no finding.',
+    remediation: 'The lockfile does not pin {subject}; run the package manager\'s install so the lockfile is updated with the manifest.',
+  },
+  // ── generated-file guard (add-generated-file-guard) ──
+  // Returned and classified by verify_change; `openlore enforce` does not collect it.
+  'generated-file-edited': {
+    defaultClass: 'advisory',
+    source: 'generated-file-guard',
+    description: 'A diff edits a generated or vendored file (recognized header marker, .gitattributes linguist attribute, or excluded path pattern) without also changing its known source or the config entry that regenerates it, or changes a lockfile without a manifest of its ecosystem. A newly added generated file does not fire it.',
+    remediation: 'Generated file {subject} was edited without its source; edit the source and regenerate, or record why the hand edit is intended.',
+  },
+  // ── check weakening (add-check-weakening-findings) ──
+  // Returned by structural_diff and verify_change, listed by `openlore review`; `openlore enforce` does not collect them.
+  'test-removed': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A test case or test file present at the baseline (the merge-base) is gone, and no test with the same body appears under a new name.',
+    remediation: 'Test {subject} was removed; confirm the behavior it checked is still tested, or restore it.',
+  },
+  'test-disabled': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A skip, ignore, or disable marker (`it.skip`, `xit`, `@pytest.mark.skip`, `t.Skip`, `@Disabled`) was added to a test, or a focus marker (`.only`, `fit`) that stops the file\'s other tests from running.',
+    remediation: 'Test {subject} no longer runs; re-enable it, or record why it is off.',
+  },
+  'assertions-reduced': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A test has fewer assertion calls than at the baseline (closed per-framework assertion-call list).',
+    remediation: 'Test {subject} lost assertions; confirm it still checks the behavior it is named for.',
+  },
+  'expected-value-changed': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A literal argument of a test\'s assertions changed while no production symbol the test file reaches changed.',
+    remediation: 'An expected value in {subject} changed without a change to the code it checks; confirm the new value is correct.',
+  },
+  'suppression-added': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A suppression comment or annotation was added (`@ts-ignore`, `eslint-disable`, `# noqa`, `# type: ignore`, `//nolint`, `@SuppressWarnings`, …).',
+    remediation: 'A suppression was added at {subject}; fix the reported issue, or record why it is suppressed.',
+  },
+  'error-swallowed': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A new catch/except block (or Go `if err != nil`) that is empty or only logs (closed per-language logging list) and returns at most a constant, around a call the baseline did not so wrap.',
+    remediation: 'An error at {subject} is now discarded; handle or rethrow it, or record why it is safe to ignore.',
+  },
+  'check-config-relaxed': {
+    defaultClass: 'advisory',
+    source: 'check-weakening',
+    description: 'A test-runner, coverage, lint, or CI config was relaxed: an added exclude/ignore entry, a lint rule turned off, a lowered coverage threshold, an added `continue-on-error`/`allow_failure` or `if: false`, a removed or changed CI step that ran tests, a deleted check config, or a lowered enforcement class for one of these codes in `.openlore/config.json`.',
+    remediation: 'A check config was relaxed at {subject}; confirm the relaxation is intended.',
+  },
   // ── deprecation propagation (add-deprecation-propagation) ──
   'deprecated-symbol-use': {
     defaultClass: 'advisory',
@@ -355,6 +456,12 @@ export const FINDING_CODE_REGISTRY: Record<string, FindingCodeSpec> = {
     description: 'A set of proposed tasks forms an unorderable read-after-write cycle; no wave order satisfies all dependencies, so the members are scheduled mutually exclusive and the circular dependency should be resolved.',
   },
   // ── cross-actor interference map (add-cross-actor-interference-map) ──
+  'duplicate-intent': {
+    defaultClass: 'advisory',
+    source: 'declare-footprint',
+    description: 'Two live agents on the peer board intend to create the same symbol name or file (change: add-peer-footprint-board).',
+    remediation: 'Duplicate intent {subject}: agree which agent creates it, or release one footprint.',
+  },
   'cross-actor-conflict': {
     defaultClass: 'advisory',
     source: 'interference-map',

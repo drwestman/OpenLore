@@ -16,6 +16,7 @@ import { isChangedSetCaveat } from '../../core/services/symbol-changed-set.js';
 import { writeStdout, writeStderr } from '../output.js';
 import { logger, configureLogger } from '../../utils/logger.js';
 import { renderPushedMemories } from './pushed-memory-render.js';
+import { sanitizeForTerminal } from '../../utils/misc.js';
 import { readOpenLoreConfig } from '../../core/services/config-manager.js';
 import type { BlastRadiusBriefing } from '../../core/services/mcp-handlers/blast-radius.js';
 import { dispatchTool } from '../../core/services/tool-dispatch.js';
@@ -28,7 +29,9 @@ import {
   resolveTrustedHookLauncher,
   renderTrustedHookCommand,
   updateHookFile,
+  insertHookBlock,
 } from '../git-hooks.js';
+import { toCliVocabulary } from '../surface-vocabulary.js';
 
 const HOOK_MARKER = '# openlore-blast-radius-hook';
 
@@ -62,8 +65,7 @@ export async function installBlastRadiusHook(rootPath: string): Promise<void> {
   let alreadyInstalled = false;
   const result = await updateHookFile(hookPath, (existing) => {
     if (existing?.includes(HOOK_MARKER)) { alreadyInstalled = true; const refreshed = existing.replace(/# openlore-blast-radius-hook[\s\S]*?# end-openlore-blast-radius-hook/, hookContent.trimEnd()); return refreshed === existing ? null : refreshed; }
-    const stripped = existing?.trimEnd().replace(/\n*\nexit 0\s*$/, '');
-    return stripped ? stripped + '\n\n' + hookContent : '#!/bin/sh\n\n' + hookContent;
+    return insertHookBlock(existing, hookContent);
   });
   if (result.status === 'unavailable') {
     logger.warning(`Cannot install the blast-radius hook at ${displayHookPath(hookPath)}: ${result.reason}`);
@@ -170,6 +172,35 @@ function renderHuman(b: BlastRadiusBriefing): string {
   // Notes pushed by a matching trigger: one line each, terminal-safe and cut short — the JSON carries
   // the full content (change: add-memory-trigger-predicates).
   lines.push(...renderPushedMemories(b, '   '));
+  // Generated files the diff changed, with their source and regenerate command (add-generated-file-guard).
+  const GENERATED_SHOWN = 5;
+  for (const g of (b.generated ?? []).slice(0, GENERATED_SHOWN)) {
+    const from = g.generatedFrom === 'unknown' ? 'source unknown'
+      : `from ${g.generatedFrom.map(s => (g.sourceNotFound?.includes(s) ? `${s} (not at that path)` : s)).join(', ')}`;
+    const regen = g.regenerateWith === 'unknown' ? '' : `; regenerate: ${g.regenerateWith}`;
+    lines.push(sanitizeForTerminal(`   ⚠ ${g.kind} ${g.file} (${g.rule}: ${g.matched}) — ${from}${regen}`));
+  }
+  if ((b.generated?.length ?? 0) > GENERATED_SHOWN) lines.push(`   … and ${b.generated!.length - GENERATED_SHOWN} more generated file(s)`);
+  // References the diff adds that resolve to nothing (add-phantom-reference-findings).
+  const REFERENCES_SHOWN = 5;
+  for (const u of (b.phantomReferences?.unresolved ?? []).slice(0, REFERENCES_SHOWN)) {
+    lines.push(sanitizeForTerminal(`   ⚠ ${u.code}: ${u.subject} (${u.path}${u.line ? `:${u.line}` : ''})`));
+  }
+  const refTotal = b.phantomReferences?.count ?? 0;
+  if (refTotal > REFERENCES_SHOWN) lines.push(`   … and ${refTotal - REFERENCES_SHOWN} more unresolved reference(s)`);
+  // Env vars the diff stops reading that infrastructure still sets (add-iac-code-binding).
+  const ENV_SITES_SHOWN = 5;
+  for (const e of b.envDeclarations?.stillSet ?? []) {
+    const shown = e.sites.slice(0, ENV_SITES_SHOWN).map(x => `${x.file}:${x.line}`).join(', ');
+    const more = e.sites.length > ENV_SITES_SHOWN ? ` and ${e.sites.length - ENV_SITES_SHOWN} more` : '';
+    lines.push(sanitizeForTerminal(`   ⚠ env ${e.name} is no longer read, but is still set in ${shown}${more}`));
+  }
+  // OpenAPI operations served by routes in the changed files (add-contract-graph-projection).
+  for (const c of b.contracts?.contracts ?? []) {
+    const req = [...c.requiredParams, ...c.requiredBody];
+    lines.push(sanitizeForTerminal(`   · contract ${c.operation} (${c.spec}), served by ${c.route.method} ${c.route.path} in ${c.route.file}${c.deprecated ? '; deprecated' : ''}${req.length ? `; requires ${req.join(', ')}` : ''}`));
+  }
+  if (b.contracts?.omitted) lines.push(`   … and ${b.contracts.omitted} more contract operation(s)`);
   for (const d of b.decisions.items) lines.push(`   ⚠ decision [${d.provenance}] ${d.kind}: ${d.message}`);
   if (b.decisions.affected > b.decisions.items.length) lines.push(`   … and ${b.decisions.affected - b.decisions.items.length} more decision issue(s)`);
   const SPEC_SHOWN = 5;
@@ -212,8 +243,9 @@ export async function runBlastRadiusCli(opts: BlastRadiusCliOptions): Promise<nu
   if ('error' in result) {
     // Advisory: an infrastructure failure (no graph, not a repo) must NEVER block
     // a commit. Surface the reason and exit 0 in hook mode.
-    if (opts.json) await writeStdout(JSON.stringify({ status: 'unavailable', error: result.error }, null, 2) + '\n');
-    else logger.warning(`blast-radius: ${result.error}`);
+    const error = toCliVocabulary(String(result.error));
+    if (opts.json) await writeStdout(JSON.stringify({ status: 'unavailable', error }, null, 2) + '\n');
+    else logger.warning(`blast-radius: ${error}`);
     return 0;
   }
 
