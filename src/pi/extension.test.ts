@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createServer } from 'node:http';
 
 import openloreExtension, { createPiExtension, modelsUrl, stripMarker, isUsableConfig, readConfig, loadExistingConfig, runConfigWizard, readSpecIndex, formatToolResult, formatCallArgs, compositeToolResult, NAV_TOOLS, PI_DAEMON_PRESET, PI_EXCLUDED_CONCLUSION_TOOLS, PI_SPEC_WORKFLOW_OBSERVATIONS, PI_SPEC_WORKFLOW_EXCLUSIONS, ensureDaemon, ensureDaemonResult, callTool, isUsableDaemon, missingDaemonTools, piDaemonSpawnCommand, PiDaemonConnectionError, PI_SPEC_INDEX_MAX_DOMAINS, shouldNegativeCacheDaemonFailure, piMaySpawnDaemon, piToolSurface, PI_TOOL_SNIPPETS, PI_LEAN_TOOLS, PI_SEARCH_TOOLS, PI_ON_DEMAND_SUBSTRATE_TOOLS, PI_TOOL_GROUPS, PI_ACTIVATOR_TOOL, PI_STANDING_CONTEXT_BUDGETS, piRegisteredToolNames, estimatePiStandingTokens, formatPiStatus, piDaemonView, piHealthCacheKey, PI_STATUS_KEY, type PiDaemonView, type PiExtensionRuntime } from './extension.js';
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { HealthResult } from '../api/health.js';
 import { TOOL_DEFINITIONS, TOOL_PRESETS } from '../cli/commands/mcp.js';
 import { startServe } from '../cli/commands/serve.js';
@@ -1147,7 +1147,7 @@ it('omits standing repository context by default and does not orient on the user
     } as unknown as ExtensionContext;
 
     for (const prompt of ['salut !', 'inspect the parser']) {
-      const result = await beforeAgentStart?.({ messageType: 'user', prompt, systemPrompt: 'base' }, ctx) as { systemPrompt?: string } | undefined;
+      const result = await beforeAgentStart?.({ type: 'before_agent_start', prompt, systemPrompt: 'base' }, ctx) as { systemPrompt?: string } | undefined;
       expect(result).toBeUndefined();
     }
     expect(requests).toEqual([]);
@@ -1158,20 +1158,25 @@ it('omits standing repository context by default and does not orient on the user
   }
 });
 
-it('injects only the proposal instruction for a proposal invocation in default mode', async () => {
+it.each(['tui', 'rpc'])('injects only the proposal instruction for a %s proposal event in default mode', async mode => {
   const dir = await mkdtemp(join(tmpdir(), 'openlore-pi-proposal-context-'));
   try {
     await mkdir(join(dir, '.openlore', 'analysis'), { recursive: true });
     await writeFile(join(dir, '.openlore', 'analysis', 'CODEBASE.md'), 'STANDING DIGEST');
     const beforeAgentStart = registerPiHandlers().get('before_agent_start');
     const ctx = {
-      cwd: dir, mode: 'tui', hasUI: false,
+      cwd: dir, mode, hasUI: false,
       ui: { select: vi.fn(), input: vi.fn(), confirm: vi.fn(), notify: vi.fn() },
     } as unknown as ExtensionContext;
 
-    const result = await beforeAgentStart?.({
-      messageType: 'user', prompt: '/opsx:propose', systemPrompt: 'base',
-    }, ctx) as { systemPrompt?: string } | undefined;
+    const event = {
+      type: 'before_agent_start', prompt: '/opsx:propose', systemPrompt: 'base',
+      systemPromptOptions: {
+        cwd: dir, selectedTools: [], hiddenTools: [], toolSnippets: {}, toolGuidelines: {},
+        promptGuidelines: [], appendSystemPrompt: '', sections: {}, contextFiles: [], skills: [],
+      },
+    } satisfies BeforeAgentStartEvent;
+    const result = await beforeAgentStart?.(event, ctx) as { systemPrompt?: string } | undefined;
 
     expect(result?.systemPrompt).toContain('[OpenLore proposal preparation]');
     expect(result?.systemPrompt).toContain('call openlore_orient with the brief');

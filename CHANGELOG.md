@@ -5,6 +5,81 @@ All notable changes to OpenLore are documented here. This project adheres to
 
 ## [Unreleased]
 
+### The in-toto statement we emit is checked
+
+- **`certify_provenance` with `format: "in-toto"` now validates the envelope it emits** against the
+  in-toto Statement v1 shape, locally and with no new dependency (`validateInTotoStatement`), and
+  discloses the outcome as a named `statementValidation` receipt — conformant, or the reasons a
+  consumer's verifier would reject it.
+- **The check is structural only, and says so.** It verifies no signature, none of the predicate's
+  own fields, and not that the `subject` digest identifies an artifact — that digest is the content
+  address of the predicate body, so an in-toto verifier resolving it against a built artifact will
+  not match. The note, the tool description and the docs now state this plainly.
+- **Fixed a false claim**: the JSON note advertised a `--format in-toto` CLI flag; there is no
+  `openlore certify-provenance` command. It now names the tool's `format` option.
+### Removed
+
+- The OpenSpec plugin manifest (`plugin-manifest` command and schema); the OpenSpec host side was never built.
+
+### GraphQL schemas are read
+
+- **Every `.graphql` / `.graphqls` / `.gql` schema is read** and merged into one schema, `extend`
+  folded in: each root field becomes an operation node (`Query.order`), each named type a node, with
+  `references_schema` edges between them. A file of operations and fragments is a client document,
+  listed under `skippedCandidates`.
+- **The function a literal resolver map names is bound to its operation** — JS/TS
+  `{ Query: { order: getOrder } }` and Python Ariadne `@query.field("order")` — with an
+  `implements_endpoint` edge, so it is a reachability root. Inline resolvers, spreads, unknown
+  fields and functions neither local nor imported are disclosed in `unresolvedResolvers`.
+- **`certify_service_contract` grades GraphQL changes** with variance-aware rows: an output may only
+  become non-null, an input only optional; removals, a required argument and an output made nullable are
+  `breaking`; an added enum value or union member is `dangerous`. GraphQL consumers are a disclosed
+  boundary. The index schema version is now 17.
+- **An imported handler binds only in the module it was imported from**, one barrel re-export
+  followed — for gRPC Node registrations too, which previously took any same-named function in the
+  repository. A package or path-alias import binds nothing and says so.
+- **GraphQL schemas under fixture paths are not read** (`fixtures/`, `__tests__/`, `testdata/`,
+  `*.test.graphql`), and are listed under `skippedCandidates`: a fixture's `type Query` made the real
+  root ambiguous. `.proto` files are read wherever they are, as before.
+- `find_dead_code` names unbound GraphQL operations and gRPC RPCs, so a code-first resolver or a
+  handler registered in an unread style is not reported dead without a word.
+
+### Protobuf schemas are read
+
+- **Every `.proto` file is read as a proto3 schema** and projected onto the graph: each RPC is a
+  node named by its gRPC method path (`/orders.v1.OrderService/GetOrder`), each message and enum a
+  node named by its full name, with `references_schema` edges from an RPC to its request and
+  response types and from a message to its fields' types. Types are resolved with protobuf's own
+  scoping rule over each file's imports, as protoc resolves them. proto2 and editions files are
+  listed as unread with that reason.
+- **The method that serves an RPC is bound to it** through the server registration — Go
+  `RegisterXServer(s, &impl{})`, Python `add_XServicer_to_server(Impl(), server)`, Node
+  `server.addService(pkg.X.service, { … })` — with an `implements_endpoint` edge, so it is a
+  reachability root rather than dead code. A registration whose implementation is not written at
+  the call, an ambiguous service or method, and every RPC left unbound are disclosed.
+- **`certify_service_contract` grades `.proto` changes** with protobuf rows in the closed rule
+  table: fields matched by number, removal without `reserved` and reuse of a reserved number
+  `breaking`, a rename `dangerous`, removed or retyped RPCs `breaking`. gRPC consumers are a
+  disclosed boundary: a protobuf change carries `consumersNotAssessed`, not an empty `consumers`.
+- **A file that looks like a specification but is not one** — an `openapi` key below the top
+  level — is now listed under `skippedCandidates` instead of passing silently.
+- **`unmatchedOperations` no longer lists named schemas.** A schema is neither served nor called,
+  so listing one read as "declared but nothing serves it".
+- **`certify_service_contract` withholds the suggested bump when a changed specification could not
+  be compared** (a parse error, proto2, a cap) — OpenAPI included. An unchanged unreadable file
+  withholds nothing.
+- **What withholds nothing moved to `notes`.** An unresolved OpenAPI `$ref`, a protobuf type
+  imported from outside the repository and an `extend` block are listed under the projection's new
+  `notes`, not `notAssessed`, so `find_dead_code` no longer says "these bindings were NOT made"
+  when every binding was made. `find_dead_code` now also names gRPC registrations that bound
+  nothing.
+- **`get_leaf_functions` and `get_low_risk_refactor_candidates` list code only**: projected
+  declarations are excluded, and a handler bound to an operation is still a leaf.
+- `blast_radius` names changed `.proto` files; Node's static-codegen registration
+  `addService(services.XService, …)` is read.
+- The index schema version is now 16: a new projected node language, which an older OpenLore would
+  otherwise rank as code. An existing index is rebuilt on the next `openlore analyze`.
+
 ### Named schemas are in the graph
 
 - **Each named schema a specification declares is a graph node**, with `references_schema` edges

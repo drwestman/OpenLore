@@ -19,6 +19,7 @@
  */
 
 import { readdir, open, realpath, type FileHandle } from 'node:fs/promises';
+import { YAML_QUIET } from '../analyzer/yaml-diagnostics.js';
 import { constants } from 'node:fs';
 import { posix, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -26,7 +27,8 @@ import { safeJoin } from '../../utils/path-confinement.js';
 import { execFileGit } from '../../utils/git-exec.js';
 import { isExcludedPath } from './mcp-handlers/code-node.js';
 import { redactSecretText } from './secret-redaction.js';
-import { detectInjectionShapes } from './served-content.js';
+import { screenServedText, WITHHELD_SERVED_TEXT } from './served-content.js';
+import { stripTerminalEscapeSequences } from '../../utils/misc.js';
 import type { GovernanceFinding } from './mcp-handlers/enforcement-policy.js';
 import type { ChangedFile } from '../../types/index.js';
 
@@ -156,15 +158,22 @@ export interface ClassifyResult {
 
 /** Longest repository-derived string a fact carries into agent context. */
 export const MAX_EMITTED_TEXT = 512;
-export const WITHHELD_TEXT = '[withheld: reads like an instruction]';
+export const WITHHELD_TEXT = WITHHELD_SERVED_TEXT;
 
 /**
  * Repository text bound for agent context (a command, a header literal, a script name): bounded,
  * credential-redacted, control characters removed, and withheld when it reads like an instruction.
+ *
+ * Sanitizing runs BEFORE the screen and the screened text is what is returned — the order
+ * {@link screenServedText} exists to enforce. Whole escape SEQUENCES go first
+ * ({@link stripTerminalEscapeSequences}): dropping the ESC alone left `[31m` welded to the next
+ * word, which is enough to walk an imperative past a word-boundary-anchored rule.
  */
 export function emittedText(text: string): string {
-  const redacted = redactSecretText(text.slice(0, MAX_EMITTED_TEXT * 4)).value;
+  const redacted = stripTerminalEscapeSequences(redactSecretText(text.slice(0, MAX_EMITTED_TEXT * 4)).value);
   let clean = redacted
+    // Controls become a SPACE, not nothing: a removed control would weld the words it separated
+    // together, and the instruction screen that runs after this reads word boundaries.
     // eslint-disable-next-line no-control-regex -- control characters are exactly what is removed
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
     // Invisible characters (format controls such as bidi and zero-width, soft hyphens, variation
@@ -172,7 +181,8 @@ export function emittedText(text: string): string {
     // screen; they carry nothing a reader needs.
     .replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, '');
   if (clean.length > MAX_EMITTED_TEXT) clean = clean.slice(0, MAX_EMITTED_TEXT).replace(/[\uD800-\uDBFF]$/, '') + '…';
-  return detectInjectionShapes(clean).length ? WITHHELD_TEXT : clean;
+  const screen = screenServedText(clean);
+  return screen.withheld ? WITHHELD_TEXT : screen.sanitized;
 }
 
 /** {@link emittedText} over every repository-derived field of a fact. */
@@ -763,7 +773,7 @@ export function packageScripts(text: string): Array<{ name: string; command: str
 /** `run:` steps of a GitHub Actions workflow with their raw working directory (step, job, then workflow default). */
 export function workflowRuns(text: string): Array<{ jobId: string; step: number; command: string; wd: unknown }> {
   let doc: unknown;
-  try { doc = parseYaml(text); } catch { return []; }
+  try { doc = parseYaml(text, { ...YAML_QUIET }); } catch { return []; }
   const jobs = (doc as { jobs?: unknown } | null)?.jobs;
   if (!jobs || typeof jobs !== 'object') return [];
   const out: Array<{ jobId: string; step: number; command: string; wd: unknown }> = [];

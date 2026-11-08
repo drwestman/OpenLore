@@ -13,6 +13,7 @@
  */
 
 import { dirname, posix } from 'node:path';
+import { importGrammar } from './grammar-entry.js';
 import type Parser from 'tree-sitter';
 import { FunctionRegistryTrie } from './function-registry-trie.js';
 import type { ImportMap } from './import-resolver-bridge.js';
@@ -45,6 +46,10 @@ import { projectIacGraph } from './iac/project.js';
 import { bindDeployHandlers, type UnresolvedDeployBinding } from './iac/deploy-binding.js';
 import { projectContracts, contractDisclosure, emptyContractProjection, type ProjectedContracts } from './contract/project.js';
 import { generatedClientFunctionsFor } from './contract/generated-client.js';
+import { scanGrpcRegistrations, isGeneratedGrpcStub, createImportResolver, type GrpcRegistration, type ImportTarget, type PathAlias } from './contract/grpc-registration.js';
+import { isProtobufPath } from './contract/protobuf.js';
+import { isGraphqlPath } from './contract/graphql.js';
+import { scanResolverMaps, hasInlineSdl, type ResolverMap } from './contract/graphql-resolvers.js';
 import { isProjectedLanguage, isDeclarationEdgeKind } from './projected-language.js';
 import { isIacLanguage } from './iac/types.js';
 import { isTestFile } from './test-file.js';
@@ -514,7 +519,7 @@ async function getTSParser(
   if (usesTsxGrammar(filePath)) {
     if (!_tsxParser) {
       const loaded = await loadCoreGrammarSoft(language, async () => {
-        const tsModule = await import('tree-sitter-typescript');
+        const tsModule = await importGrammar('tree-sitter-typescript');
         const lang = (tsModule.default as { tsx: object }).tsx;
         const parser = new NP();
         parser.setLanguage(lang as unknown as Parser.Language);
@@ -529,7 +534,7 @@ async function getTSParser(
   }
   if (!_tsParser) {
     const loaded = await loadCoreGrammarSoft(language, async () => {
-      const tsModule = await import('tree-sitter-typescript');
+      const tsModule = await importGrammar('tree-sitter-typescript');
       const lang = (tsModule.default as { typescript: object }).typescript;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -549,7 +554,7 @@ async function getPyParser(): Promise<{ parser: Parser; lang: object } | null> {
   if (grammarStatus('Python') === 'unavailable') return null;
   if (!_pyParser) {
     const loaded = await loadCoreGrammarSoft('Python', async () => {
-      const pyModule = await import('tree-sitter-python');
+      const pyModule = await importGrammar('tree-sitter-python');
       const lang = pyModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -569,7 +574,7 @@ async function getGoParser(): Promise<{ parser: Parser; lang: object } | null> {
   if (grammarStatus('Go') === 'unavailable') return null;
   if (!_goParser) {
     const loaded = await loadCoreGrammarSoft('Go', async () => {
-      const goModule = await import('tree-sitter-go');
+      const goModule = await importGrammar('tree-sitter-go');
       const lang = goModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -589,7 +594,7 @@ async function getRustParser(): Promise<{ parser: Parser; lang: object } | null>
   if (grammarStatus('Rust') === 'unavailable') return null;
   if (!_rustParser) {
     const loaded = await loadCoreGrammarSoft('Rust', async () => {
-      const rustModule = await import('tree-sitter-rust');
+      const rustModule = await importGrammar('tree-sitter-rust');
       const lang = rustModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -609,7 +614,7 @@ async function getRubyParser(): Promise<{ parser: Parser; lang: object } | null>
   if (grammarStatus('Ruby') === 'unavailable') return null;
   if (!_rubyParser) {
     const loaded = await loadCoreGrammarSoft('Ruby', async () => {
-      const rubyModule = await import('tree-sitter-ruby');
+      const rubyModule = await importGrammar('tree-sitter-ruby');
       const lang = rubyModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -629,7 +634,7 @@ async function getJavaParser(): Promise<{ parser: Parser; lang: object } | null>
   if (grammarStatus('Java') === 'unavailable') return null;
   if (!_javaParser) {
     const loaded = await loadCoreGrammarSoft('Java', async () => {
-      const javaModule = await import('tree-sitter-java');
+      const javaModule = await importGrammar('tree-sitter-java');
       const lang = javaModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -647,7 +652,7 @@ async function getPhpParser(): Promise<{ parser: Parser; lang: object } | null> 
   const NP = await loadNativeParserFor('PHP');
   if (!NP) return null;
   if (!_phpParser) {
-    const phpModule = await import('tree-sitter-php');
+    const phpModule = await importGrammar('tree-sitter-php');
     _PhpLanguage = (phpModule.default as { php: object }).php;
     _phpParser = new NP();
     _phpParser.setLanguage(_PhpLanguage as unknown as Parser.Language);
@@ -659,7 +664,7 @@ async function getCSharpParser(): Promise<{ parser: Parser; lang: object } | nul
   const NP = await loadNativeParserFor('C#');
   if (!NP) return null;
   if (!_csParser) {
-    const csModule = await import('tree-sitter-c-sharp');
+    const csModule = await importGrammar('tree-sitter-c-sharp');
     _CsLanguage = csModule.default;
     _csParser = new NP();
     _csParser.setLanguage(_CsLanguage as unknown as Parser.Language);
@@ -671,7 +676,7 @@ async function getKotlinParser(): Promise<{ parser: Parser; lang: object } | nul
   const NP = await loadNativeParserFor('Kotlin');
   if (!NP) return null;
   if (!_ktParser) {
-    const ktModule = await import('tree-sitter-kotlin');
+    const ktModule = await importGrammar('tree-sitter-kotlin');
     _KtLanguage = ktModule.default;
     _ktParser = new NP();
     _ktParser.setLanguage(_KtLanguage as unknown as Parser.Language);
@@ -683,7 +688,7 @@ async function getScalaParser(): Promise<{ parser: Parser; lang: object } | null
   const NP = await loadNativeParserFor('Scala');
   if (!NP) return null;
   if (!_scalaParser) {
-    const scalaModule = await import('tree-sitter-scala');
+    const scalaModule = await importGrammar('tree-sitter-scala');
     _ScalaLanguage = (scalaModule as { default: object }).default;
     _scalaParser = new NP();
     _scalaParser.setLanguage(_ScalaLanguage as unknown as Parser.Language);
@@ -695,7 +700,7 @@ async function getElixirParser(): Promise<{ parser: Parser; lang: object } | nul
   const NP = await loadNativeParserFor('Elixir');
   if (!NP) return null;
   if (!_exParser) {
-    const exModule = await import('tree-sitter-elixir');
+    const exModule = await importGrammar('tree-sitter-elixir');
     _ExLanguage = exModule.default;
     _exParser = new NP();
     _exParser.setLanguage(_ExLanguage as unknown as Parser.Language);
@@ -709,7 +714,7 @@ async function getCppParser(): Promise<{ parser: Parser; lang: object } | null> 
   if (grammarStatus('C++') === 'unavailable') return null;
   if (!_cppParser) {
     const loaded = await loadCoreGrammarSoft('C++', async () => {
-      const cppModule = await import('tree-sitter-cpp');
+      const cppModule = await importGrammar('tree-sitter-cpp');
       const lang = cppModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -729,7 +734,7 @@ async function getSwiftParser(): Promise<{ parser: Parser; lang: object } | null
   if (grammarStatus('Swift') === 'unavailable') return null;
   if (!_swiftParser) {
     const loaded = await loadCoreGrammarSoft('Swift', async () => {
-      const swiftModule = await import('tree-sitter-swift');
+      const swiftModule = await importGrammar('tree-sitter-swift');
       const lang = swiftModule.default;
       const parser = new NP();
       parser.setLanguage(lang as unknown as Parser.Language);
@@ -3006,7 +3011,7 @@ async function extractByQueries(
 // ── C# ──────────────────────────────────────────────────────────────────────
 const CSHARP_SPEC: QueryLangSpec = {
   language: 'C#',
-  loader: () => loadGrammarSoft('C#', () => import('tree-sitter-c-sharp'), m => m.default),
+  loader: () => loadGrammarSoft('C#', () => importGrammar('tree-sitter-c-sharp'), m => m.default),
   classTypes: new Set(['class_declaration', 'struct_declaration', 'record_declaration', 'interface_declaration', 'enum_declaration']),
   fnQuery: `
     (method_declaration name: (identifier) @fn.name) @fn.node
@@ -3023,7 +3028,7 @@ const CSHARP_SPEC: QueryLangSpec = {
 // ── Kotlin ──────────────────────────────────────────────────────────────────
 const KOTLIN_SPEC: QueryLangSpec = {
   language: 'Kotlin',
-  loader: () => loadGrammarSoft('Kotlin', () => import('tree-sitter-kotlin'), m => m.default),
+  loader: () => loadGrammarSoft('Kotlin', () => importGrammar('tree-sitter-kotlin'), m => m.default),
   classTypes: new Set(['class_declaration', 'object_declaration', 'interface_declaration', 'companion_object']),
   // Extension functions: `fun Foo.bar()` — the receiver user_type becomes the className.
   // The receiver is the user_type that appears BEFORE the function name. A user_type
@@ -3055,7 +3060,7 @@ const KOTLIN_SPEC: QueryLangSpec = {
 // ── PHP ─────────────────────────────────────────────────────────────────────
 const PHP_SPEC: QueryLangSpec = {
   language: 'PHP',
-  loader: () => loadGrammarSoft('PHP', () => import('tree-sitter-php'), m => (m.default as { php: object }).php),
+  loader: () => loadGrammarSoft('PHP', () => importGrammar('tree-sitter-php'), m => (m.default as { php: object }).php),
   classTypes: new Set(['class_declaration', 'trait_declaration', 'interface_declaration', 'enum_declaration']),
   fnQuery: `
     (function_definition name: (name) @fn.name) @fn.node
@@ -3073,7 +3078,7 @@ const PHP_SPEC: QueryLangSpec = {
 // ── C ───────────────────────────────────────────────────────────────────────
 const C_SPEC: QueryLangSpec = {
   language: 'C',
-  loader: () => loadGrammarSoft('C', () => import('tree-sitter-c'), m => m.default),
+  loader: () => loadGrammarSoft('C', () => importGrammar('tree-sitter-c'), m => m.default),
   classTypes: new Set(), // C has no classes — file scope is the implicit grouping
   fnQuery: `
     (function_definition declarator: (function_declarator declarator: (identifier) @fn.name)) @fn.node
@@ -3086,7 +3091,7 @@ const C_SPEC: QueryLangSpec = {
 // ── Scala ───────────────────────────────────────────────────────────────────
 const SCALA_SPEC: QueryLangSpec = {
   language: 'Scala',
-  loader: () => loadGrammarSoft('Scala', () => import('tree-sitter-scala'), m => m.default),
+  loader: () => loadGrammarSoft('Scala', () => importGrammar('tree-sitter-scala'), m => m.default),
   classTypes: new Set(['object_definition', 'class_definition', 'trait_definition']),
   fnQuery: `
     (function_definition name: (identifier) @fn.name) @fn.node
@@ -3145,7 +3150,7 @@ const LUA_SPEC: QueryLangSpec = {
 // ── Bash ────────────────────────────────────────────────────────────────────
 const BASH_SPEC: QueryLangSpec = {
   language: 'Bash',
-  loader: () => loadGrammarSoft('Bash', () => import('tree-sitter-bash'), m => m.default),
+  loader: () => loadGrammarSoft('Bash', () => importGrammar('tree-sitter-bash'), m => m.default),
   classTypes: new Set(),
   // Only edge to project-defined functions, never external binaries (grep/ls/…).
   callFilter: (calleeName, definedNames) => definedNames.has(calleeName),
@@ -3315,7 +3320,7 @@ async function extractElixirGraph(
   filePath: string,
   content: string,
 ): Promise<{ nodes: FunctionNode[]; rawEdges: RawEdge[]; parseHealth?: FileParseHealth }> {
-  const loaded = await loadGrammarSoft('Elixir', () => import('tree-sitter-elixir'), m => m.default);
+  const loaded = await loadGrammarSoft('Elixir', () => importGrammar('tree-sitter-elixir'), m => m.default);
   if (!loaded) return { nodes: [], rawEdges: [] };
 
   return loaded.withTree(content, (root) => {
@@ -5661,12 +5666,25 @@ export interface CallGraphBuilderOptions {
   contractFiles?: ReadonlyArray<{ path: string; content: string }>;
   /** Specification candidates the caller did not retain, so the projection discloses the cap. */
   contractFilesOmitted?: number;
+  /** `.proto` files the walk did not retain (change: add-contract-graph-projection). */
+  protoFilesOmitted?: number;
+  /** GraphQL files the walk did not retain. */
+  graphqlFilesOmitted?: number;
+  /** Schema files deliberately not read (fixtures, a Relay compiler's copy), each with why. */
+  contractFilesSkipped?: ReadonlyArray<{ file: string; reason: string }>;
   /**
    * The project's declared build-output mapping (change: add-iac-deploy-binding-commands), so a
    * deployed handler naming a built file (`dist/orders.handler`) binds to its source. Absent means
    * no mapping: a built path then binds only if it is itself indexed.
    */
   buildOutput?: import('./iac/build-output.js').BuildOutputMap;
+  /**
+   * The path aliases the project DECLARED (tsconfig/jsconfig `compilerOptions.paths`, a
+   * `package.json` `imports` subpath), read by `readPathAliases` (change:
+   * fix-bind-aliased-grpc-node-handlers). Absent means none were read, and a bare specifier then
+   * resolves to nothing — as before.
+   */
+  pathAliases?: readonly PathAlias[];
 }
 
 export class CallGraphBuilder {
@@ -5678,7 +5696,11 @@ export class CallGraphBuilder {
   private readonly resolution: Required<CallGraphResolutionToggles>;
   private readonly contractFiles: ReadonlyArray<{ path: string; content: string }>;
   private readonly contractFilesOmitted: number;
+  private readonly protoFilesOmitted: number;
+  private readonly graphqlFilesOmitted: number;
+  private readonly contractFilesSkipped: ReadonlyArray<{ file: string; reason: string }>;
   private readonly buildOutput: import('./iac/build-output.js').BuildOutputMap | undefined;
+  private readonly pathAliases: readonly PathAlias[];
 
   constructor(options: CallGraphBuilderOptions = {}) {
     this.extractionOptions = options.extraction;
@@ -5687,7 +5709,11 @@ export class CallGraphBuilder {
     this.legacyLatePassesForTesting = options.legacyLatePassesForTesting === true;
     this.contractFiles = options.contractFiles ?? [];
     this.contractFilesOmitted = options.contractFilesOmitted ?? 0;
+    this.protoFilesOmitted = options.protoFilesOmitted ?? 0;
+    this.graphqlFilesOmitted = options.graphqlFilesOmitted ?? 0;
+    this.contractFilesSkipped = options.contractFilesSkipped ?? [];
     this.buildOutput = options.buildOutput;
+    this.pathAliases = options.pathAliases ?? [];
     this.resolution = {
       typeInference: options.resolution?.typeInference !== false,
       reExport: options.resolution?.reExport !== false,
@@ -6536,7 +6562,9 @@ export class CallGraphBuilder {
     // (change: add-contract-node-projection) — extracted once, here. Retained only when a
     // specification exists: on a repository with none, holding the whole route and call list
     // across Passes 3-8 would be memory spent for nothing.
-    const projectContractsFor = this.contractFiles.length > 0 || this.contractFilesOmitted > 0;
+    const projectContractsFor = this.contractFiles.length > 0 || this.contractFilesOmitted > 0 || this.protoFilesOmitted > 0 || this.graphqlFilesOmitted > 0
+      // A schema skipped as a fixture or a Relay copy is still disclosed when it is the only one.
+      || this.contractFilesSkipped.length > 0;
     let httpRoutes: RouteDefinition[] = [];
     let httpCalls: HttpCall[] = [];
     /** Why the route/call extraction is not complete — withholds every "unmatched" conclusion. */
@@ -6721,9 +6749,69 @@ export class CallGraphBuilder {
           const at = codeNodesByFile.get(n.filePath);
           if (at) at.push(n); else codeNodesByFile.set(n.filePath, [n]);
         }
+        // gRPC server registrations, read only when a `.proto` file is in hand: the scan is a
+        // marker test per file, but a repository with no protobuf schema has nothing to bind.
+        // Test files are skipped — a test server registers a fake, not the implementation.
+        const grpcRegistrations: GrpcRegistration[] = [];
+        if (this.contractFiles.some(f => isProtobufPath(f.path))) {
+          for (const [file, content] of fileContents) {
+            if (isTestFile(file)) continue;
+            for (const r of scanGrpcRegistrations(file, content)) grpcRegistrations.push(r);
+          }
+        }
+        const runtimeLanguages: Record<GrpcRegistration['runtime'], ReadonlySet<string>> = {
+          go: new Set(['Go']), python: new Set(['Python']), node: new Set(['TypeScript', 'JavaScript']),
+        };
         const projection = projectContracts({
+          grpcRegistrations,
+          // The candidates a registration could mean: for Go and Python, methods of the registered
+          // type; for Node, functions of the name the implementation map gives. The projector
+          // picks among them only where the registration's own scope allows (`pick`).
+          resolveGrpcImplementation: (reg, name) => trie.findBySimpleName(name).filter(n =>
+            !n.isExternal && !isProjectedLanguage(n.language) && !isTestFile(n.filePath) && !isGeneratedGrpcStub(n.filePath)
+            && runtimeLanguages[reg.runtime].has(n.language)
+            && (reg.implType === undefined ? !n.className : n.className === reg.implType)),
           files: this.contractFiles,
           filesOmitted: this.contractFilesOmitted,
+          protoFilesOmitted: this.protoFilesOmitted,
+          graphqlFilesOmitted: this.graphqlFilesOmitted,
+          ...(this.contractFilesSkipped.length ? { skippedFiles: this.contractFilesSkipped } : {}),
+          importTargets: (() => {
+            // Built lazily, once: a repository with no imported handler never indexes its files.
+            let resolve: ReturnType<typeof createImportResolver> | undefined;
+            const memo = new Map<string, readonly ImportTarget[]>();
+            return (from: string, spec: string, name: string, runtime: 'node' | 'python') => {
+              const key = `${runtime}\0${from}\0${spec}\0${name}`;
+              let hit = memo.get(key);
+              if (!hit) {
+                resolve ??= createImportResolver([...fileContents.keys()], f => fileContents.get(f), this.pathAliases);
+                hit = resolve(from, spec, name, runtime);
+                memo.set(key, hit);
+              }
+              return hit;
+            };
+          })(),
+          // Resolver maps are read only when a GraphQL file is in hand, and only for the root type
+          // names the schema has (the projector passes them). Test files are skipped.
+          graphqlResolverMaps: roots => {
+            if (!this.contractFiles.some(f => isGraphqlPath(f.path))) return [];
+            const maps: ResolverMap[] = [];
+            // A directory holding an inline schema (`typeDefs.ts`) serves THAT schema: maps beside it
+            // are not bound to the repository's SDL by field name.
+            const dirOf = (f: string) => f.slice(0, f.lastIndexOf('/') + 1);
+            const inlineDirs = new Set<string>();
+            for (const [file, content] of fileContents) if (!isTestFile(file) && hasInlineSdl(content)) inlineDirs.add(dirOf(file));
+            for (const [file, content] of fileContents) {
+              if (isTestFile(file) || inlineDirs.has(dirOf(file))) continue;
+              for (const m of scanResolverMaps(file, content, roots)) maps.push(m);
+            }
+            return maps;
+          },
+          // A function a map names is a top-level function or an object-literal method — never a
+          // CLASS method (`class OrderRepo { getOrder() }`), which a map cannot name bare.
+          resolveGraphqlImplementation: (map, name) => trie.findBySimpleName(name).filter(n =>
+            !n.isExternal && !isProjectedLanguage(n.language) && !isTestFile(n.filePath) && !n.className
+            && (map.runtime === 'python' ? n.language === 'Python' : n.language === 'TypeScript' || n.language === 'JavaScript')),
           ...(extractionNotAssessed.size ? { extractionNotAssessed: [...extractionNotAssessed] } : {}),
           routes: httpRoutes,
           calls: httpCalls,
@@ -7097,7 +7185,7 @@ export class CallGraphBuilder {
       // Calibration: CHA is the over-approximating mechanism — with it off, no `overrides`
       // edges are synthesized and every other edge is left exactly as it was.
       if (this.resolution.cha) {
-        edges.push(...synthesizeTypeHierarchyEdges({
+        const cha = synthesizeTypeHierarchyEdges({
           nodes: hierarchyNodes,
           classes,
           inheritanceEdges,
@@ -7105,7 +7193,26 @@ export class CallGraphBuilder {
           fileContents,
           directCalleeIdsByCaller,
           importMap: callImportMap,
-        }));
+        });
+        // A loop, not a spread: a large repository's synthesized set can exceed the engine's
+        // argument limit, and the throw would be swallowed below, silently dropping the pass.
+        for (const edge of cha.edges) edges.push(edge);
+        // Sites whose name-only fan-out CHA refused because the receiver is statically outside
+        // this repository (change: suppress-false-cha-name-only). Disclosed through the SAME
+        // channel as a refused resolution-ladder binding, so the graph records an unresolved
+        // call there instead of silently losing the (false) edges — and the `find_dead_code`
+        // ambiguity cap keeps naming the in-repo methods the pass declined to wire.
+        for (const site of cha.refusedSites) {
+          ambiguousSites.push({
+            callerId: site.callerId,
+            calleeName: site.method,
+            calleeObject: site.recv,
+            line: site.line,
+            strategy: 'cha_receiver_outside_repo',
+            candidateIds: site.refusedCandidateIds.slice(0, AMBIGUOUS_CANDIDATE_CAP),
+            candidateCount: site.refusedCandidateIds.length,
+          });
+        }
       }
     } catch {
       // CHA is best-effort; a failure must never abort the build.

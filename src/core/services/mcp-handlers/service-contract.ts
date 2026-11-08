@@ -27,6 +27,13 @@ import { readArtifactBounded, ANALYSIS_ARTIFACT_MAX_BYTES } from '../../../utils
 import { OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_ROUTE_INVENTORY } from '../../../constants.js';
 import { readOpenApi, looksLikeOpenApi, MAX_SPEC_BYTES, type ContractDocument, type ContractOperation } from '../../analyzer/contract/openapi.js';
 import { diffContracts, contractParity, contractBump, type ContractChange, type IndexedRoute } from '../contract/contract-diff.js';
+import { readProtobuf, resolveProtoTypes, isProtobufPath, type ProtoDocument } from '../../analyzer/contract/protobuf.js';
+import { diffProtobuf } from '../contract/protobuf-diff.js';
+import { MAX_PROTO_FILES } from '../../analyzer/contract/project-protobuf.js';
+import { readGraphql, mergeGraphqlSchema, isGraphqlPath, clientSchemaReferences, CLIENT_SCHEMA_CONFIG_FILE, type GqlDocument, type ClientSchemaReference } from '../../analyzer/contract/graphql.js';
+import { diffGraphql } from '../contract/graphql-diff.js';
+import { isFixtureSchemaPath, schemaProvenance, SCHEMA_PROVENANCE_HEAD_BYTES, type SchemaProvenance } from '../../analyzer/contract/types.js';
+import { MAX_GRAPHQL_FILES } from '../../analyzer/contract/project-graphql.js';
 import { readOpenLoreConfig } from '../config-manager.js';
 import { classifyFindings, effectivePolicy, type GovernanceFinding } from './enforcement-policy.js';
 import { emittedText } from '../generated-file-guard.js';
@@ -74,12 +81,30 @@ export interface FederationCensus {
 const MAX_FEDERATED_CONSUMERS = 100;
 const MAX_FEDERATION_SKIPPED = 50;
 
-const SPEC_EXT = /\.(?:ya?ml|json)$/i;
+const SPEC_EXT = /\.(?:ya?ml|json|proto|graphqls?|gql)$/i;
+/**
+ * Generated / vendored / build-output directories, applied to UNTRACKED files only.
+ *
+ * A directory-name guess must never exclude a TRACKED file: a tracked file is part of the
+ * repository by definition. Applied to tracked files, this rule deleted four hand-written Google
+ * API protos from certify — `google/devtools/build/v1/build_events.proto` and friends — because
+ * `build/` appears somewhere in their path, with no boundary and no `notAssessed`
+ * (change: disclose-schema-provenance).
+ */
 const SKIP_DIR = /(?:^|\/)(?:node_modules|vendor|dist|build|\.git)\//;
+/**
+ * The one exception applied to tracked files too: a committed dependency tree is genuinely another
+ * project's contract, and grading it as this repository's is wrong whoever committed it. Named
+ * apart from the blanket rule, and disclosed like every other exclusion.
+ */
+const SKIP_DIR_TRACKED = /(?:^|\/)node_modules\//;
 const MAX_SPEC_FILES = 200;
 const CLIENT_EXT = /\.(?:[cm]?[jt]sx?|py|pyw|go)$/i;
 const MAX_CLIENT_FILES = 3000;
 const MAX_CONSUMERS_PER_ELEMENT = 25;
+/** Client-toolchain configs read, and the bytes read from each: a hostile repository has many. */
+const MAX_CLIENT_CONFIGS = 200;
+const MAX_CLIENT_CONFIG_BYTES = 1024 * 1024;
 
 const sortStr = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -88,20 +113,60 @@ async function git(root: string, args: string[]): Promise<string> {
   return String(stdout);
 }
 
-/** Files in the working tree (tracked and untracked, not ignored) matching `ext`. */
+/** Excluded paths held for the disclosure line; the COUNT is always exact. */
+const MAX_LISTED_EXCLUDED = 1000;
+
+/**
+ * Files in the working tree (tracked and untracked, not ignored) matching `ext`, and the ones the
+ * directory rules excluded. The two halves are listed apart because the rule differs: a tracked
+ * file is excluded only under `node_modules/`, an untracked one by the whole {@link SKIP_DIR} set.
+ * Either way the exclusion is DISCLOSED — it used to be silent.
+ */
+async function listSpecFiles(root: string, ext: RegExp): Promise<{ files: string[]; excluded: string[]; excludedTotal: number }> {
+  const [tracked, untracked] = await Promise.all([
+    git(root, gitPathArgs('ls-files', '-z', '--cached')),
+    git(root, gitPathArgs('ls-files', '-z', '--others', '--exclude-standard')),
+  ]);
+  const files = new Set<string>();
+  const excluded = new Set<string>();
+  const take = (out: string, skip: RegExp) => {
+    for (const f of out.split('\0')) {
+      if (!f || !ext.test(f)) continue;
+      if (skip.test(f)) { excluded.add(f); continue; }
+      files.add(f);
+    }
+  };
+  take(tracked, SKIP_DIR_TRACKED);
+  take(untracked, SKIP_DIR);
+  // A path listed as both tracked and untracked cannot be excluded on the untracked rule alone.
+  for (const f of files) excluded.delete(f);
+  // The listed paths are bounded; the count is every distinct one.
+  return { files: [...files].sort(sortStr), excluded: [...excluded].sort(sortStr).slice(0, MAX_LISTED_EXCLUDED), excludedTotal: excluded.size };
+}
+
+/**
+ * Files in the working tree (tracked and untracked, not ignored) matching `ext`, by the blanket
+ * directory rule.
+ *
+ * Used for client CALL SITES and client configs, never for schema discovery: nothing is GRADED
+ * from a call site, so excluding a committed bundle costs a consumer count at worst, where
+ * excluding a tracked schema dropped a graded contract. Discovery uses {@link listSpecFiles}.
+ */
 async function workingFiles(root: string, ext: RegExp): Promise<string[]> {
   const out = await git(root, gitPathArgs('ls-files', '-z', '--cached', '--others', '--exclude-standard'));
   return [...new Set(out.split('\0').filter(f => f && ext.test(f) && !SKIP_DIR.test(f)))].sort(sortStr);
 }
 
 const MAX_CANDIDATES = MAX_SPEC_FILES * 10;
+type ScanScopeLike = { capped: boolean; unreadable: unknown[]; unread: unknown[] };
+/** Total `.proto` text held per revision, the same bound the analyzer's walk applies. */
+const MAX_PROTO_TOTAL_BYTES = 64 * 1024 * 1024;
 
-/** One revision's specifications, with what was and was not examined. */
-export interface SpecSide {
-  docs: ContractDocument[];
+/** What one revision's scan of one format examined, read, and could not read. */
+interface ScanScope {
   /** Specifications that could not be parsed. */
   unreadable: Array<{ file: string; reason: string }>;
-  /** Every YAML/JSON candidate at this revision (examined or not). */
+  /** Every candidate of this format at this revision (examined or not). */
   candidates: Set<string>;
   /** Candidates whose text was examined. */
   examined: Set<string>;
@@ -109,11 +174,42 @@ export interface SpecSide {
   unread: Array<{ file: string; reason: string }>;
   /** Whether a cap left candidates unexamined. */
   capped: boolean;
+  /**
+   * Examined candidates that look GENERATED or VENDORED, each with the rule that matched. An
+   * annotation only: the schema is graded exactly as before, never dropped or downgraded on it
+   * (change: disclose-schema-provenance).
+   */
+  provenance: Map<string, SchemaProvenance>;
 }
 
-/** Sniff and parse candidate texts, in path order, up to the specification cap. */
-function parseSide(candidates: string[], texts: Map<string, string>, unread: SpecSide['unread']): SpecSide {
-  const side: SpecSide = { docs: [], unreadable: [], candidates: new Set(candidates), examined: new Set(), unread, capped: candidates.length > MAX_CANDIDATES };
+/** Record a candidate's provenance from a bounded head of its text. */
+function noteProvenance(scope: ScanScope, file: string, text: string): void {
+  const p = schemaProvenance(file, text.slice(0, SCHEMA_PROVENANCE_HEAD_BYTES));
+  if (p) scope.provenance.set(file, p);
+}
+
+/**
+ * One revision's specifications, with what was and was not examined.
+ *
+ * The top-level fields are the OpenAPI / Swagger scan of YAML and JSON files, exactly as they
+ * were before protobuf was read. `proto` is a separate scan of `.proto` files with its own window
+ * and cap (change: add-contract-graph-projection): sharing one window let a repository's protobuf
+ * files push its OpenAPI document out of the scan, and sharing one cap flag downgraded every
+ * OpenAPI removal to "may only have moved".
+ */
+export interface SpecSide extends ScanScope {
+  docs: ContractDocument[];
+  /** GraphQL SDL files, a scope of their own too; client documents are not schemas. */
+  graphql: ScanScope & { docs: GqlDocument[]; clientDocuments: string[] };
+  proto: ScanScope & {
+    /** Types resolved across every `.proto` file of this revision. */
+    docs: ProtoDocument[];
+  };
+}
+
+/** Sniff and parse the YAML/JSON candidates, in path order, up to the specification cap. */
+function parseSide(candidates: string[], texts: Map<string, string>, unread: SpecSide['unread'], proto: SpecSide['proto'], graphql: SpecSide['graphql']): SpecSide {
+  const side: SpecSide = { docs: [], unreadable: [], candidates: new Set(candidates), examined: new Set(), unread, capped: candidates.length > MAX_CANDIDATES, provenance: new Map(), proto, graphql };
   let specs = 0;
   for (const file of candidates.slice(0, MAX_CANDIDATES)) {
     if (specs >= MAX_SPEC_FILES) { side.capped = true; break; }
@@ -121,6 +217,7 @@ function parseSide(candidates: string[], texts: Map<string, string>, unread: Spe
     if (text === undefined) continue;
     side.examined.add(file);
     if (!looksLikeOpenApi(text)) continue;
+    noteProvenance(side, file, text);
     specs++;
     const r = readOpenApi(file, text); // a text over the size cap is an error here, never dropped
     if (!r) continue;
@@ -130,6 +227,52 @@ function parseSide(candidates: string[], texts: Map<string, string>, unread: Spe
   return side;
 }
 
+/** Parse the `.proto` candidates (every one is a schema), up to the protobuf cap. */
+function parseProtoSide(candidates: string[], texts: Map<string, string>, unread: SpecSide['unread']): SpecSide['proto'] {
+  const scope: SpecSide['proto'] = { docs: [], unreadable: [], candidates: new Set(candidates), examined: new Set(), unread, capped: candidates.length > MAX_PROTO_FILES, provenance: new Map() };
+  const read: ProtoDocument[] = [];
+  for (const file of candidates.slice(0, MAX_PROTO_FILES)) {
+    const text = texts.get(file);
+    if (text === undefined) continue;
+    scope.examined.add(file);
+    noteProvenance(scope, file, text);
+    const r = readProtobuf(file, text);
+    if ('error' in r) scope.unreadable.push({ file, reason: r.error });
+    else read.push(r);
+  }
+  scope.docs = resolveProtoTypes(read).docs;
+  return scope;
+}
+
+/** Parse the GraphQL candidates, up to the GraphQL cap. A client document is set aside, not unread. */
+function parseGraphqlSide(candidates: string[], texts: Map<string, string>, unread: SpecSide['unread']): SpecSide['graphql'] {
+  const scope: SpecSide['graphql'] = { docs: [], clientDocuments: [], unreadable: [], candidates: new Set(candidates), examined: new Set(), unread, capped: candidates.length > MAX_CANDIDATES, provenance: new Map() };
+  // The cap counts SCHEMAS: a frontend's hundreds of query documents must not push its schema out.
+  let schemas = 0;
+  for (const file of candidates.slice(0, MAX_CANDIDATES)) {
+    const text = texts.get(file);
+    if (text === undefined) continue;
+    const r = readGraphql(file, text);
+    // Client documents are read past the cap too (they cost no schema slot); a schema past it is not.
+    if (!('clientDocument' in r)) { if (schemas >= MAX_GRAPHQL_FILES) { scope.capped = true; continue; } schemas++; }
+    scope.examined.add(file);
+    noteProvenance(scope, file, text);
+    if ('error' in r) scope.unreadable.push({ file, reason: r.error });
+    else if ('clientDocument' in r) scope.clientDocuments.push(file);
+    else scope.docs.push(r);
+  }
+  return scope;
+}
+
+/** The candidates each scan reads: YAML/JSON, `.proto` and GraphQL in separate windows. */
+const windows = (listed: readonly string[]) => {
+  const yaml = listed.filter(f => !isProtobufPath(f) && !isGraphqlPath(f));
+  // The same fixture rule as `analyze`: a test schema is a fake service, not this repository's contract.
+  const proto = listed.filter(f => isProtobufPath(f));
+  const graphql = listed.filter(f => isGraphqlPath(f) && !isFixtureSchemaPath(f));
+  return { yaml, proto, graphql, read: [...yaml.slice(0, MAX_CANDIDATES), ...proto.slice(0, MAX_PROTO_FILES), ...graphql.slice(0, MAX_CANDIDATES)] };
+};
+
 let headCache: { root: string; stamps: string; side: SpecSide } | undefined;
 
 /**
@@ -137,8 +280,8 @@ let headCache: { root: string; stamps: string; side: SpecSide } | undefined;
  * stat-stamped, and their texts are read and parsed again only when a stamp changed.
  */
 export async function headSpecsCached(root: string): Promise<SpecSide> {
-  const candidates = await workingFiles(root, SPEC_EXT);
-  const stamps = candidates.slice(0, MAX_CANDIDATES).map(f => {
+  const candidates = (await listSpecFiles(root, SPEC_EXT)).files;
+  const stamps = windows(candidates).read.map(f => {
     try { const s = statSync(join(root, f)); return `${f}:${s.size}:${s.mtimeMs}:${s.ino}`; } catch { return `${f}:-`; }
   }).join('\0');
   if (headCache && headCache.root === root && headCache.stamps === stamps) return headCache.side;
@@ -147,19 +290,52 @@ export async function headSpecsCached(root: string): Promise<SpecSide> {
   return side;
 }
 
+/**
+ * The schema each client-toolchain config in the repository names: possibly a copy of another
+ * service's schema, not this repository's contract.
+ *
+ * Read for DISCLOSURE only. Certify grades such a schema exactly as it grades any other and NEVER
+ * drops one on a config's say-so — a config in this repository must not let OpenLore stop speaking
+ * about a schema that may well be this repository's own (change: disclose-schema-provenance).
+ */
+async function clientSchemas(root: string, boundaries?: string[]): Promise<ClientSchemaReference[]> {
+  const configs: Array<{ path: string; content: string }> = [];
+  // Configs anywhere in the working tree, not the root alone: a monorepo keeps them per package.
+  const all = await workingFiles(root, CLIENT_SCHEMA_CONFIG_FILE);
+  if (all.length > MAX_CLIENT_CONFIGS) {
+    boundaries?.push(`${all.length - MAX_CLIENT_CONFIGS} client-toolchain config file(s) past the first ${MAX_CLIENT_CONFIGS} were not read, so a schema one of them names is not disclosed as a possible copy.`);
+  }
+  for (const path of all.slice(0, MAX_CLIENT_CONFIGS)) {
+    // Bounded, and confined: a symlinked config pointing out of the repository throws here.
+    try { configs.push({ path, content: await readFileConfined(root, path, MAX_CLIENT_CONFIG_BYTES) }); } catch { /* absent, oversized, or out of the repository */ }
+  }
+  return clientSchemaReferences(configs);
+}
+
 export async function headSpecs(root: string, listed?: string[]): Promise<SpecSide> {
-  const candidates = listed ?? await workingFiles(root, SPEC_EXT);
+  // Discovery is always `listSpecFiles`: a head side listed by another rule than the base side
+  // would report a tracked `build/x.proto` as added or removed.
+  const w = windows(listed ?? (await listSpecFiles(root, SPEC_EXT)).files);
   const texts = new Map<string, string>();
   const unread: SpecSide['unread'] = [];
-  for (const f of candidates.slice(0, MAX_CANDIDATES)) {
+  const protoUnread: SpecSide['unread'] = [];
+  const graphqlUnread: SpecSide['unread'] = [];
+  const unreadFor = (f: string) => (isProtobufPath(f) ? protoUnread : isGraphqlPath(f) ? graphqlUnread : unread);
+  let schemaBytes = 0;
+  for (const f of w.read) {
+    const schema = isProtobufPath(f) || isGraphqlPath(f);
+    // The `.proto` and GraphQL texts held at once are bounded in total too: 500 files of 4 MB is 2 GB.
+    if (schema && schemaBytes > MAX_PROTO_TOTAL_BYTES) { unreadFor(f).push({ file: f, reason: 'past the total schema byte budget' }); continue; }
     try {
       // An oversized file, or a link out of the repository, throws: it is listed as unread.
-      texts.set(f, await readFileConfined(root, f, MAX_SPEC_BYTES));
+      const text = await readFileConfined(root, f, MAX_SPEC_BYTES);
+      if (schema) schemaBytes += text.length;
+      texts.set(f, text);
     } catch (e) {
-      unread.push({ file: f, reason: e instanceof Error ? e.message.split('\n')[0] : String(e) });
+      unreadFor(f).push({ file: f, reason: e instanceof Error ? e.message.split('\n')[0] : String(e) });
     }
   }
-  return parseSide(candidates, texts, unread);
+  return parseSide(w.yaml, texts, unread, parseProtoSide(w.proto, texts, protoUnread), parseGraphqlSide(w.graphql, texts, graphqlUnread));
 }
 
 async function baseSpecs(root: string, commit: string): Promise<SpecSide> {
@@ -167,18 +343,30 @@ async function baseSpecs(root: string, commit: string): Promise<SpecSide> {
   const listing = await git(root, gitPathArgs('ls-tree', '-r', '-z', '--full-tree', '--name-only', commit));
   const { getRepoPrefix } = await import('../../drift/git-diff.js');
   const prefix = (await getRepoPrefix(root)) ?? '';
-  const full = listing.split('\0').filter(f => f && f.startsWith(prefix) && SPEC_EXT.test(f.slice(prefix.length)) && !SKIP_DIR.test(f.slice(prefix.length)))
-    .sort((x, y) => sortStr(x.slice(prefix.length), y.slice(prefix.length)));
-  const window = full.slice(0, MAX_CANDIDATES);
-  const blobs = await readBlobsAtRef(root, commit, window).catch(() => readBlobsPerFile(root, commit, window));
+  // The tracked rule, matching the working-tree side: a file read at HEAD and skipped at the base
+  // would read as ADDED, and one skipped at HEAD and read at the base as REMOVED.
+  const full = listing.split('\0').filter(f => f && f.startsWith(prefix) && SPEC_EXT.test(f.slice(prefix.length)) && !SKIP_DIR_TRACKED.test(f.slice(prefix.length)))
+    .map(f => f.slice(prefix.length)).sort(sortStr);
+  const w = windows(full);
+  const paths = w.read.map(f => prefix + f);
+  const blobs = await readBlobsAtRef(root, commit, paths).catch(() => readBlobsPerFile(root, commit, paths));
   const texts = new Map<string, string>();
   const unread: SpecSide['unread'] = [];
-  for (const p of window) {
-    const t = blobs.get(p);
-    if (t === undefined) unread.push({ file: p.slice(prefix.length), reason: 'could not be read at the base revision' });
-    else texts.set(p.slice(prefix.length), t);
+  const protoUnread: SpecSide['unread'] = [];
+  const graphqlUnread: SpecSide['unread'] = [];
+  const unreadFor = (f: string) => (isProtobufPath(f) ? protoUnread : isGraphqlPath(f) ? graphqlUnread : unread);
+  let schemaBytes = 0;
+  for (const f of w.read) {
+    const t = blobs.get(prefix + f);
+    // Checked before counting, as on the working-tree side, so both sides read the same files.
+    if (t !== undefined && (isProtobufPath(f) || isGraphqlPath(f))) {
+      if (schemaBytes > MAX_PROTO_TOTAL_BYTES) { unreadFor(f).push({ file: f, reason: 'past the total schema byte budget' }); continue; }
+      schemaBytes += t.length;
+    }
+    if (t === undefined) unreadFor(f).push({ file: f, reason: 'could not be read at the base revision' });
+    else texts.set(f, t);
   }
-  return parseSide(full.map(p => p.slice(prefix.length)), texts, unread);
+  return parseSide(w.yaml, texts, unread, parseProtoSide(w.proto, texts, protoUnread), parseGraphqlSide(w.graphql, texts, graphqlUnread));
 }
 
 /** The route inventory written by `analyze` (undefined when absent). */
@@ -446,7 +634,7 @@ async function checkPayloads(root: string, docs: readonly ContractDocument[], fi
       if (body.kind === 'absent') {
         findings.push({ code: 'contract-payload-missing-required', severity: 'warning', source: 'service-contract', subject: emittedText(`${site.file}:${site.line}`),
           discriminator: address, message: emittedText(`${site.file}:${site.line} calls ${address} with no request body; the specification (${o.file}:${o.op.line}) requires ${required.join(', ')}.`),
-          location: { path: site.file, line: site.line } });
+          location: { path: emittedText(site.file), line: site.line } });
         continue;
       }
       if (body.kind === 'not-literal') { notAssessed.push({ file: site.file, line: site.line, operation: emittedText(address), reason: body.reason }); continue; }
@@ -454,7 +642,7 @@ async function checkPayloads(root: string, docs: readonly ContractDocument[], fi
       if (!missing.length) { conforming++; continue; }
       findings.push({ code: 'contract-payload-missing-required', severity: 'warning', source: 'service-contract', subject: emittedText(`${site.file}:${site.line}`),
         discriminator: address, message: emittedText(`${site.file}:${site.line} calls ${address} without required body propert${missing.length === 1 ? 'y' : 'ies'} ${missing.join(', ')} (${o.file}:${o.op.line}).`),
-        location: { path: site.file, line: site.line } });
+        location: { path: emittedText(site.file), line: site.line } });
     }
   }
   if (capped) boundaries.push(`Request bodies were read at the first ${MAX_PAYLOAD_SITES} call sites only.`);
@@ -490,19 +678,97 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
   if (!(await isGitRepository(root))) return { error: 'Not a git repository: specifications are listed through git.' };
 
   const boundaries: string[] = [];
-  const head = await headSpecs(root);
+  const listed = await listSpecFiles(root, SPEC_EXT);
+  const head = await headSpecs(root, listed.files);
+  if (listed.excludedTotal) {
+    // The exclusion stays — these directories hold other people's schemas and build output — but
+    // it is no longer silent: a dropped schema was the gate bypass this discloses.
+    boundaries.push(emittedText(`${listed.excludedTotal} file(s) with a specification extension were not examined — an untracked file under node_modules/, vendor/, dist/, build/ or .git/, or any file under node_modules/ (${listed.excluded.slice(0, 3).join(', ')}${listed.excludedTotal > 3 ? ', …' : ''}); a schema among them is not assessed.`));
+  }
   if (head.capped) boundaries.push(`Past the scan cap (${MAX_CANDIDATES} YAML/JSON files or ${MAX_SPEC_FILES} specifications), ${head.candidates.size - head.examined.size} file(s) were not checked for a specification.`);
   if (head.unread.length) boundaries.push(`${head.unread.length} YAML/JSON file(s) could not be read (over ${MAX_SPEC_BYTES / 1024 / 1024} MB, a link out of the repository, or an I/O error); a specification among them is not assessed.`);
-  const notAssessed = head.unreadable.map(u => ({ file: emittedText(u.file), reason: emittedText(u.reason) }));
-  for (const d of head.docs) if (d.unassessed.length) notAssessed.push({ file: emittedText(d.file), reason: `outside the model: ${d.unassessed.join(', ')}` });
+  if (head.proto.capped) boundaries.push(`Past the protobuf cap (${MAX_PROTO_FILES} files), ${head.proto.candidates.size - head.proto.examined.size} .proto file(s) were not read.`);
+  if (head.proto.unread.length) boundaries.push(`${head.proto.unread.length} .proto file(s) could not be read (over ${MAX_SPEC_BYTES / 1024 / 1024} MB, a link out of the repository, or an I/O error), so their schemas are not assessed.`);
+  if (head.graphql.capped) boundaries.push(`Past the GraphQL cap (${MAX_GRAPHQL_FILES} schema files, ${MAX_CANDIDATES} files read), ${head.graphql.candidates.size - head.graphql.examined.size} GraphQL file(s) were not read.`);
+  {
+    // Graded all the same — never dropped on a config's say-so — but named, so a frontend reading
+    // these as its own breaking changes knows they may be a vendor's schema. One line per config
+    // that was read, naming it, so the claim is attributable.
+    const named = (await clientSchemas(root, boundaries)).filter(r => head.graphql.candidates.has(r.schema))
+      .sort((a, b) => sortStr(a.config, b.config) || sortStr(a.schema, b.schema));
+    for (const r of named.slice(0, limit)) {
+      boundaries.push(emittedText(`${r.schema} is named by ${r.tool} (${r.config}): possibly a copy of another service's schema, graded here as this repository's.`));
+    }
+    // Cut at the cap WITH its count: a disclosure that disappears past a cap is the omission this
+    // change exists to close.
+    if (named.length > limit) boundaries.push(`${named.length - limit} further schema(s) named by a client-toolchain config are not listed.`);
+  }
+  {
+    const fixtures = listed.files.filter(f => isGraphqlPath(f) && isFixtureSchemaPath(f));
+    if (fixtures.length) boundaries.push(emittedText(`${fixtures.length} GraphQL schema file(s) under a fixture path were not read as this repository's contract (${fixtures.slice(0, 3).join(', ')}${fixtures.length > 3 ? ', …' : ''}).`));
+  }
+  if (head.graphql.unread.length) boundaries.push(`${head.graphql.unread.length} GraphQL file(s) could not be read, so their schemas are not assessed.`);
+  const notAssessed = [...head.unreadable, ...head.proto.unreadable, ...head.graphql.unreadable].map(u => ({ file: emittedText(u.file), reason: emittedText(u.reason) }));
+  // Bounded and screened: a file can name thousands of distinct directives.
+  for (const d of [...head.docs, ...head.proto.docs, ...head.graphql.docs]) {
+    if (d.unassessed.length) notAssessed.push({ file: emittedText(d.file), reason: emittedText(`outside the model: ${d.unassessed.slice(0, 12).join(', ')}${d.unassessed.length > 12 ? ` and ${d.unassessed.length - 12} more` : ''}`) });
+  }
 
   const findings: GovernanceFinding[] = [];
-  const specs = head.docs.map(d => ({ file: emittedText(d.file), format: d.format, basePath: d.basePath || '/', operations: d.operations.length }));
+  /**
+   * A generated or vendored copy is DISCLOSED, not dropped: the verdict is the same as before and
+   * the entry simply carries what rule said so, at its own certainty.
+   */
+  const provenanceOf = (scope: ScanScope, file: string) => {
+    const p = scope.provenance.get(file);
+    return p ? { provenance: { kind: p.kind, matched: emittedText(p.matched), certainty: p.certainty } } : {};
+  };
+  const specs: Array<Record<string, unknown>> = [
+    ...head.docs.map(d => ({ file: emittedText(d.file), format: d.format, basePath: d.basePath || '/', operations: d.operations.length, ...provenanceOf(head, d.file) })),
+    ...head.proto.docs.map(d => ({
+      file: emittedText(d.file), format: d.format, ...(d.package ? { package: emittedText(d.package) } : {}),
+      operations: d.services.reduce((n, s) => n + s.rpcs.length, 0), types: d.messages.length + d.enums.length,
+      ...provenanceOf(head.proto, d.file),
+    })),
+    ...(() => {
+      const roots = new Set(Object.values(mergeGraphqlSchema(head.graphql.docs).roots));
+      return head.graphql.docs.map(d => ({
+        file: emittedText(d.file), format: d.format,
+        ...provenanceOf(head.graphql, d.file),
+        // The root fields this file declares or adds by `extend`: its operations.
+        operations: d.types.filter(t => roots.has(t.name)).reduce((n, t) => n + t.fields.length, 0),
+        types: d.types.filter(t => !t.extension && !roots.has(t.name)).length,
+      }));
+    })(),
+  ];
+  {
+    // What the merged GraphQL schema could not settle is named, not left to the analyze notes.
+    const merged = mergeGraphqlSchema(head.graphql.docs);
+    for (const a of merged.ambiguous.slice(0, limit)) notAssessed.push({ file: emittedText(a.files[0]), reason: emittedText(`GraphQL type ${a.name} is defined in more than one file (${a.files.slice(0, 3).join(', ')}), so nothing binds to it`) });
+    for (const c of merged.conflicts.slice(0, limit)) notAssessed.push({ file: '(graphql schema)', reason: emittedText(c) });
+    // Both lists were cut at the cap with no counterpart, so the rest were silently absent.
+    if (merged.ambiguous.length > limit) boundaries.push(`${merged.ambiguous.length - limit} further GraphQL type(s) defined in more than one file are not listed.`);
+    if (merged.conflicts.length > limit) boundaries.push(`${merged.conflicts.length - limit} further GraphQL schema conflict(s) are not listed.`);
+  }
+  // Not gated on a schema being found: a repository with client documents and NO schema said
+  // nothing at all about them (change: disclose-schema-provenance).
+  if (head.graphql.clientDocuments.length) {
+    // One entry, not one per file: a frontend holds hundreds of query documents.
+    const docs = head.graphql.clientDocuments;
+    notAssessed.push({ file: emittedText(docs[0]), reason: emittedText(`${docs.length} GraphQL client document(s) (operations and fragments) are not schemas${docs.length > 1 ? `: ${docs.slice(0, 3).join(', ')}${docs.length > 3 ? ', …' : ''}` : ''}`) });
+  }
 
   // ── Parity against the indexed route handlers ──
   const routes = await indexedRoutes(root);
   let parity: Record<string, unknown>;
-  if (!head.docs.length) parity = { assessed: false, reason: 'no OpenAPI or Swagger document was found' };
+  if (!head.docs.length) {
+    // "None was found" is a claim about what was EXAMINED: with the scan cap reached, a document
+    // may simply be past it.
+    const found = head.capped ? 'no OpenAPI or Swagger document was found among the files examined, and the scan cap was reached, so one may be unexamined' : 'no OpenAPI or Swagger document was found';
+    parity = { assessed: false, reason: head.proto.docs.length || head.graphql.docs.length
+      ? `${found}; protobuf RPCs and GraphQL operations are bound to their implementation in the graph (server registrations, resolver maps), not compared with routes`
+      : found };
+  }
   else if (!routes) parity = { assessed: false, reason: 'no route inventory: run `openlore analyze` first' };
   else if (!routes.length) parity = { assessed: false, reason: 'no server route handler is indexed in this repository (the specification may describe another service)' };
   else {
@@ -510,13 +776,13 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
     for (const u of p.declaredUnimplemented) {
       findings.push({ code: 'contract-declared-unimplemented', severity: 'warning', source: 'service-contract', subject: emittedText(u.address),
         message: emittedText(`${u.address} is declared in ${u.file}:${u.line} but no indexed route handler serves it.`),
-        location: { path: u.file, line: u.line } });
+        location: { path: emittedText(u.file), line: u.line } });
     }
     for (const u of p.implementedUndeclared) {
       const subject = `${u.file}::${u.method} ${u.path}`;
       findings.push({ code: 'contract-implemented-undeclared', severity: 'warning', source: 'service-contract', subject: emittedText(subject),
         message: emittedText(`${u.method} ${u.path} (in ${u.file}) is under a path the specification covers, but the specification does not declare it.`),
-        location: { path: u.file } });
+        location: { path: emittedText(u.file) } });
     }
     if (p.dynamic) boundaries.push(`${p.dynamic} route handler(s) with a dynamic path were not compared with the specifications.`);
     parity = { assessed: true, matched: p.matched, declaredUnimplemented: p.declaredUnimplemented.length, implementedUndeclared: p.implementedUndeclared.length };
@@ -541,7 +807,7 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
     let commit = res.resolved;
     try { commit = (await git(root, ['merge-base', res.resolved, 'HEAD'])).trim() || res.resolved; } catch { /* unrelated histories: the base tip */ }
     const base = await baseSpecs(root, commit);
-    for (const u of base.unreadable) notAssessed.push({ file: emittedText(u.file), reason: `at the base revision: ${emittedText(u.reason)}` });
+    for (const u of [...base.unreadable, ...base.proto.unreadable, ...base.graphql.unreadable]) notAssessed.push({ file: emittedText(u.file), reason: `at the base revision: ${emittedText(u.reason)}` });
     if (base.capped && !head.capped) boundaries.push(`At the base revision, files past the scan cap were not checked for a specification.`);
     // A file is compared only when each side either examined it or does not have it at all: a
     // specification unparseable, unread, or past a cap on one side would otherwise read as
@@ -556,17 +822,101 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
     const comparable = (file: string) => !unparsed.has(file) && !lostSpec(file)
       && (head.examined.has(file) || !head.candidates.has(file)) && (base.examined.has(file) || !base.candidates.has(file));
     const docFiles = new Set([...head.docs, ...base.docs].map(d => d.file));
-    for (const u of [...head.unread, ...base.unread]) if (docFiles.has(u.file)) notAssessed.push({ file: emittedText(u.file), reason: emittedText(`unread on one side: ${u.reason}`) });
+    /** Specification files present on a side but not compared, for the bump below. */
+    const notCompared = new Set<string>([...head.unreadable, ...base.unreadable].map(u => u.file));
+    for (const u of [...head.unread, ...base.unread]) {
+      if (!docFiles.has(u.file)) continue;
+      notCompared.add(u.file);
+      notAssessed.push({ file: emittedText(u.file), reason: emittedText(`unread on one side: ${u.reason}`) });
+    }
     for (const f of docFiles) {
       if (unparsed.has(f) || comparable(f)) continue;
+      notCompared.add(f);
       notAssessed.push({ file: emittedText(f), reason: lostSpec(f) ? 'reads as a specification on one side only, so it is not compared' : 'past the scan cap on one side, so it is not compared' });
     }
+    // A YAML/JSON candidate the cap stopped before the sniff is one no rule saw, and it MAY be the
+    // specification that changed — the sniff never ran, so it is not in `docFiles`. The protobuf
+    // and GraphQL windows have had this sweep all along; without it here, a cap that displaced the
+    // repository's only OpenAPI document returned `suggestedBump: 'patch'` for a removed operation.
+    for (const side of [head, base]) for (const f of side.candidates) if (!side.examined.has(f)) notCompared.add(f);
+    // A file the working-tree scan excluded but the base revision has cannot be compared either:
+    // its elements would otherwise read as removed.
+    for (const f of listed.excluded) {
+      if (!base.candidates.has(f) && !base.proto.candidates.has(f) && !base.graphql.candidates.has(f)) continue;
+      notCompared.add(f);
+      notAssessed.push({ file: emittedText(f), reason: 'excluded from the working-tree scan but present at the base revision, so it is not compared' });
+    }
+    // Protobuf has its own scan scope, so its comparability is its own: every `.proto` file is a
+    // schema, so there is no "a specification on one side only" case.
+    const protoUnparsed = new Set([...head.proto.unreadable, ...base.proto.unreadable, ...head.proto.unread, ...base.proto.unread].map(u => u.file));
+    const protoComparable = (file: string) => !protoUnparsed.has(file)
+      && (head.proto.examined.has(file) || !head.proto.candidates.has(file)) && (base.proto.examined.has(file) || !base.proto.candidates.has(file));
+    for (const u of [...head.proto.unread, ...base.proto.unread]) notAssessed.push({ file: emittedText(u.file), reason: emittedText(`unread on one side: ${u.reason}`) });
+    for (const f of protoUnparsed) notCompared.add(f);
+    // Every `.proto` file is a schema, so one past the cap on either side is one no rule saw.
+    for (const side of [head.proto, base.proto]) for (const f of side.candidates) if (!side.examined.has(f)) notCompared.add(f);
+    for (const f of new Set([...head.proto.docs, ...base.proto.docs].map(d => d.file))) {
+      if (protoUnparsed.has(f) || protoComparable(f)) continue;
+      notCompared.add(f);
+      notAssessed.push({ file: emittedText(f), reason: 'past the protobuf cap on one side, so it is not compared' });
+    }
+    if (base.proto.capped && !head.proto.capped) boundaries.push('At the base revision, .proto files past the protobuf cap were not read.');
+    // GraphQL: its own scope. One schema per revision, merged from every COMPARABLE file; a schema
+    // file that is unread, unparseable, or past the cap on either side is one no rule saw.
+    const gqlUnparsed = new Set([...head.graphql.unreadable, ...base.graphql.unreadable, ...head.graphql.unread, ...base.graphql.unread].map(u => u.file));
+    const gqlComparable = (file: string) => !gqlUnparsed.has(file)
+      && (head.graphql.examined.has(file) || !head.graphql.candidates.has(file)) && (base.graphql.examined.has(file) || !base.graphql.candidates.has(file));
+    for (const u of [...head.graphql.unread, ...base.graphql.unread]) notAssessed.push({ file: emittedText(u.file), reason: emittedText(`unread on one side: ${u.reason}`) });
+    for (const f of gqlUnparsed) notCompared.add(f);
+    for (const side of [head.graphql, base.graphql]) for (const f of side.candidates) if (!side.examined.has(f)) notCompared.add(f);
+    if (base.graphql.capped && !head.graphql.capped) boundaries.push('At the base revision, GraphQL files past the GraphQL cap were not read.');
     // With a cap reached, an operation missing on the capped side may only have moved past the cap.
-    const changes = diffContracts(base.docs.filter(d => comparable(d.file)), head.docs.filter(d => comparable(d.file))).map(c =>
-      (c.rule === 'operation-removed' && head.capped) || (c.rule === 'operation-added' && base.capped)
+    const removedRule = new Set(['operation-removed', 'rpc-removed', 'type-removed']);
+    const addedRule = new Set(['operation-added', 'rpc-added', 'type-added']);
+    // Each format's own cap: a protobuf cap says nothing about where an OpenAPI operation went.
+    const cappedBy = (headCapped: boolean, baseCapped: boolean) => (c: ContractChange): ContractChange =>
+      (removedRule.has(c.rule) && headCapped) || (addedRule.has(c.rule) && baseCapped)
         ? { ...c, rule: 'schema-unassessed' as const, class: 'potentially-breaking' as const, detail: `${c.detail} (a scan cap was reached, so it may only have moved)` }
-        : c);
-    const consumers = await consumersOf(root, changes, [...head.docs, ...base.docs], boundaries);
+        : c;
+    const httpChanges = diffContracts(base.docs.filter(d => comparable(d.file)), head.docs.filter(d => comparable(d.file))).map(cappedBy(head.capped, base.capped));
+    // Protobuf (change: add-contract-graph-projection): its own rules, and no consumer join —
+    // a gRPC client call names no method and path, so the HTTP call-site census cannot find it.
+    // GraphQL is one schema merged from every file, so a side with a schema file it could not read
+    // may hold what moved there: a removal at an incomplete head (or an addition over an incomplete
+    // base) is not known to be one. Protobuf resolves through imports and keeps the cap-only rule —
+    // a vendored proto2 file beside it is common and hides nothing.
+    const incomplete = (scope: ScanScopeLike) => scope.capped || scope.unreadable.length > 0 || scope.unread.length > 0;
+    const protoChanges = diffProtobuf(base.proto.docs.filter(d => protoComparable(d.file)), head.proto.docs.filter(d => protoComparable(d.file))).map(cappedBy(head.proto.capped, base.proto.capped));
+    if (protoChanges.some(c => c.class === 'breaking' || c.class === 'dangerous')) {
+      boundaries.push('gRPC client call sites are not read, so a breaking protobuf change names no consumer, in this repository or another.');
+    }
+    const gqlDocsOf = (side: SpecSide) => side.graphql.docs.filter(d => gqlComparable(d.file));
+    const graphqlChanges = (head.graphql.docs.length || base.graphql.docs.length)
+      ? diffGraphql(mergeGraphqlSchema(gqlDocsOf(base)), mergeGraphqlSchema(gqlDocsOf(head))).map(cappedBy(incomplete(head.graphql), incomplete(base.graphql)))
+      : [];
+    if (graphqlChanges.some(c => c.class === 'breaking' || c.class === 'dangerous')) {
+      boundaries.push('GraphQL client operations are not read, so a breaking GraphQL change names no consumer, in this repository or another.');
+    }
+    /** Which non-HTTP format each change is, by identity — two formats may share an address. */
+    const formatOf = new Map<ContractChange, 'gRPC' | 'GraphQL'>([
+      ...protoChanges.map(c => [c, 'gRPC'] as const), ...graphqlChanges.map(c => [c, 'GraphQL'] as const),
+    ]);
+    const changes = [...httpChanges, ...protoChanges, ...graphqlChanges];
+    // A specification that changed but could not be compared (proto2, a parse error, a cap) holds
+    // changes no rule saw, so no bump is proven. One that did not change hides nothing.
+    let uncomparedChanged = 0;
+    if (notCompared.size) {
+      const onBothSides = (f: string) => (base.candidates.has(f) || base.proto.candidates.has(f) || base.graphql.candidates.has(f))
+        && (head.candidates.has(f) || head.proto.candidates.has(f) || head.graphql.candidates.has(f));
+      // One listing of every change since the base, intersected here: no pathspec to batch, quote,
+      // or misread (`:x.yaml` is magic to git).
+      let diffed: Set<string> | undefined;
+      try {
+        diffed = new Set((await git(root, gitPathArgs('diff', '--relative', '--name-only', '-z', commit))).split('\0').filter(Boolean));
+      } catch { /* unknown: every one counts as changed */ }
+      uncomparedChanged = [...notCompared].filter(f => !diffed || !onBothSides(f) || diffed.has(f)).length;
+    }
+    const consumers = await consumersOf(root, httpChanges, [...head.docs, ...base.docs], boundaries);
     await attachReachingTests(root, consumers, boundaries);
     // A service's consumers are usually in OTHER repositories, so "no caller in this repository"
     // is the least informative thing to say about the change most worth stopping.
@@ -608,6 +958,15 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
       const who = consumers.get(c.address) ?? [];
       const across = federated?.byAddress.get(c.address) ?? [];
       const subject = `${c.address}${c.element ? ` ${c.element}` : ''}`;
+      const format = formatOf.get(c);
+      if (format) {
+        findings.push({
+          code: 'contract-breaking', severity: c.class === 'breaking' ? 'error' : 'warning', source: 'service-contract', subject: emittedText(subject),
+          discriminator: c.rule, message: emittedText(`${c.detail} (${c.rule}, ${c.class}); ${format} consumers are not assessed.`),
+          location: { path: emittedText(c.file), line: c.line },
+        });
+        continue;
+      }
       // Three distinct states, never collapsed: called here, called elsewhere, or not called in
       // anything censused — and the last one names what was censused so it is not read as "safe".
       const where = who.length
@@ -625,7 +984,7 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
       findings.push({
         code: 'contract-breaking', severity: c.class === 'breaking' ? 'error' : 'warning', source: 'service-contract', subject: emittedText(subject),
         discriminator: c.rule, message: emittedText(`${c.detail} (${c.rule}, ${c.class})${where}.`),
-        location: { path: c.file, line: c.line },
+        location: { path: emittedText(c.file), line: c.line },
       });
     }
     if (federated) {
@@ -641,7 +1000,7 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
       if (!federated.census.repos.length) {
         boundaries.push('No sibling repository was censused, so a consumer outside this repository is not assessed.');
       }
-    } else {
+    } else if (httpChanges.length) {
       boundaries.push('Consumers outside this repository are not assessed; pass `federation: true` to census indexed sibling repositories.');
     }
     changesOut = {
@@ -650,7 +1009,9 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
       items: changes.slice(0, limit).map(c => ({
         ...c, file: emittedText(c.file), address: emittedText(c.address), detail: emittedText(c.detail),
         ...(c.element ? { element: emittedText(c.element) } : {}),
-        consumers: consumers.get(c.address) ?? [],
+        // A protobuf change names no consumer list at all: gRPC call sites are not read, and an
+        // empty list would read as "no callers".
+        ...(formatOf.has(c) ? { consumersNotAssessed: formatOf.get(c) === 'gRPC' ? 'gRPC client call sites are not read' : 'GraphQL client operations are not read' } : { consumers: consumers.get(c.address) ?? [] }),
         // A COUNT here, and the sites themselves in one top-level list below. Nesting them per
         // item put 25-per-sibling inside `changes.items`, which the response trimmer cannot
         // reach into (it shrinks top-level arrays only) — so at the default `maxResults` a
@@ -661,8 +1022,10 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
           : {}),
       })),
       ...(changes.length > limit ? { omitted: changes.length - limit } : {}),
-      suggestedBump: contractBump(changes),
-      ...(contractBump(changes) === null ? { suggestedBumpWithheld: 'a change is outside the model, so compatibility is not proven' } : {}),
+      suggestedBump: uncomparedChanged ? null : contractBump(changes),
+      ...(uncomparedChanged
+        ? { suggestedBumpWithheld: `${uncomparedChanged} changed specification file(s) could not be compared, so compatibility is not proven` }
+        : contractBump(changes) === null ? { suggestedBumpWithheld: 'a change is outside the model, so compatibility is not proven' } : {}),
     };
   }
 
@@ -682,7 +1045,21 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
     tool: 'certify_service_contract',
     posture: 'advisory',
     specs,
-    surface: head.docs.flatMap(d => d.operations.map(o => ({ file: emittedText(d.file), address: emittedText(o.address), line: o.line, ...(o.operationId ? { operationId: emittedText(o.operationId) } : {}), ...(o.deprecated ? { deprecated: true } : {}) }))).slice(0, limit),
+    ...(() => {
+      const surface = [
+        ...head.docs.flatMap(d => d.operations.map(o => ({ file: emittedText(d.file), address: emittedText(o.address), line: o.line, ...(o.operationId ? { operationId: emittedText(o.operationId) } : {}), ...(o.deprecated ? { deprecated: true } : {}) }))),
+        ...head.proto.docs.flatMap(d => d.services.flatMap(s => s.rpcs.map(r => ({ file: emittedText(d.file), address: emittedText(r.address), line: r.line, ...(r.deprecated ? { deprecated: true } : {}) })))),
+        ...(() => {
+          const schema = mergeGraphqlSchema(head.graphql.docs);
+          return (['query', 'mutation', 'subscription'] as const).flatMap(kind => {
+            const root = schema.types.get(schema.roots[kind] ?? "");
+            return (root?.fields ?? []).map(f => ({ file: emittedText(f.file ?? root!.file), address: emittedText(`${root!.name}.${f.name}`), line: f.line, ...(f.deprecated ? { deprecated: true } : {}) }));
+          });
+        })(),
+      ];
+      // The cap was applied with no counterpart, so the operations past it were silently absent.
+      return { surface: surface.slice(0, limit), ...(surface.length > limit ? { surfaceOmitted: surface.length - limit } : {}) };
+    })(),
     parity,
     payload,
     ...(changesOut ? { changes: changesOut } : {}),
@@ -699,8 +1076,8 @@ export async function handleCertifyServiceContract(input: CertifyServiceContract
     findings: shown,
     ...(kept.length > shown.length ? { findingsOmitted: kept.length - shown.length } : {}),
     gated: gate.gated,
-    ...(notAssessed.length ? { notAssessed: notAssessed.sort((a, b) => sortStr(a.file, b.file)) } : {}),
+    ...(notAssessed.length ? { notAssessed: [...new Map(notAssessed.map(n => [`${n.file}\0${n.reason}`, n])).values()].sort((a, b) => sortStr(a.file, b.file)) } : {}),
     ...(boundaries.length ? { boundaries } : {}),
-    note: 'OpenAPI 3.x and Swagger 2.0 only (protobuf and GraphQL are not read yet). Advisory: nothing blocks unless enforcement.policy says so.',
+    note: 'OpenAPI 3.x, Swagger 2.0, protobuf v3, and GraphQL SDL. Advisory: nothing blocks unless enforcement.policy says so.',
   };
 }

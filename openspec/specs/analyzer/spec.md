@@ -4278,6 +4278,23 @@ defect. A worker SHALL additionally prove it can parse — in a language the bui
 deduplicated reporting. An extraction lane that can produce nothing SHALL never be mistaken for
 files that contain nothing.
 
+A worker's FAILURE SHALL NOT be recorded as the file's verdict either. Every known worker-local
+defect reaches the parent as that one message — a per-language grammar that resolved on the main
+thread but not in that isolate, a successfully extracted result that will not serialize back across
+the channel, a binding that misbehaves in one thread — and having already extracted that language
+proves none of them absent. So a worker-reported failure SHALL be re-extracted on the serial path,
+and the file SHALL be recorded as failed (`parse-failure`) only when the SERIAL path fails too; a
+case where the serial path extracts it SHALL be disclosed as a lane defect, worded apart from the
+empty-result defect so a reader can tell "the worker asserted a parse failure" from "the worker
+reported nothing". A file abandoned at the per-file PARSE BUDGET is the one exception: that bound is
+a property of the file, so it SHALL be trusted and SHALL NOT be re-extracted — one bound, not two.
+
+Re-checking SHALL be bounded by a named constant counting the worker failures re-extracted in one
+build. The bound SHALL limit DUPLICATED work, never completeness: past it the pool SHALL stop
+claiming files and the remainder of the build SHALL be extracted on the serial path exactly once,
+and the retirement SHALL be disclosed. No bound SHALL ever cause a file to be recorded as failed on
+a worker's word.
+
 The lane SHALL bound its own cost and liveness: worker startup and each per-file request SHALL have
 deadlines after which the worker is retired and its file re-extracted on the serial path; worker
 count SHALL be bounded per PROCESS, not per build, so concurrent builds cannot multiply the resident
@@ -4298,6 +4315,30 @@ the build result for the CLI to render.
 - **WHEN** the analyze run completes
 - **THEN** the affected file was re-extracted on the serial path, its facts are identical to a
   fully serial run, and the fallback is disclosed
+
+#### Scenario: A file only the worker could not parse keeps its place in the graph
+
+- **GIVEN** a worker that answers "failed" for one file — for a reason about the worker rather than
+  the source, after it has already extracted many files of that same language
+- **WHEN** the analyze run completes
+- **THEN** that file was re-extracted on the serial path, its facts are in the graph, no
+  `parse-failure` record names it, and the contradiction is disclosed as a lane defect worded as a
+  parse failure the worker asserted and the serial path refuted
+
+#### Scenario: A failure the serial path reproduces is still the file's own
+
+- **GIVEN** a file a worker reports as failed and the serial path also cannot parse
+- **WHEN** the analyze run completes
+- **THEN** the file is recorded as `parse-failure`, carrying the serial path's own error, and
+  nothing is disclosed as a lane defect
+
+#### Scenario: A lane that fails everything costs one extra pass, not two
+
+- **GIVEN** a build in which every worker answer is a failure
+- **WHEN** the re-check bound is reached
+- **THEN** the pool stops claiming files, the remaining files are extracted once on the serial path,
+  the retirement and its failure count are disclosed, and the resulting graph is identical to a
+  fully serial run with no file recorded as failed
 
 #### Scenario: A worker that cannot parse is dropped, not trusted
 
@@ -5260,6 +5301,58 @@ only the read site it guards, never every variable in the file.
 - **GIVEN** a TS file with `process.env.A ?? 'x'` and a separate bare `process.env.B` read
 - **WHEN** the inventory is built
 - **THEN** `B` is not marked `required: false` on the strength of `A`'s fallback
+
+### Requirement: EnvNameThroughAHelperIsFollowedOneHopOrDisclosed
+
+A very common idiom hides an environment variable's name from the read site: the read lives in a
+one-line helper and the name is passed in as an argument (`mustMapEnv(&addr, "PORT")` →
+`func mustMapEnv(target *string, envKey string) { os.Getenv(envKey) }`). Environment-variable
+extraction SHALL follow such a name EXACTLY ONE HOP, and only where the binding is provable from
+literal text; every case it cannot prove SHALL be counted as an unfollowed read rather than guessed
+or silently dropped.
+
+A binding SHALL require ALL of: the helper is a free function (never a method) declared at the top
+level of the SAME FILE as the call site; exactly one parameter position feeds an environment read;
+that parameter is the WHOLE key expression, with no concatenation, reassignment, rebinding, or
+shadowing anywhere in the helper's body; and the call site passes a plain string literal of
+environment-name shape at that position. A bound read SHALL be attributed to the CALL SITE's file
+and line — where the variable is named — with the helper disclosed as the mechanism, and SHALL take
+its hard/soft `required` verdict from the helper's read form. The number of call sites followed per
+helper SHALL be capped, and the cap disclosed when it is reached.
+
+The read patterns are exactly those the extractor already scans: Go `os.Getenv`/`os.LookupEnv`,
+Python `os.environ[...]`/`os.environ.get`/`os.getenv`, TS/JS `process.env[...]`, and Ruby
+`ENV[...]`/`ENV.fetch`. A file in any other language SHALL yield no binding and no count.
+
+#### Scenario: A literal at the call site is bound to the helper's read
+
+- **GIVEN** a Go file whose `main` calls `mustMapEnv(&svc.addr, "PRODUCT_CATALOG_SERVICE_ADDR")`
+  and whose `mustMapEnv(target *string, envKey string)` reads `os.Getenv(envKey)`
+- **WHEN** env extraction scans the file
+- **THEN** `PRODUCT_CATALOG_SERVICE_ADDR` is a read site at the call site's line, with the helper
+  disclosed, and the helper's own `os.Getenv(envKey)` is NOT reported as a read of any named
+  variable
+
+#### Scenario: An unprovable case is counted, never guessed
+
+- **GIVEN** a helper called only with a variable, a template string, a concatenated key, a
+  reassigned or shadowed parameter, a parameter with a default, or through a second helper
+- **WHEN** env extraction scans the file
+- **THEN** no read site is bound and the read is reported as an unfollowed non-literal
+  environment read, with its file, line, key expression, and the reason it was refused
+
+#### Scenario: A same-named helper in another file is never bound
+
+- **GIVEN** a literal call site in one file and a same-named helper declared in another
+- **WHEN** env extraction scans either file
+- **THEN** no binding is produced, because a cross-file name cannot be proven from text alone
+
+#### Scenario: Call-site fan-out stays bounded
+
+- **GIVEN** a helper called from many thousands of sites in one file
+- **WHEN** env extraction scans the file
+- **THEN** the followed call sites are capped, the cap is disclosed, and the scan stays linear in
+  the size of the file
 
 ### Requirement: ReceiverAwareArityGuard
 
@@ -6417,6 +6510,13 @@ declared DI package, a declared decorator or annotation, or a resolution API nam
 source-declared framework table. A call to a method merely *named* `get`, `resolve`, or `make`
 SHALL NOT be recorded.
 
+A matcher's rule tables are keyed by text read out of the ANALYZED SOURCE, so a lookup SHALL match
+only keys the rule table DECLARES — never a key it inherits from the language's own base object. A
+repository is free to name a function `toString`, `valueOf`, `constructor` or `hasOwnProperty`, and
+such a name SHALL fire no rule and SHALL yield no site. Every recorded `kind` SHALL be a member of
+the closed vocabulary and therefore serializable, so no matched construct can make a file's facts
+unable to cross a process or thread boundary.
+
 The vocabulary SHALL carry a measured **density budget**: on the substrate's own repository and
 on each language fixture, recorded sites SHALL NOT exceed a declared per-thousand-lines ceiling,
 and a matcher that exceeds it SHALL fail the test suite rather than ship.
@@ -6448,6 +6548,13 @@ at most once.
 - **GIVEN** `this.cache.get(key)` and `Promise.resolve(x)` in a file with no DI framework import
 - **WHEN** the repository is analyzed
 - **THEN** no `container-resolution` site is recorded for either
+
+#### Scenario: A function named after a base-object member fires no rule
+
+- **GIVEN** a Go file declaring a local `toString := func(x int) int { ... }` and calling it
+- **WHEN** the repository is analyzed
+- **THEN** no site is recorded for that call, and every site in the file carries a kind from the
+  closed vocabulary that survives being sent across a thread boundary
 
 #### Scenario: A literal that resolves to nothing is still a boundary
 
@@ -6690,11 +6797,55 @@ conclusions SHALL say so. An adapter SHALL only ever add evidence of use and SHA
 deadness. A reference built from a variable, expression, or glob, an unsupported command form, a
 missing or unmapped target, a path outside the repository, and a config that cannot be read or parsed
 SHALL surface as disclosed boundaries with a reason, never as guesses; reading SHALL not follow links
-or block on non-regular files. Config formats outside the supported set — workspace-member manifests,
-framework route conventions, and others — SHALL be named as unread in the caveats. Downstream
+or block on non-regular files. Config formats outside the supported set — framework route conventions
+and others — SHALL be named as unread in the caveats. Downstream
 conclusions SHALL consume the evidence: a config-wired untested gap carries its receipt and is not
 flagged also-dead, and the entry-points digest separates entry points in files a config invokes from
 those no read config invokes.
+
+In a workspace monorepo the package.json adapter SHALL also read the manifests a root config DECLARES
+as workspace members — the root `workspaces` field (array form or `{ packages: [...] }`) and
+`pnpm-workspace.yaml`'s `packages:`, including `!` exclusions — and SHALL NOT search the tree for
+manifests, so a root is only ever a file a config names. Each member manifest's references SHALL
+resolve against THAT manifest's own directory and SHALL be receipted with that manifest's own path.
+Reading SHALL be bounded — the glob expansion over real directories, its `**` depth, the number of
+patterns, and the number of member manifests read (with an exact count of those left unread) — and
+SHALL never follow a symlinked directory or a pattern that leaves the repository (confined with the
+repository's own path-confinement helper). A pattern form the reader does not expand (a brace list,
+character class, or extglob) and a member manifest that cannot be read or parsed SHALL be disclosed
+boundaries naming the member's own path. Whenever a repository declares workspaces, the standing limit
+— that only declared member manifests are read, so a manifest outside the declared set contributes
+nothing — SHALL be disclosed in the boundaries channel even when nothing was capped, and SHALL be
+listed ahead of the resolved-reference boundaries so truncation cannot hide it.
+
+#### Scenario: A declared workspace member's script wires its own file
+
+- **GIVEN** a root package.json declaring `workspaces: ["benchmark"]` and `benchmark/package.json`
+  whose `scripts.start` runs `node start-server.ts`
+- **WHEN** `find_dead_code` runs
+- **THEN** the functions in `benchmark/start-server.ts` are `externally-wired` roots, and the receipt
+  names `benchmark/package.json` and the `scripts.start` key
+
+#### Scenario: A member's relative reference resolves against the member's directory
+
+- **GIVEN** `benchmark/envelop/package.json` whose script runs `node ./app.js`, and an unrelated
+  `app.js` at the repository root
+- **WHEN** the adapters run
+- **THEN** `benchmark/envelop/app.js` is wired and the root's `app.js` gains no evidence
+
+#### Scenario: A manifest outside the declared set contributes nothing, and the limit is disclosed
+
+- **GIVEN** a root declaring `workspaces: ["packages/*"]` and a `tools/package.json` whose `bin` names
+  `tools/helper.js`
+- **WHEN** the adapters run
+- **THEN** `tools/helper.js` gains no evidence, and the boundaries disclose that only the manifests of
+  declared workspace members are read
+
+#### Scenario: A workspace pattern that leaves the repository is refused
+
+- **GIVEN** a root declaring `workspaces: ["../*"]` with a manifest outside the repository
+- **WHEN** the adapters run
+- **THEN** nothing outside the repository is read and the pattern is an `outside-repository` boundary
 
 #### Scenario: A bin-wired CLI entry is not a dead-code candidate
 
@@ -8338,6 +8489,180 @@ same-basename source file.
   `main`/`source` pair
 - **WHEN** the repository is analyzed
 - **THEN** no edge is created and the unresolved binding names the missing mapping
+
+### Requirement: ContractSchemasAreDiscoveredAndNormalized
+
+The analyzer SHALL deterministically discover interface-schema files — OpenAPI and Swagger
+documents by their top-level key, every `.proto` file, and every GraphQL SDL file (`.graphql`,
+`.graphqls`, `.gql`) — and read each into a normalized element model for rule-table diffing. A
+schema that looks GENERATED or VENDORED — by a generator header in its bounded head, or by a path
+pattern — SHALL be disclosed with that provenance and its certainty, and SHALL still be read and
+graded: provenance annotates and never excludes. A
+GraphQL file holding only operations and fragments is a client document and SHALL be listed as a
+skipped candidate, not read as an empty schema; GraphQL files SHALL be merged into one schema, with
+`extend` folded into its definition and a type two files define treated as ambiguous. For protobuf that model SHALL hold RPCs, messages under their full
+names with numbered fields, enums with their values, and `reserved` numbers and names, with type
+names resolved by protobuf's own scoping rule over the file and the files it imports (and what
+those re-export with `import public`) — never over a file it does not import. Discovery scope SHALL be visible, and a
+file that cannot be read SHALL be unread with the reason, never omitted.
+
+#### Scenario: Discovery scope is visible
+
+- **GIVEN** a repository containing one OpenAPI document, one `.proto` file, and one YAML file
+  with an `openapi` key below the top level
+- **WHEN** the repository is analyzed
+- **THEN** the two schemas are projected, and the third is listed under `skippedCandidates` with
+  the reason it was excluded
+
+#### Scenario: A GraphQL client document is not a schema
+
+- **GIVEN** `web/queries.graphql` holding `query GetOrder { order(id: 1) { id } }` only
+- **WHEN** the repository is analyzed
+- **THEN** it is listed under `skippedCandidates` as a client document, and declares no type
+
+#### Scenario: Parse failure is unread, not empty
+
+- **GIVEN** a `.proto` file with a syntax error, and another with no `syntax` statement (proto2)
+- **WHEN** the repository is analyzed, and when `certify_service_contract` runs with a base ref
+- **THEN** both files are listed as unread with the reason, and no diff over either reports "no
+  changes" or a removed element
+
+#### Scenario: Elements outside the model are named
+
+- **GIVEN** a `.proto` file that declares an `extend` block
+- **WHEN** the repository is analyzed
+- **THEN** `extend` is named as outside the model (under the projection's `notes`, which withhold
+  no conclusion), and the rest of the file is read
+
+#### Scenario: A generated or vendored schema copy is disclosed, not dropped
+
+- **GIVEN** `src/__generated__/schema.graphql`, a `# @generated`-headed SDL, and a copy under
+  `vendor/`
+- **WHEN** the repository is analyzed
+- **THEN** each is listed under the projection's `schemaProvenance` with its `kind`
+  (`generated` / `vendored`), the rule that `matched`, and a `certainty` of `declared` for a
+  header the file itself carries or `path-pattern` for a path guess
+- **AND** every one of them is projected and graded exactly as before: provenance annotates, and
+  never drops, downgrades or excludes a schema
+- **AND** a header marker is looked for in a bounded head of the file only, never the whole text
+
+#### Scenario: Protobuf types resolve by scope, across files
+
+- **GIVEN** `orders.proto` in package `orders.v1`, importing `status.proto`, whose `Order` has a
+  field of type `Status`, and `status.proto` in the same package declaring `enum Status`
+- **WHEN** the repository is analyzed
+- **THEN** `orders.v1.Order` has a `references_schema` edge to `orders.v1.Status`; a field typed
+  `google.protobuf.Timestamp` with no such file in the repository, or a name declared in two files,
+  draws no edge and is disclosed
+
+### Requirement: RpcsAreBoundToTheImplementationTheirServerRegistrationNames
+
+Each protobuf RPC SHALL be a graph node named by its gRPC method path (`/package.Service/Method`),
+and each message and enum a node named by its full name, all `language: Protobuf`. A method SHALL
+be bound to an RPC by an `implements_endpoint` edge only through a gRPC server registration that
+names both the service and its implementation literally (Go, Python, Node grpc-js). Nothing SHALL
+be guessed: every registration that cannot be bound is disclosed with the reason, and an RPC left
+unbound is listed as not bound, never as not implemented.
+
+#### Scenario: A Go registration binds the implementing methods
+
+- **GIVEN** `service OrderService { rpc GetOrder(…) }` in package `orders.v1`, and Go code calling
+  `pb.RegisterOrderServiceServer(s, &orderServer{})` with `func (s *orderServer) GetOrder(…)`
+- **WHEN** the repository is analyzed
+- **THEN** an `implements_endpoint` edge runs from `orderServer.GetOrder` to
+  `/orders.v1.OrderService/GetOrder`, and `orderServer.GetOrder` is not a dead-code candidate
+
+#### Scenario: A registration that names no type binds nothing
+
+- **GIVEN** `pb.RegisterOrderServiceServer(s, NewServer())`
+- **WHEN** the repository is analyzed
+- **THEN** no edge is drawn, the registration is disclosed as `not-literal`, and the service's RPCs
+  are listed as unbound
+
+#### Scenario: Registrations that are not code are not read
+
+- **GIVEN** a registration written in a comment, one in a test file, and the generated stub's own
+  definition of `RegisterOrderServiceServer`
+- **WHEN** the repository is analyzed
+- **THEN** none of them binds anything
+
+#### Scenario: A declaration binding changes no code measurement
+
+- **GIVEN** the same repository analyzed with and without its `.proto` files
+- **WHEN** the two graphs are compared
+- **THEN** every code function's fan-in and fan-out, the entry points and the hubs are identical,
+  and no protobuf node appears among them
+
+#### Scenario: A Node registration's implementation is read in each shape that is written down
+
+A grpc-js `addService` call states its implementation in one of three shapes a reader can settle
+from the file's own text. Each is read, and the scope rule says WHERE the implementation may be:
+
+| Written at the registration | Bound | Where it is looked for |
+|---|---|---|
+| an object literal (`{ getOrder }`) | the function each key names | this file, or — for an imported name — the module it was imported from |
+| a local name bound ONCE to an object literal | the same, through that literal | as above |
+| `new MyHandlers()` | the method of the class named after each RPC | this file, or the module `MyHandlers` was imported from |
+
+- **GIVEN** `server.addService(proto.shop.v1.OrderService.service, new MyHandlers())` with
+  `class MyHandlers { getOrder() … }` in the same file, and a second server whose implementation is
+  `const serviceImplementation = { getOrder }` passed by name
+- **WHEN** the repository is analyzed
+- **THEN** `MyHandlers.getOrder` and `getOrder` each carry an `implements_endpoint` edge to
+  `/shop.v1.OrderService/GetOrder`, and neither is a dead-code candidate
+
+#### Scenario: A Node implementation whose value the file does not settle stays disclosed
+
+- **GIVEN** `addService(…, makeHandlers())`, `addService(…, this.handlers)`,
+  `addService(…, new Impl().wrap())`, a name bound more than once or reassigned after its literal,
+  and a name imported from another module
+- **WHEN** the repository is analyzed
+- **THEN** none of them binds anything and each is disclosed as `not-literal` with what was written
+
+#### Scenario: A handler imported through a DECLARED path alias is followed
+
+An alias is followed only from a mapping the repository wrote down — a tsconfig/jsconfig
+`compilerOptions.paths` entry or a `package.json` `imports` subpath — and only when exactly ONE
+mapping matches the specifier, names exactly one target, and that target is exactly one indexed
+module. A webpack/jest/vite alias is arbitrary code and is never read; an `extends` chain is not
+followed. Anything ambiguous leaves the specifier unresolved and disclosed.
+
+- **GIVEN** `tsconfig.json` declaring `"@app/*": ["src/*"]`, and
+  `import { addItem } from '@app/handlers'` registered as `addService(…, { addItem })`
+- **WHEN** the repository is analyzed
+- **THEN** `addItem` in `src/handlers.ts` carries the `implements_endpoint` edge; with no such
+  mapping declared, or with two mappings matching, no edge is drawn and the registration is
+  disclosed as `implementation-not-found` naming the module it was imported from
+
+### Requirement: GraphqlOperationsAreBoundToTheirResolverMaps
+
+Each root field of a GraphQL schema SHALL be a graph node named `<RootType>.<field>`, and each other
+named type a node named by the type, all `language: GraphQL`. A function SHALL be bound to an
+operation by an `implements_endpoint` edge only through a literal resolver map that names it for
+that root field (JS/TS object maps, Python Ariadne bindables); every entry that cannot be bound SHALL
+be disclosed with the reason, and an operation no map binds SHALL be listed as not bound, never as
+not served.
+
+#### Scenario: An Apollo resolver map binds its functions
+
+- **GIVEN** `type Query { order(id: ID!): Order }` and `const resolvers = { Query: { order: getOrder } }`
+  with `getOrder` defined in the same file
+- **WHEN** the repository is analyzed
+- **THEN** an `implements_endpoint` edge runs from `getOrder` to `Query.order`, and `getOrder` is not
+  a dead-code candidate
+
+#### Scenario: An extension in another file is the same root
+
+- **GIVEN** `extend type Query { search: [Result!]! }` in a second schema file and a map entry
+  `search: searchAll` whose function the map's file imports
+- **WHEN** the repository is analyzed
+- **THEN** `Query.search` is an operation node in the second file and `searchAll` is bound to it
+
+#### Scenario: An inline resolver is disclosed
+
+- **GIVEN** `{ Query: { orders: () => [] } }`
+- **WHEN** the repository is analyzed
+- **THEN** no edge is drawn for `Query.orders`, and the entry is disclosed as `inline-implementation`
 
 ## Sub-components
 
@@ -10375,6 +10700,61 @@ class pairs, and was applied inconsistently across reachability paths.
 - **THEN** override edges are still emitted for every name-and-arity-matched override pair, and none
   are silently dropped
 
+### Sub-component: CHAReceiverOutsideRepositoryRefusal
+
+#### Requirement: CHAReceiverOutsideRepositoryRefusal
+
+The system SHALL NOT synthesize a `cha-name-only` virtual-dispatch edge for a `recv.m()` call site
+whose receiver is statically known NOT to be a value of a type defined in this repository. A
+receiver is known to be outside the repository when, and only when, the import facts already
+extracted for the caller's file say so:
+
+- `recv` is a source-level QUALIFIER the file binds to a package or module that does not resolve to
+  an in-project file (`json` from Go's `import "encoding/json"`, `os` from Python's `import os`,
+  `fs` from `import * as fs from 'node:fs'`), or
+- `recv`'s explicitly DECLARED type is qualified by such a package (`t *testing.T`,
+  `ctx context.Context`, `zf: zipfile.ZipFile`).
+
+The determination SHALL be made from import/qualifier facts only, and SHALL NOT consult any
+hard-coded list of standard-library or third-party names. A Go import specifier whose last segment
+is the name of the repository's own root package SHALL NOT be treated as outside the repository
+(the module's own path names the repository root, which has no path segment to match).
+
+A refused call site SHALL be DISCLOSED as an unresolved-ambiguous call site with
+`strategy: 'cha_receiver_outside_repo'`, naming the in-repo methods the pass declined to wire as its
+candidates, so that removing the former edges cannot promote any of those methods to
+high-confidence dead code. CHA SHALL continue to over-approximate by method name for a genuinely
+unresolved receiver whose type could be an in-repo class.
+
+#### Scenario: A standard-library call is not fanned onto same-named in-repo methods
+
+- **GIVEN** a Go file that imports `encoding/json` and calls `json.Unmarshal(...)`, and a method
+  named `Unmarshal` declared on an in-repo type
+- **WHEN** the call graph is built
+- **THEN** the call site carries only its `external::json.Unmarshal` edge and no
+  `cha-name-only` edge to the in-repo `Unmarshal`
+
+#### Scenario: A receiver whose declared type is outside the repository is refused
+
+- **GIVEN** a Go function with a parameter `t *testing.T` that calls `t.Fatalf(...)`, and an in-repo
+  method named `Fatalf`
+- **WHEN** the call graph is built
+- **THEN** no `cha-name-only` edge is synthesized to the in-repo `Fatalf`
+
+#### Scenario: A genuinely unresolved in-repo receiver still fans out
+
+- **GIVEN** a call `x.area()` whose receiver type was not recovered and is not an imported
+  non-repo qualifier, and two in-repo classes declaring `area`
+- **WHEN** the call graph is built
+- **THEN** a `cha-name-only` edge is synthesized to each of them
+
+#### Scenario: A refusal is disclosed, never silent
+
+- **GIVEN** a call site whose name-only fan-out was refused
+- **WHEN** the built graph's ambiguous call sites are inspected
+- **THEN** the site appears with `strategy: 'cha_receiver_outside_repo'` and lists the in-repo
+  methods declined as its candidates
+
 ### Sub-component: CHAProvenanceLabeling
 
 #### Requirement: CHAProvenanceLabeling
@@ -10384,7 +10764,8 @@ edges by setting its `confidence` to `synthesized` and recording the producing r
 `synthesizedBy` property, using `cha-declared-type` for a virtual-dispatch edge whose target set was
 narrowed by a statically-recovered receiver type, `cha-name-only` for a virtual-dispatch edge
 resolved by method name over the whole hierarchy (the receiver type was not statically recovered and
-the call site's argument count is not captured, so no arity narrowing is applied), and `override` for
+the call site's argument count is not captured, so no arity narrowing is applied, and the receiver is
+not known to be outside the repository — see CHAReceiverOutsideRepositoryRefusal), and `override` for
 a method-level override edge.
 Directly-resolved edges SHALL retain their existing `confidence` value and SHALL NOT carry
 `synthesizedBy`. A virtual-dispatch edge SHALL NOT introduce a new `EdgeConfidence` member or a new

@@ -66,6 +66,7 @@ import {
   type ServeHealth,
 } from '../cli/commands/serve-descriptor.js';
 import { OPENLORE_PACKAGE_VERSION } from '../core/runtime/package-versions.js';
+import { sanitizeForTerminal } from '../utils/misc.js';
 import type { ContextInjectionConfig } from '../types/index.js';
 import {
   refuseRepoConfiguredEndpoint,
@@ -1367,7 +1368,7 @@ export const NAV_TOOLS: NavToolSpec[] = [
     parameters: Type.Object({
       baseRef: Type.Optional(Type.String({ description: 'Git ref to diff against (default HEAD).' })),
       change: Type.Optional(Type.String({ description: 'Change id recorded on the certificate (default "working-tree").' })),
-      format: Type.Optional(Type.String({ description: 'Output shape: "in-toto" predicate or "json" (default json).' })),
+      format: Type.Optional(Type.String({ description: 'Output shape: "in-toto" for an unsigned Statement v1 envelope (shape structurally checked locally), or "json" (default json).' })),
     }),
   },
   {
@@ -2009,8 +2010,13 @@ export const PI_EXCLUDED_CONCLUSION_TOOLS: Record<string, string> = {
   get_change_coupling: 'git co-change/churn conclusion — deferred from the native surface pending demand',
 };
 
+/**
+ * Every Pi tool answer is built here, so this is where repository-derived bytes are screened on
+ * the Pi surface — the counterpart of `capStructuredResult` on the MCP transport. `details` is the
+ * structured passthrough a host consumes programmatically and is left exactly as computed.
+ */
 function toolResult(text: string, details: unknown = null): AgentToolResult<unknown> {
-  return { content: [{ type: 'text', text }], details };
+  return { content: [{ type: 'text', text: sanitizeForTerminal(text, { keepNewlines: true }) }], details };
 }
 
 /**
@@ -2952,8 +2958,7 @@ function registerOpenlore(
       }
     }
 
-    const proposalPrompt = event.messageType === 'user' ? event.prompt : '';
-    const proposalContext = proposalContextForPrompt(proposalPrompt, 'pi');
+    const proposalContext = proposalContextForPrompt(event.prompt, 'pi');
     if (proposalContext) blocks.push(proposalContext);
 
     // The handoff joins the conversation (a custom message reaches the model as context and stays

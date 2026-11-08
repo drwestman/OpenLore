@@ -50,6 +50,7 @@ import type { DecisionNode } from '../../decisions/project.js';
 import { decisionContentProvenance } from '../served-content.js';
 import { isIacLanguage } from '../../analyzer/iac/types.js';
 import { isContractLanguage } from '../../analyzer/contract/types.js';
+import { isProjectedLanguage, isDeclarationEdgeKind } from '../../analyzer/projected-language.js';
 import { getFileGodFunctions, extractSubgraph } from '../../analyzer/subgraph-extractor.js';
 import { readOpenLoreConfig } from '../config-manager.js';
 import {
@@ -566,6 +567,49 @@ export async function handleGetCallGraph(directory: string): Promise<unknown> {
 }
 
 /**
+ * Unresolved-ambiguous call sites touching a traversed id set (change:
+ * harden-call-resolution-ambiguity). A site whose CALLER is in-scope is an outbound call
+ * the resolver refused to bind (downstream is under-counted); a site listing a SEED among
+ * its candidates is a potential hidden upstream caller (upstream is under-counted).
+ * Disclosed so the answer reads as a sound lower bound.
+ *
+ * Shared by `analyze_impact` and `get_subgraph`: both traverse the same graph past the
+ * same unbound sites, and `ambiguousCallSites` is a registered disclosure channel, so a
+ * traversal that crosses one can no longer be reported as a complete answer (change:
+ * never-claim-complete-beside-a-refusal).
+ */
+function ambiguousCallSitesBlock(
+  ctx: { callGraph?: { ambiguousSites?: AmbiguousCallSite[] }; edgeStore?: { getNode(id: string): { name: string } | null | undefined } | null },
+  involvedIds: ReadonlySet<string>,
+  seedIds: readonly string[],
+): Record<string, unknown> {
+  const inScope = (ctx.callGraph?.ambiguousSites ?? []).filter(
+    (s: AmbiguousCallSite) => involvedIds.has(s.callerId) || s.candidateIds.some(id => seedIds.includes(id)),
+  );
+  if (inScope.length === 0) return {};
+  return {
+    ambiguousCallSites: {
+      count: inScope.length,
+      note:
+        'Call sites the resolver refused to bind because >1 candidate was viable. A caller ' +
+        'in-scope means downstream is under-counted; a seed among the candidates means a ' +
+        'potential hidden upstream caller. This answer is a lower bound here.',
+      sample: inScope.slice(0, 10).map((s: AmbiguousCallSite) => ({
+        caller: ctx.edgeStore?.getNode(s.callerId)?.name ?? s.callerId,
+        // A chained intra-object site's receiver is `this.<field>`, not the bare `this` the
+        // raw edge carries; rendering the bare token names a call the source does not have
+        // (change: shrink-receiver-resolution-boundary — same rule as error-propagation.ts).
+        callee: s.calleeObject
+          ? `${s.calleeObject}.${s.receiverField ? `${s.receiverField}.` : ''}${s.calleeName}`
+          : s.calleeName,
+        strategy: s.strategy,
+        candidates: s.candidateCount,
+      })),
+    },
+  };
+}
+
+/**
  * Extract a depth-limited subgraph centred on a named function.
  * Falls back to semantic search if no exact name match is found.
  */
@@ -718,6 +762,10 @@ export async function handleGetSubgraph(
     nodes: subNodes,
     edges: subEdges,
     ...(governingDecisions.length > 0 ? { governingDecisions } : {}),
+    // Same unbound call sites `analyze_impact` discloses. A subgraph that came back with
+    // no edges because the resolver refused to bind them is not an empty neighbourhood,
+    // and must not read as a complete one.
+    ...ambiguousCallSitesBlock(ctx, visitedIds, seedIds),
     confidenceBoundary,
   };
   return withIndexStaleness(absDir, result, ctx, subgraphFiles);
@@ -970,31 +1018,7 @@ export async function handleAnalyzeImpact(
   // call the resolver refused to bind (downstream is under-counted); a site listing a
   // SEED among its candidates is a potential hidden upstream caller (upstream is
   // under-counted). Disclosed so the blast radius reads as a sound lower bound.
-  const ambiguousInScope = (ctx.callGraph?.ambiguousSites ?? []).filter(
-    (s: AmbiguousCallSite) => involvedIds.has(s.callerId) || s.candidateIds.some(id => seedIds.includes(id)),
-  );
-  const ambiguousBlock = ambiguousInScope.length > 0
-    ? {
-        ambiguousCallSites: {
-          count: ambiguousInScope.length,
-          note:
-            'Call sites the resolver refused to bind because >1 candidate was viable. A caller ' +
-            'in-scope means downstream is under-counted; a seed among the candidates means a ' +
-            'potential hidden upstream caller. The blast radius is a lower bound here.',
-          sample: ambiguousInScope.slice(0, 10).map((s: AmbiguousCallSite) => ({
-            caller: ctx.edgeStore!.getNode(s.callerId)?.name ?? s.callerId,
-            // A chained intra-object site's receiver is `this.<field>`, not the bare `this` the
-            // raw edge carries; rendering the bare token names a call the source does not have
-            // (change: shrink-receiver-resolution-boundary — same rule as error-propagation.ts).
-            callee: s.calleeObject
-              ? `${s.calleeObject}.${s.receiverField ? `${s.receiverField}.` : ''}${s.calleeName}`
-              : s.calleeName,
-            strategy: s.strategy,
-            candidates: s.candidateCount,
-          })),
-        },
-      }
-    : {};
+  const ambiguousBlock = ambiguousCallSitesBlock(ctx, involvedIds, seedIds);
 
   const results = seeds.map(seed => {
     const isHub     = hubIds.has(seed.id);
@@ -1217,7 +1241,8 @@ export async function handleGetLowRiskRefactorCandidates(
   let candidates = cg.nodes.filter(n => {
     const fanIn  = n.fanIn  ?? 0;
     const fanOut = n.fanOut ?? 0;
-    return !n.isExternal && !n.isTest && fanIn <= LOW_RISK_MAX_FAN_IN && fanOut <= LOW_RISK_MAX_FAN_OUT && !hubIds.has(n.id) && !entryIds.has(n.id);
+    // A projected declaration (an RPC, a schema, a resource) is not code to rename or rewrite.
+    return !n.isExternal && !n.isTest && !isProjectedLanguage(n.language) && fanIn <= LOW_RISK_MAX_FAN_IN && fanOut <= LOW_RISK_MAX_FAN_OUT && !hubIds.has(n.id) && !entryIds.has(n.id);
   });
 
   if (filePattern) candidates = candidates.filter(n => n.filePath.includes(filePattern));
@@ -1258,8 +1283,10 @@ export async function handleGetLeafFunctions(
   if (!ctx.callGraph) return notReadyResult('Call graph not available. Re-run analyze_codebase.', 'graph-unavailable');
 
   const cg = ctx.callGraph as SerializedCallGraph;
-  const hasOutgoing = new Set(cg.edges.filter(e => e.calleeId).map(e => e.callerId));
-  let leaves = cg.nodes.filter(n => !n.isExternal && !n.isTest && !hasOutgoing.has(n.id));
+  // A declaration binding (handler → the operation it serves) is not a call, so it does not make
+  // its caller a non-leaf; and a projected declaration is not a function at all.
+  const hasOutgoing = new Set(cg.edges.filter(e => e.calleeId && !isDeclarationEdgeKind(e.kind)).map(e => e.callerId));
+  let leaves = cg.nodes.filter(n => !n.isExternal && !n.isTest && !isProjectedLanguage(n.language) && !hasOutgoing.has(n.id));
 
   if (filePattern) leaves = leaves.filter(n => n.filePath.includes(filePattern));
 

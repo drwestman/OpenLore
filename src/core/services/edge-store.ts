@@ -216,8 +216,18 @@ async function runTransactionAsync<T>(db: DatabaseSync, fn: () => Promise<T>): P
  * would pass the version gate and then DROP every schema edge, leaving the named-schema nodes
  * in the graph with nothing bound to them, and recompute a bundle digest through that dropping
  * reader (change: add-contract-schema-elements).
+ *
+ * v16 adds no column and no edge kind — it marks one more projected node language, `Protobuf`
+ * (RPCs, messages and enums read from `.proto` files). A v15 reader's projected-language filter
+ * does not name it, so it would serve every protobuf declaration as CODE: ranked among the hubs and
+ * entry points, counted in fan-in and fan-out, and offered as dead code (change:
+ * add-contract-graph-projection, protobuf phase).
+ *
+ * v17 is the same case once more: the projected node language `GraphQL` (root fields and named
+ * types read from a schema-first SDL), which a v16 reader would rank as code (change:
+ * add-contract-graph-projection, GraphQL phase).
  */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 17;
 
 /**
  * Bound on the number of bound parameters in one generated `IN (…)` list.

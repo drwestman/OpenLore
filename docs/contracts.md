@@ -122,6 +122,275 @@ entry-point or hub classification, no file-level dependency ranking and no layer
 verified as a difference between two builds of the same code, one with the specification and one
 without.
 
+## Protobuf
+
+Every `.proto` file is read as a **proto3** schema. A file with no `syntax` statement is proto2 by
+the language's own rule, and an `edition` file follows other rules again; both are listed as
+unread, with that reason, never read as declaring nothing. The reader is a small tokenizer
+written for this — no `protoc`, no grammar, no network.
+
+| Protobuf concept | OpenLore graph primitive |
+|---|---|
+| An RPC (`rpc GetOrder`) | a node named by its gRPC method path, `/orders.v1.OrderService/GetOrder`, `language: Protobuf` |
+| A message or enum | a node named by its full name, `orders.v1.Order` |
+| The request and response types of an RPC; the message and enum types of a message's fields | `references_schema` edges |
+| The method a registered server implementation defines | an `implements_endpoint` edge, **method → RPC** |
+
+Type names are resolved with protobuf's own scoping rule, across every `.proto` file read: the
+first part of a name is looked up from the innermost scope outward, and a leading dot means "from
+the root". A file sees only its own declarations and those of the files it imports (plus what they
+re-export with `import public`); an import path matches a read file whose path ends with it. So
+adding an unrelated file whose package shadows a scope never changes what an untouched field
+resolves to. A name declared in two visible files binds nothing, and a type imported from outside the
+repository (`google.protobuf.Timestamp`) draws no edge — both are disclosed. Fields are not nodes,
+for the same reason as above.
+
+### Which code serves an RPC
+
+A gRPC server is wired up at **one call that names both the service and its implementation**, in
+code the generator emits for every language. That call is the evidence the edge rests on:
+
+| Runtime | Registration | The RPC `GetOrder` is served by |
+|---|---|---|
+| Go | `pb.RegisterOrderServiceServer(s, &orderServer{})` | the method `GetOrder` of `orderServer` |
+| Python | `orders_pb2_grpc.add_OrderServiceServicer_to_server(OrderServicer(), server)` | the method `GetOrder` of `OrderServicer` |
+| Node (grpc-js) | `server.addService(proto.orders.v1.OrderService.service, { getOrder })` | the function the map names under `GetOrder` or `getOrder` |
+| Node (grpc-js) | `server.addService(…, new MyHandlers())` | the method `getOrder` of `MyHandlers` |
+| Node (grpc-js) | `const impl = { getOrder }; server.addService(…, impl)` | the function the literal names, as if written at the call |
+
+The rules refuse rather than guess:
+
+- The implementation must be written **at the registration**: `&orderServer{}`, `OrderServicer()`,
+  an object literal, `new MyHandlers()`. A variable or a factory call (`NewServer()`,
+  `makeHandlers()`) names no type, so the registration is disclosed as `not-literal`.
+- One Node exception, because the file settles it: a **bare local name** passed to `addService` is
+  read as the object literal it was bound to, when this file binds it exactly once — one unindented
+  top-level `const`/`let`/`var` whose initializer is an object literal, with no later assignment to
+  the name or one of its members, no `Object.assign` onto it, no computed access, no `delete`, and
+  no import of that name. This is the shape every official grpc-node example uses. Anything else —
+  bound twice, bound inside a function, reassigned, imported, or bound to a call's result — keeps
+  the `not-literal` disclosure. `new Impl().wrap()`, `new Impl(c).handlers`, `this.handlers` and
+  `impl.handlers` name a value, not a type, and stay disclosed too.
+- A service named by two packages, or declared in two files, binds nothing (`ambiguous-service`).
+  A service no file read declares — its `.proto` lives in another repository, or in a file that
+  could not be read, which the detail then says — is `unknown-service`. A Node service path of
+  three or more parts (`proto.billing.v2.PaymentService`) binds only to a declared full name it ends
+  with; a one- or two-part path (`services.PaymentService`) states no package, so it falls back to
+  a service of that simple name declared exactly once.
+- The implementing method is looked for only where the registration's own scope says the type
+  is. Go: a bare `orderServer` is in the registration's own package (its directory) and nowhere
+  else; `v2.OrderServer` is in another package whose directory is named `v2`. Python: a bare class
+  is in the registration's file or, failing that, the only one anywhere; `servicer.OrderServicer` is
+  in a module named `servicer`. Node: the registration's file, else — only when the file imports
+  that handler — the only one anywhere. Two candidates in that scope bind nothing
+  (`ambiguous-implementation`); a lone candidate outside it is never taken. For Go and Python the
+  type's location is settled once per registration: a type defined in two places makes the whole
+  registration ambiguous, so no RPC binds to whichever place alone happens to define its method.
+- Generated stubs are never candidates (Python's `*_pb2_grpc.py` holds a client class named exactly
+  like the service), and once a Python servicer class is found in the registration's own file, an
+  RPC it does not implement is not looked for elsewhere. Inheritance is not followed: a method
+  defined on a base class in another file is not bound.
+- A Go or Python registration none of whose methods is found where it may be, and a Node map entry
+  whose handler is neither defined nor imported in the registration's file, are
+  `implementation-not-found`.
+- A Node handler imported into the registration's file binds only in the module it was imported
+  from. A **declared** path alias is followed: a tsconfig/jsconfig `compilerOptions.paths` entry or
+  a `package.json` `imports` subpath, and only when exactly one mapping matches the specifier, it
+  names exactly one target, and that target is exactly one indexed module. Two mappings matching, a
+  fallback list, a value that is not an array of strings, a target climbing above the repository
+  root, or a conditional `imports` object leave the specifier unresolved and disclosed. A webpack,
+  jest or vite alias is arbitrary JavaScript and is never read; a tsconfig's `extends` chain is not
+  followed, so a config that inherits its `paths` declares none here. A real package binds nothing.
+- A Node class instantiated at the registration is looked for in the registration's own file, or —
+  when the class name is imported — only in the module it was imported from (one barrel re-export
+  followed). A default or whole-module import does not name the class it holds, so it binds
+  nothing; `new ns.MyHandlers()` binds only when `ns` is an imported namespace. As for Go and
+  Python the class's location is settled once per registration: a class of that name in two places
+  makes the whole registration `ambiguous-implementation`.
+- Node keys match the RPC name, its lower-camel form, or grpc-js's lodash `camelCase`
+  (`GetHTTPStatus` → `getHttpStatus`).
+- Node's static-codegen form, `addService(services.GreeterService, { … })`, is read too, and binds
+  only when it names a declared service — `addService` is a common method name.
+- Registrations in comments, strings and test files are not read, and generated stubs are skipped:
+  they define the registration function rather than call it.
+- Other styles are not read: Go `s.RegisterService(&pb.X_ServiceDesc, impl)`, Python keyword
+  arguments, and quoted keys in a Node implementation map. Their RPCs stay in `unboundRpcs`.
+
+What did not bind is in the build result: `unresolvedRegistrations` (with the reasons above) and
+`unboundRpcs`. Registrations are read in **Go, Python and Node only**, so an RPC served from Java
+or C# is in `unboundRpcs` too: that list means "not bound", never "not implemented". gRPC client
+calls are not read, so a protobuf RPC has no `consumes_endpoint` edge.
+
+A method that serves an RPC is invoked from outside the code, so — like an HTTP handler — it is a
+reachability root rather than a dead-code candidate. A registration that bound nothing leaves its
+implementation unrooted, so `find_dead_code` names it under `contractRootsNotAssessed`. What is
+said after the fact and withholds nothing — a type imported from outside the repository, an
+`extend` block — is under `notes`, not `notAssessed`.
+
+Registrations are read when the repository is analyzed. Like a specification, they are not
+re-read by the watcher's per-file rebuild, so run `openlore analyze` after changing which type a
+registration names.
+
+### Breaking changes
+
+`certify_service_contract` compares the `.proto` files of two revisions with protobuf rows in the
+same closed rule table. A field's **number** is its identity on the wire, so fields are matched by
+number:
+
+| Change | Class |
+|---|---|
+| A field renamed (same number) | `dangerous` — the binary wire still works; JSON and text formats do not |
+| A field's number, type, or label (singular / repeated / map) changed; moved into or out of a `oneof` | `breaking` |
+| A field removed without reserving its number | `breaking` — a later field can reuse the number with another type |
+| A field removed with its number reserved | `dangerous` |
+| A field added on a number or name the previous revision reserved | `breaking` |
+| A reservation removed | `dangerous` |
+| `optional` added or removed | `dangerous` |
+| Two fields' numbers swapped, or a field moved to another number | `breaking` (`field-number-changed`) |
+| An enum value removed (`breaking`, or `dangerous` when its NUMBER is reserved), renumbered (`breaking`), added (`non-breaking`) | as stated |
+| An enum value renamed, or an alias removed while its number stays | `dangerous` (`enum-value-renamed`) |
+| An enum value newly deprecated | `dangerous` |
+| An RPC removed, its request or response type changed, its streaming changed | `breaking` |
+| An RPC or a field newly deprecated | `dangerous` |
+| A message or enum removed | `breaking` |
+| A field option other than `deprecated` (`json_name`, `packed`, a custom option) | `potentially-breaking` |
+
+Messages and RPCs are matched by full name across files, so moving a message to another file is
+not a change; renaming the package changes every wire name, so everything is removed and added.
+A gRPC finding names no consumer — client call sites are not read — and says so.
+
+## GraphQL
+
+Every `.graphql`, `.graphqls` and `.gql` file is read with a hand-written SDL reader. A file that
+holds only operations and fragments is a **client document**, not a schema: it is listed under
+`skippedCandidates` with that reason. All schema files read are merged into **one schema**, as one
+server sees them — `extend type Query { … }` in another file adds to `Query`; a type two files
+define is ambiguous and binds nothing. A type only ever extended — a Federation 1 subgraph's
+`extend type Query` and `extend type User @key(…)` — is this repository's contract and is compared
+as one. When any file defines `schema { … }`, the roots are exactly the ones it names.
+
+| GraphQL concept | OpenLore graph primitive |
+|---|---|
+| A root field (`order` on the query root) | an operation node `Query.order`, `language: GraphQL` |
+| An object, interface, input, enum, union or scalar type | a node named by the type, `Order` |
+| The types a field, an argument, a union member or an implemented interface names | `references_schema` edges |
+| The function a resolver map names for a root field | an `implements_endpoint` edge, **function → operation** |
+
+Directives other than `@deprecated` are outside the model: each one is named in the projection's
+`notes`, and hashed so a change to one is graded `potentially-breaking`, never "no change".
+
+### Which code resolves an operation
+
+A schema-first server names the function behind each root field in one literal place:
+
+| Runtime | Resolver map | `Query.order` is resolved by |
+|---|---|---|
+| JS/TS (Apollo, Yoga, graphql-tools) | `{ Query: { order: getOrder } }`, `const Query = { order() {…} }` | `getOrder`, or the method itself |
+| Python (Ariadne) | `@query.field("order")` on `def resolve_order`, `query.set_field("order", fn)` | the decorated or named function |
+
+The same refusals as for gRPC apply. A named function binds in the map's own file — a top-level
+function or a method written in the map, never a class method, and never the member of a local
+object (`repo.find`); an IMPORTED one
+binds only in the module it was imported from (by its exported name) — never a same-named function
+elsewhere, and a package or path-alias import binds nothing (`implementation-not-found`). An arrow
+function or lambda is `inline-implementation`; two candidates are `ambiguous-implementation`; a
+spread, or a root set from a variable or a call (`Query: queryResolvers`), is `not-literal`; a key
+the schema does not declare is `unknown-field`. Apollo's `x: { subscribe: fn }` binds `fn`.
+
+Not every `Query: {…}` is a server's. Client configuration is skipped: a file importing a GraphQL
+client (`@apollo/client`, `urql`, Relay…) and no server, and objects inside client constructors
+(`cacheExchange`, `ApolloClient`, `InMemoryCache`) or under client keys (`typePolicies`, `updates`,
+`optimistic`), and permission and middleware maps (`graphql-shield`, `graphql-middleware`). So are TypeScript resolver TYPES (`interface Resolvers { Query: … }`), stories and
+mocks, and a `const Query = {…}` in a file that is not about resolvers. Maps in comments, strings,
+test files and `*.generated.*` files are not read, and neither are schemas under test or fixture
+paths — a fixture's `type Query` would make the real root ambiguous. A root type defined in two
+files is reported as not assessed, which `find_dead_code` repeats.
+
+An import is followed one level through a barrel (`export * from './feature'`, `export { a as b }
+from …`, a Python package's `__init__.py`); when the module is indexed but does not define or
+directly re-export the name, the detail says so. A file that writes its OWN schema inline
+(``typeDefs: `type Query {…}` ``, Ariadne `gql("""…""")`) serves that schema, so its maps are not bound
+to the repository's SDL; neither are files importing a mocking library (`msw`,
+`@graphql-tools/mock`). A schema inside a Relay project's own directory that its config names (`"relay": { "schema": … }`)
+is the compiler's copy of a server's schema, and a file whose types sit beside `@client`
+operations is Apollo local state: `analyze` reads neither as this repository's contract, and lists
+both under `skippedCandidates`. `certify_service_contract` never drops a schema on a config's say-so —
+it grades the file and names the config that named it in its boundaries. One schema per repository means
+a monorepo with several servers' SDL makes their shared roots ambiguous — disclosed, not guessed.
+
+Resolvers of ordinary TYPE fields (`Order: { customer }`, `@order.field("customer")`) are not
+bound: a type field is not a node.
+
+Known boundaries, disclosed where they bite: a schema a frontend vendors for graphql-codegen or
+`apollo.config.js` is graded as this repository's contract — now with a boundary line naming that
+config (see *Schema provenance and discovery exclusions* below); an Ariadne bindable created
+in one module and decorated in another is not followed (its operations stay unbound); a map in a
+directory holding an inline schema is not bound to the repository's SDL; and an operation two maps
+bind keeps both edges, with a note naming it. Code-first servers (Strawberry, Graphene, Nexus,
+gqlgen) have no resolver map, so their operations are listed in `unboundGraphqlOperations` — "not
+bound", never "not served".
+
+### Schema provenance and discovery exclusions
+
+A codegen output or a vendored copy of someone else's contract used to be graded as this
+repository's own, silently. It is now **disclosed, never dropped** — a verdict that drops a schema
+is a gate bypass, and a provenance signal is a guess, so it only annotates.
+
+Each graded schema's `specs` entry carries `provenance` when a rule matched:
+
+| Rule | `matched` | `certainty` |
+|---|---|---|
+| A generator header in the file's bounded head (`# @generated`, `Code generated … DO NOT EDIT.`, `AUTO-GENERATED FILE`, …) | the marker id, e.g. `at-generated` | `declared` |
+| A path pattern: `__generated__/`, `generated/`, `*.generated.*` | that pattern | `path-pattern` |
+| A vendored path: `node_modules/`, `vendor/`, `vendored/`, `third_party/` | that pattern | `path-pattern` |
+
+The marker ids and pattern names are the [generated-file guard](generated-files.md)'s own
+vocabulary; a `path-pattern` guess is never reported as `declared`, and a header is looked for in
+a bounded head of the file, never in a 10 MB schema whole.
+
+A client-toolchain config that names a schema — Relay (`package.json` `"relay"`, `relay.config.*`),
+Apollo (`apollo.config.*`), graphql-config (`graphql.config.*`, `.graphqlrc*`) or GraphQL Code
+Generator (`codegen.*`) — produces one boundary line naming that config and the schema. A config is
+read for **one literal schema path inside its own directory**: a value that climbs out
+(`../schema.graphql`), a URL, an interpolation or a glob is never claimed, because a config in this
+repository must not let OpenLore speak for someone else's schema — or stop speaking about this
+repository's own. On the `analyze` side a Relay copy is still dropped (and listed under
+`skippedCandidates`); `certify_service_contract` drops nothing on any config's say-so.
+
+Discovery excludes `node_modules/`, `vendor/`, `dist/`, `build/` and `.git/` — for **untracked
+files only**. A tracked file is part of the repository by definition, and the blanket rule deleted
+four hand-written Google API protos (`google/devtools/build/v1/build_events.proto` and friends)
+from certify because `build/` appears in their path. `node_modules/` is the one named exception
+applied to tracked files too: a committed dependency tree is genuinely another project's contract.
+Either way the exclusion is named in a `boundaries` line with the count and the first few paths,
+and the same rule runs on the base revision, so an exclusion never reads as an addition or a
+removal.
+
+### Breaking changes
+
+Operations are matched by root **kind** and field name — a client writes `query { order }`, never
+the root type's name, so renaming `Query` to `RootQuery` is not a change. Nullability follows
+variance:
+
+| Change | Class |
+|---|---|
+| An operation or a field removed; an argument removed | `breaking` |
+| An output made nullable (`String!` → `String`), or a type changed | `breaking` |
+| An output made non-null (`String` → `String!`), including inside a list | `non-breaking` |
+| An argument or input field made required, or a required one added | `breaking` |
+| An argument or input field made optional, or an optional one added | `non-breaking` |
+| A non-null argument or input field losing its default (it is now required) | `breaking` |
+| A default value added, changed or removed otherwise (compared canonically: `{a: 1, b: 2}` = `{b: 2, a: 1}`, `1` = `1.0`) | `dangerous` |
+| An enum value or union member added (a client switching over it may not handle it) | `dangerous` |
+| An interface newly implemented | `dangerous` |
+| An enum value or union member removed; an interface no longer implemented | `breaking` |
+| A directive definition removed, a location removed from it, `repeatable` removed, or a required argument added | `breaking` |
+| Deprecation of an operation, field, argument or enum value | `dangerous` |
+| A directive other than `@deprecated` used on an element or on `schema` changed | `potentially-breaking` |
+| A type or root defined in two files (on either side), or roots named differently by two files | `potentially-breaking` — not compared |
+
+A GraphQL finding names no consumer — client operations are not read — and says so.
+
 ## Generated clients
 
 A generated API client builds its URL from a base variable —
@@ -241,6 +510,6 @@ scan cap, or parses with no operation the reader recognizes is named rather than
 
 ## Not read
 
-Per-FIELD nodes (named schemas are projected; individual properties are not); protobuf and
-GraphQL; registry or network fetches; runtime traffic; contract tests; code generation; any
-LLM.
+Per-FIELD nodes (named schemas are projected; individual properties are not); gRPC client calls
+and GraphQL client operations as consumers; code-first GraphQL servers (no SDL); registry or
+network fetches; runtime traffic; contract tests; code generation; any LLM.
