@@ -30,7 +30,7 @@ import { gitPathArgs } from '../../utils/git-args.js';
 import { detectLanguage } from '../analyzer/language-detection.js';
 import { isTestFile } from '../analyzer/test-file.js';
 import { getExceptionParser } from '../analyzer/exception-flow.js';
-import { parseWithBudget, type BudgetableParser } from '../analyzer/parse-budget.js';
+import { parseWithBudget, type BudgetableParser } from '../analyzer/extraction-budget.js';
 import type { SerializedCallGraph } from '../analyzer/call-graph.js';
 import type { ChangedFile } from '../../types/index.js';
 import { emittedText } from './generated-file-guard.js';
@@ -629,7 +629,7 @@ function firstCall(n: Node | null | undefined): string | null {
   return null;
 }
 
-interface Swallow { key: string; fn: string; call: string; line: number }
+interface Swallow { key: string; fn: string; call: string; line: number; body: string }
 
 function swallowedHandlers(language: string, root: Node): Swallow[] {
   const out: Swallow[] = [];
@@ -643,7 +643,10 @@ function swallowedHandlers(language: string, root: Node): Swallow[] {
       if (!onlyLogs(language, consequence)) continue;
       const guarded = n.childForFieldName('initializer') ?? n.previousNamedSibling;
       const call = firstCall(guarded);
-      if (call) out.push({ key: `${enclosingFunction(n)}\0${hash(guarded!.text)}`, fn: enclosingFunction(n), call, line: n.startPosition.row + 1 });
+      if (call) {
+        const body = hash(guarded!.text);
+        out.push({ key: `${enclosingFunction(n)}\0${body}`, fn: enclosingFunction(n), call, line: n.startPosition.row + 1, body });
+      }
       continue;
     }
     const isHandler = n.type === 'catch_clause' || n.type === 'except_clause';
@@ -654,7 +657,8 @@ function swallowedHandlers(language: string, root: Node): Swallow[] {
     const tryBody = tryNode?.childForFieldName('body') ?? tryNode?.namedChildren.find(c => c.type === 'block') ?? null;
     const call = firstCall(tryBody);
     if (!call) continue;
-    out.push({ key: `${enclosingFunction(n)}\0${hash(tryBody!.text)}`, fn: enclosingFunction(n), call, line: n.startPosition.row + 1 });
+    const body = hash(tryBody!.text);
+    out.push({ key: `${enclosingFunction(n)}\0${body}`, fn: enclosingFunction(n), call, line: n.startPosition.row + 1, body });
   }
   return out;
 }
@@ -1097,8 +1101,16 @@ export async function detectWeakeningShapes(
       const curPerFn = new Map<string, number>();
       for (const s of curSwallows) curPerFn.set(s.fn, (curPerFn.get(s.fn) ?? 0) + 1);
       const extra = new Map([...curPerFn].map(([fn, n]) => [fn, n - (perFn.get(fn) ?? 0)]));
+      // The same guarded code already discarded at the baseline, under another function name: a
+      // renamed or moved function, not a new discard. Matched as a multiset over the file, so a
+      // second copy of a once-swallowed body is still reported.
+      const baseBodies = new Map<string, number>();
+      for (const s of baseSwallows) if (!curSwallows.some(c => c.key === s.key)) baseBodies.set(s.body, (baseBodies.get(s.body) ?? 0) + 1);
       for (const s of curSwallows) {
-        if (wrapped.has(s.key) || (extra.get(s.fn) ?? 0) <= 0) continue;
+        if (wrapped.has(s.key)) continue;
+        const moved = baseBodies.get(s.body) ?? 0;
+        if (moved > 0) { baseBodies.set(s.body, moved - 1); continue; }
+        if ((extra.get(s.fn) ?? 0) <= 0) continue;
         extra.set(s.fn, extra.get(s.fn)! - 1);
         fileFindings.push(finding('error-swallowed', 'warning', `${f.path}:${s.line}`,
           `An error from ${quote(s.call)} in ${quote(s.fn)} is now caught and only logged or ignored (${f.path}:${s.line}).`, f.path, s.line, s.key));

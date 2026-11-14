@@ -109,7 +109,7 @@ import {
 } from './literal-reflection.js';
 // Per-file parse budget (change: fix-analyze-native-abort-and-file-cost-budget). Bounds the one
 // synchronous native call nothing else can interrupt.
-import { parseWithBudget as rawParseWithBudget, parseBudgetOverrunMs, type BudgetableParser } from './parse-budget.js';
+import { parseWithBudget as rawParseWithBudget, extractionBudgetOverrunMs, checkExtractionBudget, runWithExtractionBudget, type BudgetableParser } from './extraction-budget.js';
 import { usesTsxGrammar } from './language-detection.js';
 import { extractScriptContainer, SCRIPT_CONTAINER_FORMATS } from './sfc-script-extractor.js';
 // Pass-1 extraction lane (change: optimize-parallel-extraction-pool). The pool holds no
@@ -245,6 +245,9 @@ export function __resetAnalyzerWorkCountersForTests(clearQueries = false): void 
  * A normal analyze leaves this `undefined`, so its facts and its cost are unchanged.
  */
 function contentHashesFor(root: unknown, nodes: FunctionNode[], content: string, language: string): FileContentHashes | undefined {
+  // Cooperative per-file extraction-budget checkpoint at a shared phase boundary — every
+  // language extractor funnels through here (change: bound-large-literal-extraction).
+  checkExtractionBudget();
   if (!contentHashesRequested()) return undefined;
   return computeFileContentHashes(root as HashTreeNode, nodes, content, language);
 }
@@ -256,6 +259,9 @@ function contentHashesFor(root: unknown, nodes: FunctionNode[], content: string,
  * add-codebase-style-fingerprint).
  */
 function tallyStyle(language: string, tree: Parser.Tree, nodes: FunctionNode[], filePath: string): FileStyleRaw | undefined {
+  // Cooperative per-file extraction-budget checkpoint at a shared phase boundary — every
+  // language extractor funnels through here (change: bound-large-literal-extraction).
+  checkExtractionBudget();
   try {
     const raw = tallyFileStyle({
       language,
@@ -293,6 +299,9 @@ function tallyDynamicBoundary(
   nodes: FunctionNode[],
   content: string,
 ): AttributedCandidate[] | undefined {
+  // Cooperative per-file extraction-budget checkpoint at a shared phase boundary — every
+  // language extractor funnels through here (change: bound-large-literal-extraction).
+  checkExtractionBudget();
   if (!root) return undefined;
   try {
     const candidates = matchDynamicBoundaries(
@@ -919,6 +928,9 @@ function materializeCfgByNodeId(
   nodes: FunctionNode[],
   cfgByStart: Map<number, FunctionCfg>,
 ): Map<string, FunctionCfg> {
+  // Cooperative per-file extraction-budget checkpoint at a shared phase boundary — every
+  // language extractor funnels through here (change: bound-large-literal-extraction).
+  checkExtractionBudget();
   const cfg = new Map<string, FunctionCfg>();
   if (cfgByStart.size === 0) return cfg;
   for (const n of nodes) {
@@ -1268,6 +1280,12 @@ const TS_CALL_QUERY = `
                  property: (property_identifier) @call.name)]) @call.node
 `;
 
+/** `new C(...)` with a plain identifier class — `new ns.C()` and `new (f())()` are not bound. */
+const TS_NEW_QUERY = `
+  (new_expression
+    constructor: (identifier) @new.name) @new.node
+`;
+
 async function extractTSGraph(
   filePath: string,
   content: string,
@@ -1431,6 +1449,27 @@ async function extractTSGraph(
       callType,
       ...callArgumentFacts(nodeCapture.node, language),
     });
+  }
+
+  // `new C(...)` is not a call_expression, so before this no constructor ever had a caller: its
+  // callers were invisible to analyze_impact and blast_radius, and it read as dead.
+  const newQuery = nativeQuerySoft(language, lang, TS_NEW_QUERY);
+  if (newQuery) {
+    for (const match of newQuery.matches(tree.rootNode)) {
+      const nameCapture = match.captures.find(c => c.name === 'new.name');
+      const nodeCapture = match.captures.find(c => c.name === 'new.node');
+      if (!nameCapture || !nodeCapture) continue;
+      const caller = findEnclosingFunction(nodes, nodeCapture.node.startIndex);
+      if (!caller) continue;
+      rawEdges.push({
+        callerId: caller.id,
+        calleeName: nameCapture.node.text,
+        line: nodeCapture.node.startPosition.row + 1,
+        callType: 'constructor',
+        newExpression: true,
+        ...callArgumentFacts(nodeCapture.node, language),
+      });
+    }
   }
 
   const style = tallyStyle('TypeScript', tree, nodes, filePath);
@@ -2561,6 +2600,9 @@ function collectClassRelationshipFacts(
   language: string,
   runQuery: (source: string) => TsMatch[],
 ): ClassRelationshipFact[] {
+  // Cooperative per-file extraction-budget checkpoint at a shared phase boundary — every
+  // language extractor funnels through here (change: bound-large-literal-extraction).
+  checkExtractionBudget();
   try {
   const byClass = new Map<string, ClassRelationshipFact>();
   const merge = (className: string, parents: string[] = [], interfaces: string[] = []): void => {
@@ -3734,7 +3776,7 @@ export async function _extractClassRelationshipsLegacyForTesting(
       // Best-effort; skip unparseable files — but a file abandoned at the BUDGET is reported, not
       // swallowed. "We ran out of time on this file" and "the grammar rejected it" call for
       // different actions, and only one of them used to leave any trace.
-      if (parseBudgetOverrunMs((err as Error | undefined)?.message) !== undefined) {
+      if (extractionBudgetOverrunMs((err as Error | undefined)?.message) !== undefined) {
         budgetExceeded?.add(file.path);
       }
     }
@@ -5295,6 +5337,9 @@ function collectPass1DynamicDispatch(
   nodes: FunctionNode[],
   filePath: string,
 ): DynamicDispatchFacts | undefined {
+  // Cooperative per-file extraction-budget checkpoint at a shared phase boundary — every
+  // language extractor funnels through here (change: bound-large-literal-extraction).
+  checkExtractionBudget();
   const events: DynamicDispatchFacts['events'] = [];
   const callbacks: DynamicDispatchFacts['callbacks'] = [];
   const tree = { rootNode } as unknown as Parser.Tree;
@@ -5673,6 +5718,11 @@ export interface CallGraphBuilderOptions {
   /** Schema files deliberately not read (fixtures, a Relay compiler's copy), each with why. */
   contractFilesSkipped?: ReadonlyArray<{ file: string; reason: string }>;
   /**
+   * Project-root directories the walk saw (change: scope-graphql-schema-universes), so GraphQL
+   * schema identity is scoped to a project instead of the whole repository.
+   */
+  projectRoots?: readonly string[];
+  /**
    * The project's declared build-output mapping (change: add-iac-deploy-binding-commands), so a
    * deployed handler naming a built file (`dist/orders.handler`) binds to its source. Absent means
    * no mapping: a built path then binds only if it is itself indexed.
@@ -5699,6 +5749,7 @@ export class CallGraphBuilder {
   private readonly protoFilesOmitted: number;
   private readonly graphqlFilesOmitted: number;
   private readonly contractFilesSkipped: ReadonlyArray<{ file: string; reason: string }>;
+  private readonly projectRoots: readonly string[];
   private readonly buildOutput: import('./iac/build-output.js').BuildOutputMap | undefined;
   private readonly pathAliases: readonly PathAlias[];
 
@@ -5712,6 +5763,7 @@ export class CallGraphBuilder {
     this.protoFilesOmitted = options.protoFilesOmitted ?? 0;
     this.graphqlFilesOmitted = options.graphqlFilesOmitted ?? 0;
     this.contractFilesSkipped = options.contractFilesSkipped ?? [];
+    this.projectRoots = options.projectRoots ?? [];
     this.buildOutput = options.buildOutput;
     this.pathAliases = options.pathAliases ?? [];
     this.resolution = {
@@ -5954,7 +6006,7 @@ export class CallGraphBuilder {
         // never guessed at. A worker fault never reaches here: the pool routes that file to the
         // main thread instead, so this message is always the main thread's own verdict.
         const message = (error as Error | undefined)?.message;
-        const overrunBudgetMs = parseBudgetOverrunMs(message);
+        const overrunBudgetMs = extractionBudgetOverrunMs(message);
         const exclusion: FileExclusionReason = overrunBudgetMs !== undefined
           ? 'budget-exceeded'
           : 'parse-failure';
@@ -6266,6 +6318,20 @@ export class CallGraphBuilder {
       let calleeNode: FunctionNode | undefined;
       let confidence: EdgeConfidence = 'name_only';
 
+      // Strategy 0n — `new C(...)` (TS/JS) binds only to class C's own `constructor`, declared in
+      // the caller's file or in the file the caller imports C from. Anything else — an external
+      // class (`new Map()`), a class with no explicit constructor, an unproven same name elsewhere —
+      // makes no edge at all, exactly as before this site was extracted.
+      if (raw.newExpression) {
+        const ctors = trie.findByQualifiedName(raw.calleeName, 'constructor');
+        const sameFile = ctors.filter(n => n.filePath === callerNode.filePath);
+        const importedFile = callImportMap.get(callerNode.filePath)?.get(raw.calleeName);
+        const imported = importedFile ? ctors.filter(n => matchesImportedTarget(n.filePath, importedFile)) : [];
+        if (sameFile.length === 1) { calleeNode = sameFile[0]; confidence = 'same_file'; }
+        else if (sameFile.length === 0 && imported.length === 1) { calleeNode = imported[0]; confidence = 'import'; }
+        if (!calleeNode) continue;
+      }
+
       // Strategy 1r — CHAINED intra-object receiver: `this.repo.save()` / `self.repo.save()`
       // (change: shrink-receiver-resolution-boundary). Before this change the call query matched
       // no alternative for a nested receiver, so the site produced NO raw edge — not a resolved
@@ -6466,6 +6532,30 @@ export class CallGraphBuilder {
               calleeNode = candidates[0];
               confidence = viaReExport ? 're_export' : 'import';
             }
+          }
+        }
+      }
+
+      // Strategy 3p — Python instantiation `C(...)` of an in-repo class binds to `C.__init__`, on
+      // the same proof as `new C(...)`: declared in the caller's file, or in the file the caller
+      // imports `C` from. Without it the call fell through to an `external::C` leaf, listing the
+      // repository's own class as an external dependency and leaving `__init__` without a caller.
+      if (!calleeNode && !raw.calleeObject && callerNode.language === 'Python') {
+        const inits = trie.findByQualifiedName(raw.calleeName, '__init__');
+        if (inits.length > 0) {
+          const sameFile = inits.filter(n => n.filePath === callerNode.filePath);
+          const importedFile = callImportMap.get(callerNode.filePath)?.get(raw.calleeName);
+          const imported = importedFile ? inits.filter(n => matchesImportedTarget(n.filePath, importedFile)) : [];
+          if (sameFile.length === 1) { calleeNode = sameFile[0]; confidence = 'same_file'; }
+          else if (sameFile.length === 0 && imported.length === 1) { calleeNode = imported[0]; confidence = 'import'; }
+          // An absolute in-project import records no binding (see buildBaseImportMap), which is
+          // why a plain function reached that way binds by its unique name below. A class gets the
+          // same policy — the one in-repo `C.__init__` — unless the file imported `C` from a
+          // module outside the repository, which the source has just contradicted.
+          else if (sameFile.length === 0 && imported.length === 0 && inits.length === 1
+            && !callImportMap.get(callerNode.filePath)?.has(`${EXTERNAL_IMPORT_PREFIX}${raw.calleeName}`)) {
+            calleeNode = inits[0];
+            confidence = 'name_only';
           }
         }
       }
@@ -6776,6 +6866,7 @@ export class CallGraphBuilder {
           protoFilesOmitted: this.protoFilesOmitted,
           graphqlFilesOmitted: this.graphqlFilesOmitted,
           ...(this.contractFilesSkipped.length ? { skippedFiles: this.contractFilesSkipped } : {}),
+          ...(this.projectRoots.length ? { projectRoots: this.projectRoots } : {}),
           importTargets: (() => {
             // Built lazily, once: a repository with no imported handler never indexes its files.
             let resolve: ReturnType<typeof createImportResolver> | undefined;
@@ -7326,6 +7417,15 @@ function assignClassStableIds(classes: ClassNode[]): void {
  * lane cannot drift from the serial one. Returns `undefined` for a language with no extractor.
  */
 export async function dispatchFileExtract(
+  file: { path: string; content: string; language: string },
+): Promise<FileExtractResult | undefined> {
+  // The per-file budget starts HERE, not at the parse: it bounds the file's whole extraction
+  // (change: bound-large-literal-extraction). Both lanes — serial and pooled — reach extraction
+  // through this one function, so neither can escape the bound.
+  return runWithExtractionBudget(() => dispatchFileExtractUnbudgeted(file));
+}
+
+async function dispatchFileExtractUnbudgeted(
   file: { path: string; content: string; language: string },
 ): Promise<FileExtractResult | undefined> {
   const container = (SCRIPT_CONTAINER_FORMATS as readonly string[]).includes(file.language)
