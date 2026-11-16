@@ -17,7 +17,9 @@ import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR } from '../../constants.js';
-import { HOOK_MOMENTS } from './hook.js';
+import { LOOP_MOMENTS } from '../../core/services/hook-session.js';
+import { formatBuildProgress, readBuildProgress, type BuildProgress } from '../../core/services/build-progress.js';
+import { readFindingOutcomes, readHookHealth, type FindingOutcomes, type MomentHealth } from '../../core/services/hook-health.js';
 import { logger } from '../../utils/logger.js';
 import { palette } from '../../utils/colors.js';
 import { readLiveLedger, type LedgerSnapshot } from '../../core/services/session-ledger.js';
@@ -55,6 +57,8 @@ export type KeywordCause = 'no-provider-configured' | 'configured-provider-unrea
 
 export interface IndexStatus {
   indexPresent: boolean;
+  /** An index build or repair running now, from `.openlore/build-progress.json` (change: hook-reliability, group 9). */
+  building?: BuildProgress;
   /** The mode a query would actually be served right now. */
   retrievalMode: RetrievalMode | null;
   /** Set only when the served mode is a keyword one. */
@@ -87,6 +91,10 @@ export interface IndexStatus {
    * Set by `openlore status` only.
    */
   hookMoments?: Array<{ moment: string; wired: boolean; enabled: boolean }>;
+  /** Hook runs of the last 7 days, per moment (change: hook-reliability, task 6.2). Absent when none ran. */
+  hookHealth?: MomentHealth[];
+  /** What happened to the findings the hooks showed (change: hook-reliability, task 7.2). Absent with no hook run. */
+  hookOutcomes?: FindingOutcomes;
   /**
    * The live MCP session's ledger (change: add-session-structural-ledger): raw counts, named
    * background changes and edit loops — or why they are withheld. Set by `openlore status` only.
@@ -100,23 +108,35 @@ export type SessionStatus =
       editOscillation: LedgerSnapshot['editOscillation']; withheld?: string }
   | { withheld: string };
 
-/** The loop moments wired in this repository's Claude Code settings, and the config opt-outs. */
-function collectHookMoments(rootPath: string): Array<{ moment: string; wired: boolean; enabled: boolean }> {
+/**
+ * The loop moments wired in this repository's Claude Code settings, and the config opt-outs. The
+ * prompt-submitted moment (`openlore orient --inject`) is the plain `_openlore` group on
+ * `UserPromptSubmit`; the others carry their moment in `_openloreHook` (change: hook-reliability).
+ */
+export function collectHookMoments(rootPath: string): Array<{ moment: string; wired: boolean; enabled: boolean }> {
   const wired = new Set<string>();
   try {
     const settings = JSON.parse(readFileSync(join(rootPath, '.claude', 'settings.json'), 'utf-8')) as { hooks?: Record<string, unknown> };
-    for (const groups of Object.values(settings?.hooks ?? {})) {
+    for (const [event, groups] of Object.entries(settings?.hooks ?? {})) {
       for (const g of Array.isArray(groups) ? groups : []) {
-        const m = g && typeof g === 'object' ? (g as Record<string, unknown>)._openloreHook : undefined;
+        if (!g || typeof g !== 'object') continue;
+        const m = (g as Record<string, unknown>)._openloreHook;
         if (typeof m === 'string') wired.add(m);
+        else if (event === 'UserPromptSubmit' && (g as Record<string, unknown>)._openlore === true) wired.add('prompt-submitted');
       }
     }
   } catch { /* no settings: nothing wired */ }
-  let off: Record<string, unknown> = {};
+  let cfg: { hooks?: Record<string, unknown>; contextInjection?: { mode?: unknown } } = {};
   try {
-    off = (JSON.parse(readFileSync(join(rootPath, OPENLORE_DIR, 'config.json'), 'utf-8')) as { hooks?: Record<string, unknown> })?.hooks ?? {};
+    cfg = (JSON.parse(readFileSync(join(rootPath, OPENLORE_DIR, 'config.json'), 'utf-8')) as typeof cfg) ?? {};
   } catch { /* unreadable config: every moment on */ }
-  return HOOK_MOMENTS.map(moment => ({ moment, wired: wired.has(moment), enabled: off[moment] !== false }));
+  const off = cfg.hooks ?? {};
+  const injectionOff = cfg.contextInjection?.mode === 'off';
+  return LOOP_MOMENTS.map(moment => ({
+    moment,
+    wired: wired.has(moment),
+    enabled: off[moment] !== false && !(moment === 'prompt-submitted' && injectionOff),
+  }));
 }
 
 function collectSessionStatus(rootPath: string): SessionStatus {
@@ -197,6 +217,26 @@ async function changedSinceIndex(rootPath: string, builtAtMs: number | null): Pr
   return { files, truncated };
 }
 
+/**
+ * One line of hook health: each moment's last run and p95 (whole-process time), then the error and
+ * overrun totals and the findings shown, over the last 7 days.
+ */
+export function formatHookHealth(health: MomentHealth[], now = Date.now(), outcomes?: FindingOutcomes): string {
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+  const moments = health.map(h => `${h.moment} ${formatAge(now - Date.parse(h.lastRun))}, p95 ${secs(h.p95Ms)}`);
+  const errors = health.reduce((n, h) => n + h.errors, 0);
+  const overruns = health.reduce((n, h) => n + h.overruns, 0);
+  const shown = health.reduce((n, h) => n + h.shown, 0);
+  // The outcome counts are per distinct finding, so they say how many were shown as well.
+  const findings = outcomes
+    ? `${outcomes.total} finding(s) shown: ${outcomes.fixed} fixed, ${outcomes.decided} decided, ${outcomes.open} open, ${outcomes.notAssessed} not assessed`
+    : `${shown} finding(s) shown`;
+  // The newest recorded failure, so an error count can be acted on.
+  const last = health.filter(h => h.lastError).sort((a, b) => b.lastError!.t.localeCompare(a.lastError!.t))[0];
+  const lastError = last ? `; last error: ${last.moment} ${formatAge(now - Date.parse(last.lastError!.t))}: ${last.lastError!.reason}` : '';
+  return `${moments.join('; ')} — ${errors} error(s), ${overruns} overrun(s), ${findings} (last 7 days)${lastError}`;
+}
+
 /** Collect the index's self-state without mutating anything. */
 /**
  * "3 minutes ago (2026-11-01 20:30)" for an ISO timestamp, or the raw value when it cannot be
@@ -220,10 +260,12 @@ export async function collectIndexStatus(rootPath: string): Promise<IndexStatus>
   try { config = await readOpenLoreConfig(rootPath); } catch { configUnreadable = true; }
 
   const receipt = await readIndexReceipt(analysisDir);
+  const building = readBuildProgress(rootPath);
   const base = {
     degraded: receipt?.degraded ?? [],
     ...(receipt?.embedFailure ? { embedFailure: receipt.embedFailure } : {}),
     ...(configUnreadable ? { configUnreadable: true as const } : {}),
+    ...(building ? { building } : {}),
   };
 
   if (!VectorIndex.exists(analysisDir)) {
@@ -327,12 +369,14 @@ Read-only: this never builds, rebuilds, or locks the index.
     const governance = index.configUnreadable
       ? undefined
       : await readOpenLoreConfig(rootPath).then(config => collectGovernanceStatus(rootPath, config)).catch(() => undefined);
+    const health = readHookHealth(rootPath);
     const status: IndexStatus = {
       ...index,
       ...(governance ? { governance } : {}),
       wiringScope: await collectWiringScope(rootPath),
       session: collectSessionStatus(rootPath),
       hookMoments: collectHookMoments(rootPath),
+      ...(health.length ? { hookHealth: health, hookOutcomes: await readFindingOutcomes(rootPath) } : {}),
     };
 
     if (options.json) {
@@ -353,6 +397,7 @@ Read-only: this never builds, rebuilds, or locks the index.
     if (moments.length) {
       console.log(`  ${label('Loop hooks')} ${safe(moments.map(m => m.enabled ? m.moment : `${m.moment} (off)`).join(', '))}`);
     }
+    if (status.hookHealth?.length) console.log(`  ${label('Hook health')} ${safe(formatHookHealth(status.hookHealth, Date.now(), status.hookOutcomes))}`);
     const session = status.session;
     if (session && 'pid' in session) {
       // The ledger is a file in the repository: every value is sanitized before it reaches the terminal.
@@ -369,7 +414,12 @@ Read-only: this never builds, rebuilds, or locks the index.
     // to forge OpenLore's own output with terminal control sequences.
     if (!status.indexPresent) {
       console.log(`  ${c.yellow('No search index')} in ${OPENLORE_DIR}/${OPENLORE_ANALYSIS_SUBDIR}`);
-      console.log(`  ${c.dim('→ Run "openlore analyze" to build one')}`);
+      // A first build in flight: say so, not "run analyze" (change: hook-reliability, group 9).
+      if (status.building) {
+        console.log(`  ${label('Index build')} ${safe(`${formatBuildProgress(status.building)}, started ${formatAge(Date.now() - Date.parse(status.building.startedAt))}`)}`);
+      } else {
+        console.log(`  ${c.dim('→ Run "openlore analyze" to build one')}`);
+      }
       if (status.governance) printGovernance(status.governance, c);
       console.log('');
       return;
@@ -390,6 +440,9 @@ Read-only: this never builds, rebuilds, or locks the index.
     // Relative, like every other line in this panel. A raw UTC ISO stamp read as TOMORROW's
     // date for anyone west of UTC in the evening (change: fix-self-inflicted-spec-warning).
     console.log(`  ${label('Index built')} ${status.builtAt ? safe(describeBuiltAt(status.builtAt)) : c.dim('unknown')}`);
+    if (status.building) {
+      console.log(`  ${label('Index build')} ${safe(`${formatBuildProgress(status.building)}, started ${formatAge(Date.now() - Date.parse(status.building.startedAt))}`)}`);
+    }
 
     const staleCount = status.staleFiles.length;
     const staleText = status.staleFilesUnknown

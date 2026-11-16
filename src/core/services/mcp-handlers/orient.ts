@@ -29,6 +29,7 @@ import { isIacLanguage } from '../../analyzer/iac/types.js';
 import { isContractLanguage } from '../../analyzer/contract/types.js';
 import type { RagManifest } from '../../generator/rag-manifest-generator.js';
 import { ARTIFACT_RAG_MANIFEST, ARTIFACT_STYLE_FINGERPRINT, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ORIENT_BUDGET_CANDIDATE_POOL } from '../../../constants.js';
+import { SPEC_SOURCES_LOOKED_FOR } from '../../spec-sources/state.js';
 import { fitPayloadToBudget } from './budget-fit.js';
 import { estimateTokens } from '../llm-service.js';
 import { loadArchitectureRules } from '../../architecture/rules.js';
@@ -48,6 +49,7 @@ import {
   compositeScore,
   buildReason,
 } from './semantic.js';
+import { indexedSpecProvenanceAt, specRootRelOrNull } from './spec-paths.js';
 import { memoryFreshness, decisionAnchors, findUnreconciled, isStaleRegionOnly, type AnchoredItem, type GraphFreshnessView, type UnreconciledGroup } from '../../decisions/anchor.js';
 import { makeFreshnessView } from '../../decisions/anchor-adapter.js';
 import { loadMemoryStore } from '../../decisions/memory-store.js';
@@ -61,9 +63,8 @@ import { getSourceRoots, moduleFromPath } from './epistemic-lease.js';
 import { readHotspotArtifact, hotspotsForModules } from './behavioral-hotspots.js';
 import {
   decisionContentProvenance,
-  indexedSpecContentProvenance,
   readAnalysisContentProvenance,
-  reviewedFileContentProvenance,
+  specCorpusContentProvenance,
   type AnalysisContentProvenance,
   type ServedContentProvenance,
 } from '../served-content.js';
@@ -212,26 +213,15 @@ interface InlineSpec {
 
 /**
  * How many spec domains the corpus holds, for the one question `specDomains: []` cannot answer on
- * its own: is this repository ungoverned, or is the link index simply not built? A local,
- * depth-bounded scan on purpose — no cross-module dependency for a directory probe, and every
- * failure is "no disclosure" rather than a broken orient (change: fix-governance-face-dark).
+ * its own: is this repository ungoverned, or is the link index simply not built? A depth-bounded
+ * scan through the OpenSpec adapter; a folder it cannot read adds nothing, and every other failure
+ * is "no disclosure" rather than a broken orient (change: fix-governance-face-dark).
  */
 async function countSpecDomains(absDir: string, openspecPath?: string): Promise<number> {
   try {
-    const { readdir } = await import('node:fs/promises');
+    const { findNestedSpecFiles } = await import('../../spec-sources/openspec.js');
     const specsDir = join(absDir, openspecPath ?? OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR);
-    const walk = async (dir: string, depth: number): Promise<number> => {
-      if (depth > 3) return 0;
-      let found = 0;
-      for (const entry of await readdir(dir, { withFileTypes: true })) {
-        if (entry.isFile() && entry.name === 'spec.md') found++;
-        else if (entry.isDirectory() && !entry.name.startsWith('.')) {
-          found += await walk(join(dir, entry.name), depth + 1);
-        }
-      }
-      return found;
-    };
-    return await walk(specsDir, 0);
+    return (await findNestedSpecFiles(specsDir, 3)).length;
   } catch {
     return 0;
   }
@@ -248,7 +238,15 @@ export async function handleOrient(
    * Lean mode only: also push triggered and pinned memories (the prompt-hook injection path), so
    * the one briefing an agent gets unasked carries them (change: add-memory-trigger-predicates).
    */
-  opts: { pushMemories?: boolean } = {},
+  opts: {
+    pushMemories?: boolean;
+    /**
+     * Include the repository-wide readability sentence (default true). It qualifies a SEARCH over
+     * the whole index; the prompt hook's exact-anchor briefing makes no absence claim, so it
+     * passes false (change: anchor-gated-prompt-briefing).
+     */
+    repoWideParseHealth?: boolean;
+  } = {},
 ): Promise<unknown> {
   const tooLong = queryTooLongError(task, 'task'); if (tooLong) return tooLong;
   // A JSON `null` budget means no budget, as before.
@@ -262,6 +260,7 @@ export async function handleOrient(
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
   const { embedderMode, resolveEmbedder, servedRetrievalMode, isKeywordRetrievalMode } = await import('../../analyzer/embedder.js');
   const { SpecVectorIndex } = await import('../../analyzer/spec-vector-index.js');
+  const { specRowProse } = await import('../../analyzer/spec-row-text.js');
 
   const hasCodeIndex = VectorIndex.exists(outputDir);
   const hasSpecIndex = SpecVectorIndex.exists(outputDir);
@@ -275,7 +274,7 @@ export async function handleOrient(
 
   const [analysisProvenance, specProvenance] = await Promise.all([
     readAnalysisContentProvenance(absDir),
-    reviewedFileContentProvenance(absDir, 'openspec'),
+    specCorpusContentProvenance(absDir),
   ]);
 
   // Resolve the active embedder (env → local provider → remote config); null is
@@ -406,8 +405,11 @@ export async function handleOrient(
   // "no spec governs this code". Say which it is: an absent index is a missing CACHE, not a
   // finding about the repository (change: fix-governance-face-dark).
   let specLinkage: { state: 'unavailable'; reason: string; remediation: string } | undefined;
+  const specCount = await countSpecDomains(absDir, cfg?.openspecPath);
+  // No spec source at all is a state of the repository, not an empty result: `specDomains: []`
+  // alone would read as "nothing governs this code" (change: spec-framework-neutrality, task 2.1).
+  const specSources = specCount === 0 ? { found: [] as string[], lookedFor: [...SPEC_SOURCES_LOOKED_FOR] } : undefined;
   if (!mappingIdx) {
-    const specCount = await countSpecDomains(absDir, cfg?.openspecPath);
     if (specCount > 0) {
       specLinkage = {
         state: 'unavailable',
@@ -553,6 +555,7 @@ export async function handleOrient(
         limit: 3,
         vocabularyExpansion,
       });
+      const specRootRel = await specRootRelOrNull(absDir);
       matchingSpecs = await Promise.all(specResults.map(async r => ({
         domain: r.record.domain,
         section: r.record.section,
@@ -561,10 +564,11 @@ export async function handleOrient(
         matchEvidence: requireMatchEvidence(r.matchEvidence),
         ...(r.expansionTerms?.length ? { expansionTerms: r.expansionTerms } : {}),
         text: r.record.text.slice(0, 300) + (r.record.text.length > 300 ? '…' : ''),
-        provenance: await indexedSpecContentProvenance(
+        provenance: await indexedSpecProvenanceAt(
           absDir,
-          `openspec/specs/${r.record.domain}/spec.md`,
-          [r.record.title, r.record.text],
+          specRootRel,
+          r.record.domain,
+          [r.record.title, specRowProse(r.record.domain, r.record.title, r.record.text)],
         ),
       })));
     } catch {
@@ -1172,7 +1176,7 @@ export async function handleOrient(
   // `repoWide`: the per-file half of this boundary is scoped to the files orient SURFACED, so it
   // can never fire for the worst case — a file that produced zero symbols never surfaces.
   const parseHealthNote = parseHealthBoundary(parseHealth.report, relevantFiles, {
-    repoWide: true,
+    repoWide: opts.repoWideParseHealth !== false,
     artifactUnreadable: parseHealth.artifactUnreadable,
   });
 
@@ -1269,6 +1273,7 @@ export async function handleOrient(
     ...(behavioralHotspots !== undefined ? { behavioralHotspots } : {}),
     ...(regionStyle !== undefined ? { regionStyle } : {}),
     ...(specLinkage ? { specLinkage } : {}),
+    ...(specSources ? { specSources } : {}),
     ...(contracts !== undefined ? { contracts } : {}),
     ...(infrastructure !== undefined ? { infrastructure } : {}),
     nextSteps,

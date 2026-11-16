@@ -12,6 +12,11 @@
   human in the agent's own final message or PR body. It stays quiet unless something is new and real.
 - **Simple, local, always on.** No new MCP tools, integrations, services, or network calls. No LLM
   in the hot path. No separate UI. Findings are advisory; enforcement stays off by default.
+- **Silent in the background.** OpenLore speaks to the agent only with evidence it can act on. It
+  speaks to the user only when work runs that the user would otherwise wonder about, such as an
+  index build: then the status line shows progress. Otherwise it says nothing.
+- **A utility for agents, not a spec generator.** The plugin carries deterministic evidence tools
+  only, used on demand like a shell tool. Spec generation stays in the npm CLI and MCP presets.
 - **Any spec workflow.** OpenSpec is the first-class format, but no feature may require OpenSpec or
   its CLI. A repo with no spec framework still gets full value from code, tests, and decisions.
 - **Every current user keeps working.** No tool renames, no aliases. The npm CLI, the MCP server and
@@ -20,47 +25,64 @@
 
 ## Build next
 
-**[`ship-claude-code-plugin`](openspec/changes/ship-claude-code-plugin)**, in progress on
-[PR #727](https://github.com/clay-good/OpenLore/pull/727). It comes first because it is the
-one-command install that puts the hooks in front of every Claude Code user. Every P1 item after it
-improves what those hooks deliver.
+**Core accuracy first (owner, 2026-11-15):** fix what makes the evidence agents receive wrong or
+noisy, one PR each, before more P1 work. Next: [`spec-framework-neutrality`](openspec/changes/spec-framework-neutrality)
+group 5 (the remaining `openspec/` sites honor `openspecPath`), then the P0 row below.
+
+Shipped since 3.6.0 for the same reason:
+
+- **Prompt briefing:** names only code the prompt names exactly (#758; replay with
+  `npm run bench:briefing`); "no index" is said only when there is none (#760).
+- **Call graph:** TypeScript grammar gaps no longer leave parse errors (#759); JavaScript is labeled
+  JavaScript (#764); Java and C# field calls use the field's declared type (#765).
+- **Freshness and scope:** the watcher honors `.openlore-ignore` and `excludePatterns` (#766); the
+  hooks, status line and Pi find the project by one rule (#768).
+- **Served text:** OpenAPI enum changes read as values (#767); every MCP tool input has a
+  description (#769); spec text is labeled reviewed only when it is, and spec paths follow
+  `openspecPath` (#771, #773).
+- **Install and CI:** a user-scope install wires the edit-time hooks (#762); CI runs every
+  integration test that can check something there (#770).
+- **Test selection, measured:** `npm run bench:select-tests` replays recent commits and checks
+  whether `select_tests` names the tests each one had to touch (#780, tiers #785). Over 20 commits,
+  recall went from 84% to 98%: dynamic imports, source guards named by path, a function added to a
+  file, imported classes and object literals, and renamed imports (#776, #781–#783). The 22
+  high-confidence files find 79% of them; medium and above finds 94% in 64 files (#786), and
+  `blast_radius` lists every file to run (#775). A rule for tests that run the CLI as a process was
+  measured and dropped: it added files and found nothing new.
+- **Dogfooding `blast_radius`:** an empty ADR `**Domains**:` line no longer names `## Context`
+  (#787); domain-level ADR matches are one line, not one per ADR (#788); the diff itself is not
+  reported as index staleness (#789).
+- **Hook findings and health:** a swallowed error moved across files counts as moved, and its
+  fallback is named (#777); a failed hook run records why (#778).
 
 ## P0: 3.6.0 follow-ups (small fixes, any time)
 
 | Fix | Where | Source |
 |-----|-------|--------|
-| The watcher ignores `.openlore-ignore` and reads ignore rules only at start | `src/core/services/mcp-watcher.ts` | #717 |
-| Three project-root walkers use three different rules | `hook.ts` `openloreRoot`, Pi `piProjectRoot`, statusline `openloreProjectRoot` | #722 / #723 |
-| JS and JSX nodes are labeled TypeScript | `src/core/analyzer/call-graph.ts` | #724 |
-| A Java field of an external type is still fanned out by name | Java resolution in `call-graph.ts` | #724 |
-| OpenAPI enum details render double-escaped | `src/core/services/mcp-handlers/service-contract.ts` | #724 |
-| CI runs 12 of 26 integration test files | `package.json` `test:integration:ci` | #724 |
-| Three `yaml` parses do not pass `YAML_QUIET` | `entry-point-adapters.ts:484,1104`, `contract/openapi.ts:177` | `fix-analyze-console-report-caps` |
-| Two tool input schemas have properties without descriptions; 15 descriptions exceed 800 characters | `explain_retrieval_miss`, `declare_footprint` in `src/cli/commands/mcp.ts` | `mcp-quality` spec |
-| References to removed planning files | `change-status.ts` (`STATUS.md`), `docs/reachability-dead-code.md`, `spec-corpus-lint.test.ts:172` (lists `validator` as removed) | this curation |
-| CHANGELOG: 3.6.0 omits fleet record expiry (#698); `[Unreleased]` says both that `new X()` is and is not a call edge | `CHANGELOG.md` | review |
+| 15 tool descriptions exceed 800 characters (token cost, not accuracy) | `analyze_error_propagation`, `find_clones`, `briefing_since`, … in `src/cli/commands/mcp.ts` | `mcp-quality` spec |
 
 ## P1: the agent-evidence direction (in this order)
 
 | # | Change | Why it helps the agent | Needs |
 |---|--------|------------------------|-------|
-| 1 | [`ship-claude-code-plugin`](openspec/changes/ship-claude-code-plugin) ([PR #727](https://github.com/clay-good/OpenLore/pull/727)) | Hooks and tools arrive with one install and stay current | — |
-| 2 | [`hook-reliability`](openspec/changes/hook-reliability) | Hooks never slow or break a session, and each finding is said once | — |
-| 3 | [`reframe-governance-as-agent-evidence`](openspec/changes/reframe-governance-as-agent-evidence) | One small tool set; governance arrives as quiet findings with proof | its `plugin` preset lands before 1 uses it |
-| 4 | [`spec-framework-neutrality`](openspec/changes/spec-framework-neutrality) | Intent in Spec Kit, Kiro, ADRs, plain requirements, or tests counts, not only OpenSpec | can start any time |
+| 1 | [`ship-claude-code-plugin`](openspec/changes/ship-claude-code-plugin) ([PR #727](https://github.com/clay-good/OpenLore/pull/727), merged; dogfooding, the 3.7.0 pin, and the directory submission remain) | Hooks and tools arrive with one install and stay current | — |
+| 2 | `hook-reliability` (shipped; [archived](openspec/changes/archive/2026-11-15-hook-reliability)) | Hooks never slow or break a session, each finding is said once, and index progress goes to the status line, not the agent | — |
+| 3 | `reframe-governance-as-agent-evidence` (shipped; [archived](openspec/changes/archive/2026-11-15-reframe-governance-as-agent-evidence); task 2.1 not doing) | One small plugin set; governance arrives as quiet findings with proof and one action | — |
+| 4 | [`spec-framework-neutrality`](openspec/changes/spec-framework-neutrality) (groups 1-4 merged: #751, #753, #754, #756, #772; group 5 in progress: #771, #773) | OpenSpec, Spec Kit and BMAD are detected; none is required; "no specs" is an honest state, never a zero | can start any time |
 | 5 | [`curate-product-surface`](openspec/changes/curate-product-surface) | Fewer, current skills and docs, so nothing stale misleads the agent | 1, 3 |
 
 ## P2: next, after P1 ships
 
-Four items get their own change folder only when P1 has shipped. Each names the existing change
-that carries it today.
+Five items get their own change folder only when P1 has shipped. Each names the existing change
+that carries it today, or what it builds on.
 
 | Item (no folder yet) | What it does for the agent | Carried by |
 |------|----------------------------|------------|
 | `stop-hook-speaks-to-agent` | The before-stop receipt reaches the agent, not only the user, and is silent when nothing is new | `add-verification-feedback-loop` |
 | `intent-check-at-stop` | Before stop, the change is checked against the intent it touches: requirements, asserting tests, decisions | `add-test-evidence-claims`, `adopt-spec-link-status-vocabulary` |
 | `test-failure-localization` | A failed test or command points at the line that emitted the error and the changed code that reaches it | `add-log-anchor-conclusions` |
-| `first-session-experience` | The first prompt in a repo gets a short digest and an honest "index is building" line; a plan prompt is oriented | `adopt-agent-context-interop`, `add-openspec-proposal-orientation` |
+| `first-session-experience` | The first prompt in a repo gets a short digest; a plan prompt is oriented. Build progress is `hook-reliability` group 9 | `adopt-agent-context-interop`, `add-openspec-proposal-orientation` |
+| `proven-fact-memory` | Durable facts are kept because a session proved them (a failing test and the change that fixed it, a recorded decision, a reverted change), not only when an agent calls `remember`; each is kept or retired by whether later sessions use it. Today memory is code-anchored and goes stale on its own, but what is remembered depends on an opt-in tool | builds on `remember`/`recall` (memory triggers, claim verdicts, anchor verdicts) and the session ledger |
 
 | Change | Why it helps the agent |
 |--------|------------------------|
@@ -125,6 +147,7 @@ Cut work is deleted, not archived: in OpenSpec, archived means shipped. Restore 
 | `add-merge-semantic-certificate` tasks: retained edges; diff-union build scoping; CLI | New surface or low value for the agent loop | `0dd75dbef` |
 | `add-fleet-coordination-arc` tasks: `carried` state and invalidating commit; live arc execution; CLI; lease test for both | No tool records a verdict yet, so these add surface with no user | `0dd75dbef` |
 | `add-verification-feedback-loop` tasks: `openlore verify-change` CLI; pre-commit gate; their tests | New surfaces; the MCP tool and the before-stop hook already deliver the receipt | `0dd75dbef` |
+| `spec-framework-neutrality` task: Kiro adapter | The owner named OpenSpec, Spec Kit and BMAD; add Kiro when a user asks | `63001d670` |
 
 ## Research notes (removed)
 
@@ -141,6 +164,17 @@ Reports that sat in `openspec/changes/` but were not changes. Restore with
 | `KOTLIN-TOTAL-SUPPORT-2026-10.md`, `PARALLEL-WORK-COORDINATION.md`, `SPEC-STORE-INTEGRATION.md` | `0dd75dbef` |
 
 ## Notes for the owner
+
+Decided 2026-11-14 (owner's answers to the open questions):
+
+| Question | Decision | Where |
+|---|---|---|
+| Plugin tool set (ADR-0037) | `verify_change` stays out of `substrate` (its benchmark is not doing); the `plugin` set is a subset of `substrate` except `verify_change`, with no spec-generation tool | `reframe-governance-as-agent-evidence` design 1 |
+| Spec frameworks | Detect OpenSpec, Spec Kit and BMAD; require none | `spec-framework-neutrality` |
+| No specs found | Spec numbers are `null` with reason `no-spec-source` and a `no spec source found` note, never 0 | `spec-framework-neutrality` design 3 |
+| Index-building message | Progress in the status line and `openlore status`; nothing in the agent's context; one start and one ready line only for users without OpenLore's status line | `hook-reliability` group 9 |
+| Spec skills in the plugin | No; the plugin ships evidence skills only | `curate-product-surface` |
+
 
 - `honour-npmrc-in-update-check` is archived as shipped. One task is manual: check the update
   notifier against a private registry (Nexus) on a machine set up for one.

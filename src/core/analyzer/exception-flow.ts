@@ -32,6 +32,7 @@ import { usesTsxGrammar } from './language-detection.js';
 import { readNamedChildren } from './ast-children.js';
 import { parseWithBudget, type BudgetableParser } from './extraction-budget.js';
 import { RECEIVER_REGISTRY_LANGUAGES } from './receiver-registry.js';
+import { sameNode } from './same-node.js';
 
 /** The languages whose exception flow is statically extractable here. This is the
  *  single authoritative source the language-support registry derives the
@@ -1047,7 +1048,7 @@ export function extractGoErrorFacts(
   const fnBody = fnNode.childForFieldName('body');
   const scopeOf = (node: Node): Node => {
     let current: Node | null = node.parent;
-    while (current && current !== fnNode && current.type !== 'block') current = current.parent;
+    while (current && !sameNode(current, fnNode) && current.type !== 'block') current = current.parent;
     return current?.type === 'block' ? current : (fnBody ?? fnNode);
   };
   const visibleBinding = (name: string, index: number): Binding | undefined =>
@@ -1096,7 +1097,7 @@ export function extractGoErrorFacts(
   if (allRecoveryDefers.length > recoveryDefers.length) boundaries.add('panic recovery inside conditional or nested control flow is not proven unconditional');
 
   const walk = (node: Node, nested: boolean): void => {
-    const isNested = node !== fnNode && (node.type === 'function_declaration' || node.type === 'method_declaration' || node.type === 'func_literal');
+    const isNested = !sameNode(node, fnNode) && (node.type === 'function_declaration' || node.type === 'method_declaration' || node.type === 'func_literal');
     if (nested || isNested) return;
     if (node.type === 'call_expression') {
       const name = callName(node);
@@ -1227,8 +1228,8 @@ export function extractGoErrorFacts(
     const panics = literalPanics(body);
     if (panics.length !== 1) return null;
     let parent = panics[0].parent;
-    while (parent && parent.parent !== body) parent = parent.parent;
-    return parent?.parent === body ? panics[0] : null;
+    while (parent && !sameNode(parent.parent, body)) parent = parent.parent;
+    return sameNode(parent?.parent, body) ? panics[0] : null;
   };
   const panicDefers = topLevelDefers.filter(d => literalBody(d) && literalPanics(literalBody(d)!).length > 0);
   if (panicDefers.length > 0) {
@@ -1287,7 +1288,7 @@ export function extractGoErrorFacts(
   }
   const inspectDeferredAndAsyncLiterals = (node: Node): void => {
     if (node.type === 'defer_statement') {
-      if (!topLevelDefers.includes(node)) {
+      if (!topLevelDefers.some(d => sameNode(d, node))) {
         const body = literalBody(node);
         if (body && literalPanics(body).length > 0) boundaries.add(`panic in conditional or nested defer at line ${node.startPosition.row + 1} is not proven registered`);
       }
@@ -1299,7 +1300,7 @@ export function extractGoErrorFacts(
       if (body && containsCallNamed(body, 'panic')) boundaries.add(`panic in goroutine literal at line ${node.startPosition.row + 1} is asynchronous and does not propagate on the caller stack`);
       return;
     }
-    if (node !== fnNode && (node.type === 'function_declaration' || node.type === 'method_declaration' || node.type === 'func_literal')) return;
+    if (!sameNode(node, fnNode) && (node.type === 'function_declaration' || node.type === 'method_declaration' || node.type === 'func_literal')) return;
     for (const child of node.namedChildren) inspectDeferredAndAsyncLiterals(child);
   };
   inspectDeferredAndAsyncLiterals(fnNode);

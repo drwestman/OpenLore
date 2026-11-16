@@ -5,102 +5,71 @@ All notable changes to OpenLore are documented here. This project adheres to
 
 ## [Unreleased]
 
-### Fixed
+## [3.7.0] - 2026-11-15
 
-- **`orient` and `search_code` stop claiming coverage over content they could not read.** With
-  unparseable files, an oversized contract schema, or an unreadable parse-health record in the
-  repository, both answered `covered` (or a confident empty `uncovered`). The verdict is now
-  `partial`, naming the cause, with the unobstructed verdict kept as `evidenceVerdict`. An index
-  whose artifacts no longer match their published generation is refused, as the graph tools already
-  refuse it. A hit matched only on a file's language marker is weak evidence and says so, and
-  `search --json` reports how many results were returned, matched and clamped.
-- **GraphQL schemas in a monorepo are graded per project.** Type identity was computed across the
-  whole repository, so two projects that each declare `type Query` voided each other and no root
-  operation of either was graded — a required argument added to one project's query went
-  unreported. A schema's identity is now scoped to its nearest enclosing project root (a
-  `package.json` or a GraphQL/Relay config), stated in `boundaries`; a collision inside one project
-  is still not assessed. A duplicate field now withholds only its own type, not the whole document,
-  and a capped `notAssessed` list carries `notAssessedOmitted`.
-- **The refactor report's cycles are real call cycles again.** It read three kinds of edge as
-  calls: the derived `tested_by` edge (production function → test), so each function closed a false
-  cycle with every test that calls it — 474 "cycles" on a 1,500-function Python repository; the
-  `overrides` edge, so every override that calls `super.m()` cycled with its base; and the
-  deliberately over-approximate `cha-name-only` guess, so unrelated same-named methods cycled.
-- **TypeScript/JavaScript `new C(…)` is now a call edge to `C`'s constructor.** It was never
-  extracted, so no constructor had a caller: `analyze_impact` and `blast_radius` could not see who
-  constructs a class, and constructors read as dead. The edge binds only to the class declared in
-  the caller's file or the file it imports `C` from; `new Map()` and classes without an explicit
-  constructor add nothing.
-- **Python `C(…)` of an in-repo class now reaches `C.__init__`.** It fell through to an
-  `external::C` leaf, listing the repository's own class as an external dependency and leaving
-  every `__init__` without a caller (0 of 172 on one sample project; 164 of 172 now). It binds on
-  the same proof as other calls; a class imported from a third-party module is never bound.
-- **A `super.m()` call is no longer fanned out to every same-named method.** In
-  `class HeaderMap extends Map`, `super.get(…)` was wired to each unrelated in-repo `get` (one in a
-  test file). A super call binds to the base class, which the direct resolver already follows.
-- **Renaming a function no longer reports its existing `try/catch` as a newly swallowed error.**
-  The `error-swallowed` check keyed each handler by its enclosing function's name, so the
-  after-edit hook flagged a plain method rename as a weakened check. A handler around code the
-  baseline already discarded, in any function of the file, is now matched first.
-- **`search_code`'s literal-text answers state their coverage.** When no indexed symbol matched —
-  including the few seconds while the watcher re-indexes a function just written — the text-index
-  fallback (and forced `mode: "text"`) returned results with no `coverage` verdict, which the
-  runtime contract check flags, and said the hits came "from markup/text files" when the top hit
-  was a TypeScript source line.
-- **`openlore change-status` no longer crashes on a repository with no open changes.** It failed
-  with a raw `ENOENT` when `openspec/changes/` did not exist — the state `openlore install` leaves.
-- **OpenLore's own `.openlore/` output no longer counts as a source change.** In a repository that
-  does not ignore it, `openlore import` warned "the checkout changed while the bundle was being
-  imported" on an untouched clone, and a first analysis recorded its own tree as dirty.
-- **`find_dead_code` no longer rates a package's entry point high-confidence dead** when that
-  package's `package.json` was never read (it is neither the root's nor a declared workspace
-  member's — a VS Code extension or web app inside a Python repository). Such a candidate is capped
-  at low with the manifest named, and `verify_claim` `dead` answers `unverifiable` instead of
-  `confirmed`.
-- **`find_dead_code` no longer rates Go, Rust, C# and other code high-confidence dead on a signal it
-  never collected.** "Not imported by name from any other file" comes from the dependency graph,
-  which extracts imports only for TypeScript, JavaScript, Python, Java and Kotlin. In a Rust
-  workspace 617 public functions were rated `high`, including a serde `default = "…"` callback.
-  Candidates in other languages now stop at `medium` and say why.
-- **`find_dead_code` no longer rates a function called from module scope high-confidence dead.**
-  Top-level code has no call-graph node, so `if (!arg) die("usage")` or `start().catch(…)` made no
-  edge and `die` / `start` read as uncalled. A candidate its own file names outside every indexed
-  function is now capped at `low`, with the line. On OpenLore's own index the high tier fell from 16
-  to 9.
-- **`find_dead_code` no longer rates closures, visitor methods or used constructors high-confidence
-  dead.** A function defined inside a live function is a value it hands out (a callback, a returned
-  visitor's `enter`/`leave`) whose caller is outside the graph; a constructor of a class with live
-  members has run, though `new X()` is not a call edge. Both are capped at `low` with the reason.
-- **Every symbol-taking tool accepts a qualified symbol.** `EdgeStore.open` — the form the
-  generated `CODEBASE.md` prints for a hub — was answered "not found" by `get_subgraph`,
-  `analyze_impact`, `trace_execution_path`, `find_path`, `get_minimal_context`, `get_cluster` and
-  `locate_symbol_span`; `find_clones` and `analyze_error_propagation` resolved an external leaf
-  carrying the dotted call text and called the method uncomparable / unsupported; and a bare `open`
-  matched every `open` in the repository. `Class.method`,
-  `name::path`, `Class.method::path` and node ids now resolve; a plain or dotted name that is not a
-  `Class.method` keeps the existing lookup.
-- **`locate_symbol_span` serves `/`-separated paths on Windows.** Its `file` and `name::path`
-  were built with `path.relative`, so a Windows agent got `src\store.ts` beside node ids of
-  `src/store.ts`, and a symbol id no other tool would accept back.
-- **`verify_claim` can verify a symbol whose name is shared.** An ambiguous subject was answered
-  "Disambiguate before verifying", but no form was accepted — not `name::path` (which every other
-  symbol-taking tool accepts), `Class.method`, or the node id. All three now resolve, and the
-  ambiguity reason names the candidates in that form.
-- **A fresh `openlore install` no longer leaves its own index stale.** The decision-trail step
-  appended guidance to `CLAUDE.md` / `AGENTS.md` after the index was built, and both files are part
-  of the analyzed corpus, so the very next run re-analyzed an unchanged repository. The gate is now
-  wired between `init` and `analyze`.
-- **`detect_changes` and `search_specs` stopped sending agents to re-run `analyze` for nothing.**
-  `detect_changes` said "Re-run analyze_codebase" when the diff touched only non-code files, and
-  `search_specs` said "Run openlore analyze first" on a repository with no specs, which `analyze`
-  cannot fix. Both now say what is actually the case.
+OpenLore now ships as a Claude Code plugin, and most of this release makes its answers to agents
+more accurate. Test selection finds more of the tests a change breaks, `blast_radius` reports less
+noise, and the prompt hook only speaks when you name code. Your existing configuration keeps
+working as it is.
 
-### Docs
+### Highlights
 
-- **The roadmap names one direction and one next step.** `ROADMAP.md` now plans OpenLore as
-  evidence delivered to the agent through hooks (ADR-0036, superseding ADR-0035), names the Claude
-  Code plugin as the next build, and lists cut work with the commit to restore it from. Shipped
-  changes are archived, and the main specs state only what the code does today.
+- **Claude Code plugin.** Run `claude plugin marketplace add clay-good/OpenLore`, then
+  `claude plugin install openlore@openlore`. It sets up the MCP server and the hooks with no global
+  npm install and no config. (#727)
+- **Better test selection.** `select_tests` now finds tests that load their module with a dynamic
+  import, guard tests that read a source file by its path, tests for a function you just added, and
+  tests that import a class or an object. Replayed over the last 20 commits, it found 98% of the
+  tests each change had to edit, up from 84%. The high-confidence part alone, about 22 files on
+  average, found 79%. (#776, #781, #782, #783, #786)
+- **`blast_radius` lists every test file to run**, not only the first 15 tests. (#775)
+- **`npm run bench:select-tests`** replays recent commits and reports how well test selection did,
+  per confidence tier. (#780, #785)
+- **The prompt hook only briefs code you name exactly**: a backticked name, a file path, or an
+  identifier. A prose prompt gets no briefing. (#758, #760)
+- **`openlore install --scope user` also sets up the edit and stop hooks**, and they only run in
+  projects that use OpenLore. (#762)
+- **Spec frameworks are optional.** A repository without specs gets a plain "no spec source" answer
+  instead of an error or a 0% score. `openspecPath` is optional, and `adrPaths` is a new setting.
+  (#751, #753, #754, #756)
+- **Per-lane file rules** (`filePolicies`) can keep a path out of indexing, watching or embeddings
+  separately, with a guided `openlore configure` workflow. (#720)
+- **The before-stop receipt names breaking changes** to exported functions and to OpenAPI,
+  protobuf and GraphQL contracts. (#749)
+
+### Behavior changes
+
+- `openlore init` and `openlore install` no longer create an empty `openspec/` folder, and the
+  `.gitignore` entry is just `.openlore/`. (#751)
+- Corpus-integrity findings are advisory by default. To keep them blocking, list them in
+  `enforcement.policy` in `.openlore/config.json`. (#747)
+- Hook time limits are shorter and measured: before-edit stops after 3 s (was 8 s). Each finding
+  is shown once per session, and hooks stay silent when something inside them fails. (#733, #736–#743)
+- `openlore doctor --json` calls the spec check `Spec source` (was `OpenSpec directory`). (#753)
+
+### Fixes
+
+- `blast_radius`: an empty `**Domains**:` line in an ADR is no longer read as a domain named
+  `## Context` (#787). ADRs that only mention a touched area are summarized in one line (#788). The
+  change you are checking is no longer reported as a stale index (#789).
+- Spec text is labeled reviewed only when it is, and spec paths follow `openspecPath`. (#771, #773)
+- The file watcher honors `.openlore-ignore` and `excludePatterns`, and picks up edits to ignore
+  files. (#766)
+- The hooks, the status line and Pi use one rule to find the project root. (#768, #723)
+- Call graph: JavaScript files are labeled JavaScript (#764); Java and C# calls through a field use
+  the field's type (#765); TypeScript files with `import()` types or `using` parse cleanly (#759);
+  `new C()` and Python `C()` reach the constructor, and `super.m()` is no longer matched to every
+  method named `m` (#724).
+- OpenAPI enum changes show their values instead of escaped JSON. (#767)
+- Every MCP tool input has a description. (#769)
+- Hooks: a failed run records why (#778), and a `try/catch` moved to another file is no longer
+  reported as a new swallowed error (#777).
+- `find_dead_code` no longer rates package entry points, functions called from module scope,
+  closures, or code in languages without import data as certainly dead. (#724)
+- `orient` and `search_code` no longer claim coverage over content they could not read. (#725)
+- GraphQL schemas in a monorepo are graded per project. (#726)
+- `openlore change-status` no longer fails in a repository with no open changes, and a fresh
+  install no longer leaves its own index stale. (#724)
 
 ## [3.6.0] - 2026-11-09
 
@@ -166,6 +135,9 @@ existing or opt-in presets; the default tool surface and your configuration are 
   symbols, with hazard-typed conflicts and duplicate-intent detection; **peer-change notices** fire
   when another agent touches what you read; and `plan_parallel_work` can plan against the live agents
   on the board. (#641, #646, #647, #648)
+- **Verification records expire on the same evidence as board entries:** a merged or deleted branch,
+  a removed worktree, or 30 minutes without being re-proven; `fleet_status` reports an ended record
+  as a count with its reason, never as a live verdict. (#698)
 
 ### Onboarding and the background
 

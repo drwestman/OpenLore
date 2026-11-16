@@ -78,6 +78,24 @@ If `statusLine` is already set, install keeps it and prints a hint instead; call
 the OpenLore status line, and uninstall removes only that one (identified by
 `--installed-by-openlore`).
 
+**While an index builds,** the status line shows its progress instead, for example
+`OpenLore: indexing 45% (1,310/2,900 files)`, then the phase name (`indexing: linking`,
+`indexing: writing the index`). `openlore status` shows the same line with its start time. When no
+build runs, nothing extra is shown. The agent is told nothing about a build: answers served during
+one already say they are partial. The progress record is `.openlore/build-progress.json`, written
+at most once a second and removed when the build ends; one whose process is gone, or that has not
+moved for 2 minutes, is ignored.
+
+**With the Claude Code plugin,** OpenLore cannot set your status line (plugins have no way to). To
+see build progress, wire it yourself in `~/.claude/settings.json`:
+
+```json
+{ "statusLine": { "type": "command", "command": "openlore statusline" } }
+```
+
+This needs the `openlore` CLI on your `PATH` (`npm install -g openlore`). Without it, a plugin user
+sees no progress; the briefings start once the build finishes.
+
 Claude Code documents custom shell-command status lines and ANSI color output in its
 [status-line guide](https://code.claude.com/docs/en/statusline). Codex CLI's
 [`/statusline` command](https://learn.chatgpt.com/docs/developer-commands#configure-footer-items-with-statusline)
@@ -117,7 +135,7 @@ The happy path needs no flags and never touches your repo on `npm install`:
 | Flag | Effect |
 |------|--------|
 | `--agent <name>` | Install only for one surface. Names: `claude-code`, `cursor`, `cline`, `continue`, `pi`, `agents-md`. |
-| `--preset <name>` | Wire the MCP server to a tool preset: `substrate` (the default — the navigation core, governance reads `recall` + `verify_claim` + `blast_radius`, and `prepare_spec_generation` + `prepare_spec_repair`; the write face `remember`/`record_decision` stays opt-in), `navigation` (the lean navigate-only escape), `minimal`, `memory`, `verify`, `federation`, `coordination`, or `full`. Omit it for the `substrate` default; pass `--preset navigation` for the lean core, or `--preset full` to wire all 83 tools. |
+| `--preset <name>` | Wire the MCP server to a tool preset: `substrate` (the default — the navigation core, governance reads `recall` + `verify_claim` + `blast_radius`, and `prepare_spec_generation` + `prepare_spec_repair`; the write face `remember`/`record_decision` stays opt-in), `navigation` (the lean navigate-only escape), `minimal`, `memory`, `verify`, `federation`, `coordination`, `plugin` (the Claude Code plugin's evidence set, with `verify_change`), or `full`. Every tool keeps its name and stays available through `--preset full` and Pi. Omit it for the `substrate` default; pass `--preset navigation` for the lean core, or `--preset full` to wire all 84 tools. |
 | `--repo-only` | Wire this repository only — write no user-scope entries. |
 | `--runtime <name>` | Runtime the hook and MCP commands launch OpenLore with: `node` or `bun`. Also read from `OPENLORE_RUNTIME`. Without it the commands use the runtime that ran the install — which is **node even for a bun-installed `openlore`**, because its CLI starts with `#!/usr/bin/env node`. Fails if the named runtime is not on `PATH` (bun is also looked up in `$BUN_INSTALL/bin`, then `~/.bun/bin`). |
 | `--dry-run` | Print the planned changes; write nothing. Previews show only the changed hunks, in a bounded context window, with secrets redacted — an untouched key in your private configuration is never printed. |
@@ -127,7 +145,7 @@ The happy path needs no flags and never touches your repo on `npm install`:
 > **Default tool surface.** A plain `openlore install` wires the read-only **`substrate`** preset:
 > 15 tools comprising the navigation core, the highest-value governance reads, and the 2 spec
 > preparation composites. Use `--preset navigation` for the lean 10-tool escape or `--preset full`
-> for all 83 tools. The decision-write and commit-gate tools remain opt-in through a preset that
+> for all 84 tools. The decision-write and commit-gate tools remain opt-in through a preset that
 > includes them.
 
 ## What it actually writes
@@ -264,9 +282,9 @@ keeps working exactly as written and still reaches every OpenLore block:
 | Blast-radius guard | `openlore blast-radius --install-hook` | the diff triggers a configured `blastRadius.block` pattern |
 | Change-impact certificate | `openlore impact-certificate --install-hook` | the diff opens a new path into a `impactCertificate.block` surface severity |
 
-`openlore enforce` is the recommended single gate: it resolves every governance finding through one
-`enforcement.policy`, and the per-surface `blastRadius.block` / `impactCertificate.block` configs lower
-onto it. All hooks are advisory by default — nothing blocks until you opt a finding into `blocking`.
+`openlore enforce` is the recommended single gate: it resolves every governance finding through the
+one policy linked in the table, and the per-surface `blastRadius.block` / `impactCertificate.block`
+configs lower onto it. All hooks are advisory by default — nothing blocks until you opt a finding into `blocking`.
 Use `claude` or `codex` instead of `all` to install only one agent host; use `none` to remove
 OpenLore's entries from both without changing user-authored hooks.
 See [cli-reference.md](cli-reference.md#enforcement-gate).
@@ -287,15 +305,18 @@ The injected block:
   never dominate the context it economizes;
 - is **clearly attributed to OpenLore** and opens with a one-line "informational; act on it or
   ignore it" framing — facts, not instructions;
-- is **gated**: exact identifier mentions, matched-function count, fan-in / hub centrality, and
-  retrieval-mode evidence decide whether the task warrants a full block; below the threshold it
-  degrades to a single pointer line, so injection stays out of the small/familiar arena it would
-  otherwise tax. Without embeddings, the default keyword/BM25 path uses scale-free top-match
-  identifier overlap and never compares the corpus-relative BM25 score to a fixed threshold. Run
-  `openlore embed --local` — a one-command, on-device, no-API-key upgrade — or set `EMBED_*` for a
-  remote endpoint to add the bounded semantic-score path.
-- **never breaks your turn**: any failure (no graph, parse error, empty/weak match) degrades to the
-  pointer line and exits 0.
+- is given **only for code the prompt names**: a `backticked` name, a file path, or an
+  identifier-shaped word (camelCase, two-hump PascalCase, snake_case, CONSTANT_CASE,
+  `Class.method(`). Prose is never searched, and text you paste (`<pasted_content>`) does not count.
+  The block shows only what those names match **exactly** in the index, with callers; search
+  neighbours are left out. A fixture or example file is shown only when you name its path, and a
+  name defined in more than two files is ambiguous and skipped. Measured on 68 real prompts from
+  this repository: 2 briefings, both naming a file the agent then worked on (the earlier
+  keyword gate gave 25, with 4% of named files relevant).
+- is **silent otherwise**: the first withheld prompt of a session gets one line saying that
+  briefings come only for code the prompt names exactly; later ones get nothing. A missing index is
+  stated once per session.
+- **never breaks your turn**: a failure prints nothing and exits 0.
 
 ### Per-adapter support
 
@@ -313,22 +334,27 @@ Task-scoped injection is on by default. To disable it (while leaving the MCP ser
 {
   "contextInjection": {
     "mode": "off",            // "task-scoped" (default) | "off"
-    "tokenBudget": 600,        // hard cap in estimated tokens; positive values below 68 clamp to 68
-    "relevanceMinMatches": 2,  // gate: minimum match count unless an identifier is exact
-    "relevanceMinFanIn": 2,    // gate: centrality; exact/ranked identifier evidence also clears it
-    "relevanceMinScore": 0.3   // gate: minimum top score (semantic/hybrid scale only)
+    "tokenBudget": 600         // hard cap in estimated tokens; positive values below 68 clamp to 68
   }
 }
 ```
 
-With `mode: "off"`, `openlore orient --inject` emits nothing and exits 0.
+With `mode: "off"`, `openlore orient --inject` emits nothing and exits 0. To turn off only this
+hook moment, set `"hooks": { "prompt-submitted": false }` instead: the command then does nothing at
+all (no lookup, no index build) and exits 0.
+
+If the lookup fails, or the moment passes its 3 s time limit, the hook prints nothing and exits 0:
+the agent is told nothing about OpenLore's own trouble. A withheld briefing (no named code, a
+management turn, an empty prompt) prints nothing, apart from the once-per-session line above.
 
 ### Performance and activation notes
 
 - **It runs on every prompt and blocks the turn until it returns**, so it is built to be fast: `orient`
-  is a local, deterministic lookup (~300 ms for the work itself; the `npx` wrapper that resolves the
-  package adds ~200 ms). That is well under Claude Code's 30 s `UserPromptSubmit` timeout. On a weak
-  match it short-circuits to the one-line pointer, so the slow path is the rare strong-match case.
+  is a local, deterministic lookup. Measured on this repository (about 5,400 functions): about 0.1 s
+  for the work itself and about 1 s for the whole process (`npm run bench:hooks`). Its time limit is
+  3 s, timed from when the command has loaded; past it the hook prints nothing. That is well under
+  Claude Code's 30 s `UserPromptSubmit` timeout. On a weak match it short-circuits to the one-line
+  pointer, so the slow path is the rare strong-match case.
 - **Activation tracks the installed version.** The wired command is `npx --yes openlore orient
   --inject`, which resolves the `openlore` your environment already has. If that is an older published
   version without `--inject`, the hook is a clean no-op (it prints nothing to stdout, writes a short
@@ -346,10 +372,28 @@ event's `additionalContext` — or nothing, when there is nothing new.
 |--------|-------------------|------------------------|
 | `before-edit` | `PreToolUse` on `Edit\|Write\|MultiEdit\|NotebookEdit` | the target is a generated file (its source and regenerate command), vendored code, or a lockfile; an import or symbol the pending `Write`/`Edit`/`MultiEdit` text would add that does not resolve ([phantom references](phantom-references.md), graded in memory before the write) |
 | `after-tools` | `PostToolUse`, same tools and `Bash`; `PostToolUseFailure` on `Bash` (a failing command) | a shell command is counted, and a test run is recorded (below); an edit is recorded for the [session ledger](session-ledger.md), which can then name background changes; new ledger facts; for the edited file: [check weakening](check-weakening.md), [phantom references](phantom-references.md), and [generated files](generated-files.md); a live peer on the [board](mcp-tools.md) that changed a symbol this worktree declared reading (`declare_footprint` `readSet`) or that `orient`/`recall` served here in the last 30 minutes |
-| `before-stop` | `Stop` | the `verify_change` receipt for the session's diff, plus the symbols edited after the last test run and the tests that reach them, shown to **you** (a `systemMessage`): context for the agent at `Stop` would make it keep working |
+| `before-stop` | `Stop` | the `verify_change` receipt for the session's diff, the certificates below, and the symbols edited after the last test run with the tests that reach them, shown to **you** (a `systemMessage`): context for the agent at `Stop` would make it keep working |
 | `after-compact` | `SessionStart` (matcher `compact`) | the [handoff briefing](mcp-tools.md) of the in-flight change, so the agent resumes from computed state, not only the compaction summary (stated after every compaction) |
 | `before-subagent` | `PreToolUse` on `Agent\|Task` | nothing: it queues the sub-agent's task (credentials redacted, kept in `.openlore/session-ledger/` for at most 2 minutes), because `SubagentStart` does not carry it; nothing is stored when `subagent-start` or `contextInjection` is off |
 | `subagent-start` | `SubagentStart` | the sub-agent itself gets the task-scoped `orient` briefing for its own task, when that task is the only one queued for its session and agent type (two parallel calls of one type, or a sub-agent no `Agent` call started, get no task briefing rather than a wrong one), and the live peers of other worktrees on the board (`declare_footprint`) |
+
+**Every finding has proof and one action.** A line from `before-edit`, `after-tools` or
+`before-stop` names its proof (the file and the cited line, or the receipt that found it) and one
+action, printed as labeled data: `fix` (the repair is in the agent's own diff), `decide` (a
+trade-off the agent may take and record with `openlore decisions record`), or `raise` (only a person
+can accept it). A finding with no proof is not printed. A note about what was not observed (no
+shell command reached the hook, so test runs are not stated) carries no action.
+
+**Certificates at stop.** `before-stop` also runs three certificates beside `verify_change`, each
+only when the session's diff can give it something to find, each with its own 10 s limit and at
+most 3 lines. One that fails or runs out of time prints nothing. A symbol `verify_change` already
+names is not repeated.
+
+| Certificate | Runs when the diff | States |
+|---|---|---|
+| `certify_public_surface` | touches a `.ts`, `.tsx`, `.js`, `.jsx` or `.py` file | each exported symbol it breaks, and the files that use it (`decide`) |
+| `certify_service_contract` | touches an OpenAPI, protobuf or GraphQL file | each breaking or dangerous contract change, and its in-repository call sites (`decide`) |
+| `change_impact_certificate` | — and `impactCertificate.surfaces` is set in `.openlore/config.json` | each path the change newly opens into a declared surface, never persisted (`raise`) |
 
 **Codex.** A repository install also writes four of these moments into `.codex/hooks.json` (Codex's
 hooks follow the same protocol): `before-edit` on `PreToolUse` and `after-tools` on `PostToolUse`
@@ -373,19 +417,55 @@ or before-stop moment, so test runs recorded there are not yet stated at stop.
 
 - **This session's changes.** Facts compare with the commit `HEAD` was at when the session's first
   hook ran, so work committed earlier is not raised again in every session.
-- **Once each.** A fact is stated once per Claude Code session (keyed by the payload's
-  `session_id`; without one, nothing is deduplicated). A fact cut by the size budget is stated on a
-  later call.
+- **Once each.** A finding is stated once per Claude Code session (keyed by the payload's
+  `session_id`; without one, nothing is deduplicated), and is printed with its id, such as
+  `[f:1a2b3c4d]`. Its identity is its code, its subject, and its proof: the text of the line it
+  cites, without the line number, so lines added above it do not repeat it, while a change to that
+  line does. The `before-stop` receipt is yours, not the agent's, so it lists each finding once
+  more, for you. A fact cut by the size budget is stated on a later call. The prompt-submitted
+  moment states its no-index line and its build note once per session too.
 - **Found from a subdirectory.** The hook uses the nearest directory at or above the session's
-  working directory that has `.openlore/`.
+  working directory whose `.openlore/` holds a `config.json` or an `analysis/`. The walk stops at
+  the repository's top (`.git`) and at the home directory. The status line and the Pi extension
+  use the same rule, so they report the project the hooks serve.
 - **Bounded.** Each receipt has a size budget (the most severe facts first, the rest counted) and a
-  time limit (8 s, 15 s, 50 s, 30 s, 5 s, 10 s); past it the hook prints nothing.
-- **Advisory.** Hooks exit 0 and never block, with one exception: when your
-  [`enforcement.policy`](configuration.md#enforcement-policy) makes a finding code `blocking`, the
-  `before-stop` hook blocks the stop and lists those findings for the agent. It does not block twice
+  time limit, timed from when the command has loaded: 3 s for the prompt moment, then 3 s, 6 s,
+  20 s, 30 s, 5 s, and 10 s for the moments in the table above; past it the hook prints nothing.
+  The limits come from measurement (`npm run bench:hooks`); `npm run test:budgets` fails when a
+  moment's measured p95 passes its budget.
+- **Upgrade, move, and uninstall.** Each hook command checks that its runtime exists first:
+  `[ -f '<entry>' ] && [ -f '<node>' ] || exit 0; '<node>' '<entry>' hook <moment>` (the `npx` form
+  checks `command -v npx`). So a moved or removed install makes the hooks skip themselves instead of
+  failing on every event; run `openlore install` again to re-wire them. This needs a POSIX shell,
+  which Claude Code uses (Git Bash on Windows). The Codex hooks are not guarded. Re-running
+  `openlore install` after an upgrade leaves one group per hook and removes any group for a moment
+  the new version no longer has; uninstall removes those too and leaves your own hooks unchanged.
+  Uninstall keeps `.openlore/` and any skills `openlore setup` copied (they may be edited), and
+  names each with the command to remove it. `openlore doctor` warns about a hook whose runtime is
+  gone, and about an event that runs two different OpenLore commands for the same step (a second
+  checkout, or a group an older install wrote without its marker).
+- **Health, for you.** Each run that reaches the hook is recorded in
+  `.openlore/session-ledger/hook-runs.jsonl` (moment, whole-process time, outcome, findings shown,
+  and for an error what failed, as one line; local only, never sent, never shown to the agent).
+  `openlore status` prints one `Hook health` line for the last 7 days: each moment's last run and
+  p95, the errors and overruns, the most recent error's reason, and the findings shown, counted as
+  fixed, decided, open, or not assessed (`hookHealth` and `hookOutcomes` in `--json`; the rules are in
+  [session ledger](session-ledger.md#hook-runs-and-finding-outcomes)). With no run recorded, the line is absent. A run that never reached the hook (the CLI
+  failed to load) is not counted.
+- **Silent on failure.** A check that throws or does not load, a passed time limit, a missing,
+  corrupt, or read-only `.openlore/`, a missing or unusable index, and an unreadable payload all end
+  the same way: exit 0, nothing printed. The prompt-submitted moment (`openlore orient --inject`,
+  [above](#task-scoped-context-injection)) follows the same rule, with its own off switch,
+  `hooks.prompt-submitted`.
+- **Advisory.** Hooks exit 0 and never block, with one exception: when your enforcement policy
+  (see [pre-commit hooks](#pre-commit-hooks)) makes a finding code `blocking`, the `before-stop`
+  hook blocks the stop and lists those findings for the agent. It does not block twice
   in a row.
-- **Repository scope only.** The moments run on every edit, so a user-scope install does not wire
-  them (they would run in every repository). Run `openlore install` in the repository to get them.
+- **User scope too.** `openlore install --scope user` wires the moments for every repository and
+  worktree. Each command first checks for `.openlore/` in the project and exits before Node starts
+  when there is none, so a repository that does not use OpenLore pays nothing. Where a repository
+  wires a moment itself (`.claude/settings.json` or `settings.local.json`), the user-scope command
+  stands down, so each event gets one receipt; `openlore doctor` does not call that pair a duplicate.
 - **Edits after the last test run.** A shell command that is a test run — a runner in command
   position from a closed list (`vitest`, `jest`, `pytest`, `go test`, `cargo test`, `npm test`,
   `make test`, …) or a test script the repository declares in `package.json` (`test`, `test:*`,

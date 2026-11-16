@@ -191,6 +191,8 @@ const ALLOWED_RAW_INTERPOLATIONS: Record<string, readonly string[]> = {
     "label('Wiring scope')",
     "label('Session ledger')",
     "label('Loop hooks')",
+    "label('Hook health')",
+    "label('Index build')",
     // A fixed WiringScope literal, never repository text.
     'wiringText',
     "label('Retrieval mode')",
@@ -447,6 +449,8 @@ const ALLOWED_RAW_INTERPOLATIONS: Record<string, readonly string[]> = {
   'cli/commands/test.ts': [
     'bar.padStart(6)',
     'drift',
+    // A fixed string built from the SPEC_SOURCES_LOOKED_FOR constants; no repository text.
+    'noSpecSourceText()',
     'pct.padEnd(8)',
     'report.coveragePercent',
     'report.discoveredScenarios',

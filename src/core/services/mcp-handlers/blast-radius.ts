@@ -78,7 +78,7 @@ import {
 import type { ConfidenceBoundary } from './confidence-boundary.js';
 import type { SerializedCallGraph } from '../../analyzer/call-graph.js';
 import type { DriftIssue, DriftResult } from '../../../types/index.js';
-import { reviewedFileContentProvenance, type ServedContentProvenance } from '../served-content.js';
+import { specCorpusContentProvenance, type ServedContentProvenance } from '../served-content.js';
 import { withIndexStaleness } from './index-staleness.js';
 
 /** How many of the highest-fan-in changed symbols to run impact analysis on.
@@ -86,6 +86,8 @@ import { withIndexStaleness } from './index-staleness.js';
  * bounding the work keeps a pre-commit hook fast. Truncation is reported, never
  * silent (mcp-quality: no-silent-truncation). */
 const DEFAULT_MAX_SYMBOLS = 12;
+/** Test files listed in `tests.files`; more are counted in `capped`, never dropped silently. */
+const MAX_TEST_FILES = 200;
 
 export interface BlastRadiusInput {
   directory: string;
@@ -181,6 +183,11 @@ export interface BlastRadiusBriefing {
   tests: {
     count: number;
     toRun: Array<{ test: string; file: string; confidence: string }>;
+    /**
+     * Every test file the selection names, most confident first: what to pass to the test runner.
+     * `toRun` lists single tests and is cut at 15; this list is cut only at {@link MAX_TEST_FILES}.
+     */
+    files: string[];
     soundness: unknown;
     /** Unmodified reachability-cap receipt from select_tests. */
     truncatedAtDepth?: number;
@@ -408,6 +415,7 @@ export async function computeBlastRadius(
   // ── 3. Tests to run (reuse select_tests over the same diff) ─────────────────
   let testCount = 0;
   let testToRun: Array<{ test: string; file: string; confidence: string }> = [];
+  let testFiles: string[] = [];
   let testSoundness: unknown;
   let testsTruncatedAtDepth: number | undefined;
   let testsUnavailable: string | null = null;
@@ -430,6 +438,8 @@ export async function computeBlastRadius(
     const tests = sel.selectedTests ?? [];
     testCount = tests.length;
     testToRun = tests.slice(0, 15);
+    // select_tests ranks by confidence, then file: the first sighting of a file is its best rank.
+    testFiles = [...new Set(tests.map(t => t.file))];
     testSoundness = sel.soundness;
     testsTruncatedAtDepth = sel.truncatedAtDepth;
     federationResult = sel.federation;
@@ -450,7 +460,7 @@ export async function computeBlastRadius(
   const decisionItems: Array<{ kind: string; message: string; domain: string | null; provenance: ServedContentProvenance }> = [];
   const memoryOrphanFindings: Array<{ id: string; filePath: string; message: string }> = [];
   const decisionOrphanFindings: Array<{ id: string; filePath: string; message: string }> = [];
-  const specProvenance = await reviewedFileContentProvenance(absDir, 'openspec');
+  const specProvenance = await specCorpusContentProvenance(absDir);
   let driftUnavailable: string | null = null;
   let driftFilesOmitted = 0;
   let driftRaw: unknown;
@@ -594,6 +604,7 @@ export async function computeBlastRadius(
   // impact.analyzedSymbolCount) remain authoritative and uncapped.
   const capped: string[] = [];
   if (testToRun.length < testCount) capped.push(`tests.toRun (${testToRun.length}/${testCount})`);
+  if (testFiles.length > MAX_TEST_FILES) capped.push(`tests.files (${MAX_TEST_FILES}/${testFiles.length})`);
   if (memWillDrift.length > 20) capped.push(`memory.willDrift (20/${memWillDrift.length})`);
   if (specItems.length > 20) capped.push(`specs.items (20/${specItems.length})`);
   if (decisionItems.length > 20) capped.push(`decisions.items (20/${decisionItems.length})`);
@@ -606,7 +617,13 @@ export async function computeBlastRadius(
   // Index-staleness disclosure: a risk headline computed from a graph that predates
   // the working tree must say so (fix-cli-conclusion-honesty). Same shared shape the
   // certification commands emit; absent when the index is current.
-  const staleness = await computeStaleness(absDir);
+  // The working tree is diffed against `resolvedBaseRef`. When the index was built at the base or
+  // later on this line of history (base ≤ index commit ≤ HEAD), every file changed since the index
+  // is a file of this diff: the change this briefing is about, not staleness. Telling the agent to
+  // re-analyze would be wrong advice. An index older than the base, or off this history, still is.
+  const indexStaleness = await computeStaleness(absDir);
+  const staleness = indexStaleness && await indexWithinDiff(absDir, indexStaleness.indexCommit, resolvedBaseRef)
+    ? undefined : indexStaleness;
   // Dynamic-boundary sites in the changed files and the caller closure this briefing computed
   // (change: disclose-dynamic-boundary-regions) — the constructs that make the radius a lower bound.
   const dynamicCrossing = dynamicBoundaryCrossing(
@@ -673,6 +690,7 @@ export async function computeBlastRadius(
     tests: {
       count: testCount,
       toRun: testToRun,
+      files: testFiles.slice(0, MAX_TEST_FILES),
       soundness: testSoundness,
       ...(testsTruncatedAtDepth !== undefined ? { truncatedAtDepth: testsTruncatedAtDepth } : {}),
       ...(testsUnavailable ? { unavailable: testsUnavailable } : {}),
@@ -761,7 +779,12 @@ function renderHeadline(b: BlastRadiusBriefing): string {
   else if (b.tests.count > 0) parts.push(`${b.tests.count} test${b.tests.count === 1 ? '' : 's'} to run`);
   const willDrift = b.memory.drifted + b.memory.orphaned;
   if (willDrift > 0) parts.push(`${willDrift} anchored memor${willDrift === 1 ? 'y' : 'ies'} will drift/orphan`);
-  if (b.decisions.affected > 0) parts.push(`${b.decisions.affected} decision${b.decisions.affected === 1 ? '' : 's'} affected`);
+  // An orphaned decision names a domain that is gone: an issue. A domain-level gap only says an ADR
+  // names a domain the change touches, which a one-line change in a broad domain hits for most ADRs;
+  // it is counted apart so it never reads as that many decisions broken.
+  if (b.decisions.orphaned > 0) parts.push(`${b.decisions.orphaned} decision${b.decisions.orphaned === 1 ? '' : 's'} name${b.decisions.orphaned === 1 ? 's' : ''} a missing domain`);
+  const domainGaps = b.decisions.affected - b.decisions.orphaned;
+  if (domainGaps > 0) parts.push(`${domainGaps} ADR${domainGaps === 1 ? '' : 's'} name${domainGaps === 1 ? 's' : ''} a touched domain`);
   if (b.specs.willGoStale > 0) parts.push(`${b.specs.willGoStale} spec${b.specs.willGoStale === 1 ? '' : 's'} may go stale`);
   if (gen) parts.push(`${gen} changed`);
   if (refs > 0) parts.push(`${refs} added reference${refs === 1 ? '' : 's'} resolve${refs === 1 ? 's' : ''} to nothing`);
@@ -808,4 +831,30 @@ async function triggeredMemoriesForDiff(
 /** MCP dispatch entry. Returns the briefing object directly (additive-by-cast). */
 export async function handleBlastRadius(input: BlastRadiusInput): Promise<unknown> {
   return computeBlastRadius(input);
+}
+
+/**
+ * Whether the index commit lies between the base and HEAD (base ≤ index ≤ HEAD), so every change
+ * since the index is inside the diff. False when anything cannot be resolved: then the staleness
+ * marker stays.
+ */
+export async function indexWithinDiff(absDir: string, indexCommit: string, baseRef: string): Promise<boolean> {
+  // The index commit is read from a repository artifact: only a hash is accepted, and no ref may
+  // read as an option.
+  if (!/^[0-9a-f]{4,64}$/i.test(indexCommit) || baseRef.startsWith('-')) return false;
+  try {
+    const { execFileGit } = await import('../../../utils/git-exec.js');
+    const { gitPathArgs } = await import('../../../utils/git-args.js');
+    const isAncestor = async (a: string, b: string) => {
+      try {
+        await execFileGit('git', gitPathArgs('merge-base', '--is-ancestor', `${a}^{commit}`, `${b}^{commit}`), { cwd: absDir });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    return await isAncestor(baseRef, indexCommit) && await isAncestor(indexCommit, 'HEAD');
+  } catch {
+    return false;
+  }
 }

@@ -17,7 +17,7 @@ import { mergeEntries, readMeta, removeManaged, isHandEdited, editJsonPreserving
 import { previewCreate, previewDiff } from '../diff.js';
 import type { Adapter, ApplyContext, ApplyResult, PlannedChange } from './types.js';
 import { LEAN_DEFAULT_PRESET } from '../../../constants.js';
-import { formatPlatformCommand, isOpenloreCliEntryPath, resolveOpenloreCommand, windowsCommandHazard } from '../../../utils/platform-command.js';
+import { formatGuardedHookCommand, formatPlatformCommand, isOpenloreCliEntryPath, resolveOpenloreCommand, windowsCommandHazard } from '../../../utils/platform-command.js';
 import { confinedAtomicWriteFile, safeJoin } from '../../../utils/path-confinement.js';
 import { isGuardedWriteFailure, withGuardedConfigWrite } from '../guarded-config-write.js';
 
@@ -294,7 +294,8 @@ interface ManagedHook {
 
 const EDIT_TOOLS = 'Edit|Write|MultiEdit|NotebookEdit';
 
-const MANAGED_HOOKS: ReadonlyArray<ManagedHook> = [
+/** Exported so the Claude Code plugin's hooks are checked against the same moments (plugin-manifest.test.ts). */
+export const MANAGED_HOOKS: ReadonlyArray<ManagedHook> = [
   { key: 'SessionStart', args: ['orient', '--json'] },
   { key: 'UserPromptSubmit', args: ['orient', '--inject'] },
   { key: 'PreToolUse', args: ['hook', 'before-edit'], moment: 'before-edit', matcher: EDIT_TOOLS, timeout: 15 },
@@ -309,15 +310,26 @@ const MANAGED_HOOKS: ReadonlyArray<ManagedHook> = [
   { key: 'SubagentStart', args: ['hook', 'subagent-start'], moment: 'subagent-start', timeout: 30 },
 ];
 
+/**
+ * The user-scope guard of a loop moment: outside a project with `.openlore/`, the hook exits before
+ * Node starts. The session-start and prompt hooks do not get it: they are what sets OpenLore up in
+ * a new repository or worktree (change: user-scope-loop-hooks).
+ */
+export const USER_SCOPE_PROJECT_GUARD = '[ -d "${CLAUDE_PROJECT_DIR:-.}/.openlore" ] || exit 0; ';
+
 /** The hook keys OpenLore manages, with commands resolved for the generating host. */
 function managedHooks(
   platform: NodeJS.Platform,
   runtime: ApplyContext['platformCommandRuntime'],
+  scope: 'repo' | 'user' = 'repo',
 ): ReadonlyArray<{ def: ManagedHook; command: string }> {
-  return MANAGED_HOOKS.map(def => ({
-    def,
-    command: formatPlatformCommand(resolveOpenloreCommand(def.args, platform, runtime), platform),
-  }));
+  return MANAGED_HOOKS.map(def => {
+    // The user-scope form stands down where a repository wires the same hook itself.
+    const args = scope === 'user' ? [...def.args, '--scope', 'user'] : def.args;
+    // Guarded: a hook whose runtime is gone exits 0 silently (change: hook-reliability, task 8.1).
+    const command = formatGuardedHookCommand(resolveOpenloreCommand(args, platform, runtime), platform);
+    return { def, command: scope === 'user' && def.moment ? USER_SCOPE_PROJECT_GUARD + command : command };
+  });
 }
 
 /**
@@ -361,6 +373,38 @@ function mergeOurHook(existing: unknown, command: string, def: ManagedHook): unk
   const arr = Array.isArray(existing) ? existing : [];
   const withoutOurs = arr.filter((e) => !isOurHookEntry(e, def));
   return [...withoutOurs, ourHookGroup(command, def)];
+}
+
+/** The moments this version wires; an `_openloreHook` group naming any other moment is retired. */
+const CURRENT_MOMENTS = new Set(MANAGED_HOOKS.flatMap(def => (def.moment ? [def.moment] : [])));
+
+/** An OpenLore loop-moment group for a moment this version no longer has (change: hook-reliability). */
+function isRetiredHookEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== 'object') return false;
+  const e = entry as Record<string, unknown>;
+  return e._openlore === true && typeof e._openloreHook === 'string' && !CURRENT_MOMENTS.has(e._openloreHook);
+}
+
+/**
+ * Remove every retired OpenLore group, on any event, from `hooks`, recording one edit per event it
+ * changes. The user's own groups, and current OpenLore groups, are kept as they are.
+ */
+function stripRetiredHooks(hooks: Record<string, unknown>, edits: JsonPathEdit[]): boolean {
+  let changed = false;
+  for (const [key, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    const kept = groups.filter(g => !isRetiredHookEntry(g));
+    if (kept.length === groups.length) continue;
+    changed = true;
+    if (kept.length === 0) {
+      delete hooks[key];
+      edits.push({ path: ['hooks', key], value: undefined });
+    } else {
+      hooks[key] = kept;
+      edits.push({ path: ['hooks', key], value: kept });
+    }
+  }
+  return changed;
 }
 
 /** Remove our marker-identified group from `existing`, leaving user-authored entries untouched. */
@@ -767,6 +811,9 @@ export const claudeCodeAdapter: Adapter = {
     // is never read for MCP), and set each marker-identified hook group. Everything else in the
     // user's settings.json is preserved byte-for-byte.
     const settingsEdits: JsonPathEdit[] = [];
+    // A group for a moment this version no longer has is removed on every install, so an upgrade
+    // never leaves an old moment running (change: hook-reliability, task 8.2).
+    stripRetiredHooks(nextHooks, settingsEdits);
     const commandHazard = hookCommandHazard(ctx.platform, ctx.platformCommandRuntime);
     if ('_openlore' in existing) settingsEdits.push({ path: ['_openlore'], value: undefined });
     const legacyMcp = existing.mcpServers as Record<string, unknown> | undefined;
@@ -821,7 +868,7 @@ export const claudeCodeAdapter: Adapter = {
     if (commandHazard) {
       for (const def of MANAGED_HOOKS) {
         const { key } = def;
-        const original = (nextHooks[key] ?? (base.hooks as Record<string, unknown>)?.[key]);
+        const original = nextHooks[key];
         if (!Array.isArray(original)) continue;
         const filtered = stripOurHook(original, def);
         if (filtered.length === original.length) continue;
@@ -840,13 +887,14 @@ export const claudeCodeAdapter: Adapter = {
         + 'without that character to get the hooks.',
       );
     } else {
-      for (const { def, command } of managedHooks(ctx.platform, ctx.platformCommandRuntime)) {
+      for (const { def, command } of managedHooks(ctx.platform, ctx.platformCommandRuntime, ctx.scope === 'user' ? 'user' : 'repo')) {
         const { key } = def;
-        // Loop moments run on every edit. The user scope would run them in every repository the
-        // agent touches, OpenLore or not, so they are wired per repository only.
-        if (def.moment && ctx.scope === 'user') continue;
+        // The user scope wires the loop moments too: their guard exits at once outside a project
+        // with `.openlore/`, and `--scope user` stands down where the repository wires them itself
+        // (change: user-scope-loop-hooks).
         // Several managed groups may share an event: merge into what this loop already built.
-        const merged = mergeOurHook(nextHooks[key] ?? (base.hooks as Record<string, unknown>)?.[key], command, def);
+        // `nextHooks` is a clone of the file's hooks, so a group removed above stays removed.
+        const merged = mergeOurHook(nextHooks[key], command, def);
         nextHooks[key] = merged;
         settingsEdits.push({ path: ['hooks', key], value: merged });
       }
@@ -878,10 +926,10 @@ export const claudeCodeAdapter: Adapter = {
         // Never claim the hooks: on this host they are the one thing that was not written.
         ? `${layout.settings}: OpenLore hooks not wired — ${commandHazard}`
         : !had
-          ? `create ${layout.settings} with SessionStart + UserPromptSubmit hooks${includesOpenLoreStatusLine ? ' and OpenLore status line' : ''}${permissionSharesSettingsFile ? ` and ${layout.permission}` : ''}`
+          ? `create ${layout.settings} with SessionStart, UserPromptSubmit and agent-loop hooks${includesOpenLoreStatusLine ? ' and OpenLore status line' : ''}${permissionSharesSettingsFile ? ` and ${layout.permission}` : ''}`
           : !changed
             ? `${layout.settings}: already up to date`
-            : `update SessionStart + UserPromptSubmit hooks${includesOpenLoreStatusLine ? ' and OpenLore status line' : ''}${permissionSharesSettingsFile ? ` and ${layout.permission}` : ''} in ${layout.settings}`,
+            : `update SessionStart, UserPromptSubmit and agent-loop hooks${includesOpenLoreStatusLine ? ' and OpenLore status line' : ''}${permissionSharesSettingsFile ? ` and ${layout.permission}` : ''} in ${layout.settings}`,
       preview: !had
         ? previewCreate(settingsPath, after)
         : !changed
@@ -1033,6 +1081,7 @@ export const claudeCodeAdapter: Adapter = {
     }
     const hooksObj = parsed.hooks as Record<string, unknown> | undefined;
     if (hooksObj) {
+      if (stripRetiredHooks(hooksObj, removalEdits)) changed = true;
       for (const def of MANAGED_HOOKS) {
         const { key } = def;
         if (!Array.isArray(hooksObj[key])) continue;

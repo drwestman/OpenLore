@@ -103,8 +103,8 @@ openlore orient [options]
   --metrics              # Report wall time + output size to stderr (opt-in)
   --inject               # Emit a bounded, ignorable task-scoped orientation block
                          #   for a pre-turn agent hook; reads the task from --task
-                         #   or stdin. Fail-open: any failure degrades to a single
-                         #   pointer line at exit 0 (see docs/install.md).
+                         #   or stdin. Briefs only code the prompt names exactly;
+                         #   otherwise silent. Fail-open, exit 0 (see docs/install.md).
 ```
 
 With no `--task`, `orient` prints a session-start primer. Requires `openlore analyze`
@@ -144,8 +144,9 @@ openlore install [options]   # wire agents (this repo AND your user scope),
                          #   continue, agents-md
   --preset <name>        # MCP tool preset to wire: substrate (default; navigation core +
                          #   spec workflows + recall + verify_claim + blast_radius), navigation (lean escape),
-                         #   minimal, memory, verify, federation, coordination, or full
-  --all-tools            # Wire the full 83-tool surface (alias of --preset full)
+                         #   minimal, memory, verify, federation, coordination,
+                         #   plugin (evidence set + verify_change), or full
+  --all-tools            # Wire the full 84-tool surface (alias of --preset full)
   --dry-run              # Print planned changes without writing any files
   --force                # Overwrite OpenLore-managed blocks even if hand-edited
   --uninstall            # Remove OpenLore-managed blocks and entries (both scopes)
@@ -164,7 +165,7 @@ openlore connect remove [agent]      # disconnect that agent
   <agent>                # Positional: claude-code | cursor | cline | continue |
                          #   agents-md (omit for an interactive picker)
   --preset <name>        # MCP tool preset to wire (same names as install)
-  --all-tools            # Wire the full 83-tool surface (alias of --preset full)
+  --all-tools            # Wire the full 84-tool surface (alias of --preset full)
   --dry-run              # Print planned changes without writing any files
   --force                # Overwrite OpenLore-managed blocks even if hand-edited
   --no-analyze           # Configure surfaces only; do not build the index
@@ -176,7 +177,7 @@ openlore connect remove [agent]      # disconnect that agent
 A bare `openlore install` wires the `substrate` surface (15 tools — navigation core + governance reads + spec-workflow composites) and, for
 Claude Code, both a `SessionStart` primer hook and a `UserPromptSubmit` task-scoped
 injection hook. Use `--preset navigation` for the lean navigate-only core (10 tools), or
-`--preset full` for all 83 tools.
+`--preset full` for all 84 tools.
 
 ### MCP Server Options
 
@@ -185,7 +186,7 @@ openlore mcp [options]             # start the stdio MCP server
 
   --preset <name>        # Expose a named preset (default: substrate, 15 tools — nav + governance + spec workflows)
   --minimal              # Expose only the core 6 governance tools
-  --all-tools            # Expose the full surface — all 83 tools (alias --preset full)
+  --all-tools            # Expose the full surface — all 84 tools (alias --preset full)
   --list-tools           # Print the active surface grouped by capability family and exit
   --watch-auto           # Auto-detect + incrementally re-index the project dir
   --no-watch-auto        # Disable auto-watch (use for one-shot tool calls)
@@ -414,7 +415,7 @@ Checks performed:
 | Git repository | `.git` directory and `git` binary on PATH |
 | openlore config | `.openlore/config.json` exists and is parseable |
 | Analysis artifacts | `repo-structure.json` freshness (warns if >24h old) |
-| OpenSpec directory | `openspec/specs/` exists |
+| Spec source | the OpenSpec corpus in use, or `none` (a supported state, never a warning) |
 | LLM provider | API key or `claude` CLI detected |
 | Disk space | Warns < 500 MB, fails < 200 MB |
 | Install health | Warns when more than one `openlore` install is on PATH, or when the user-scope MCP entry (`~/.claude.json`) names a launcher that no longer exists; `--fix` re-wires the launcher |
@@ -711,7 +712,7 @@ over plain HTTP so non-MCP clients (e.g. the [Pi](https://pi.dev) extension in
 
 ```bash
 openlore serve                          # substrate preset, ephemeral port, watch on
-openlore serve --preset all --port 7077 # all 83 tools on a fixed port
+openlore serve --preset all --port 7077 # all 84 tools on a fixed port
 openlore serve --no-watch               # transport only, no freshness lane
 openlore serve --stop                   # stop the daemon serving this directory
 ```
@@ -772,3 +773,11 @@ See `examples/pi/README.md`.
 |--------|-------------|
 | `npm run bench` | EdgeStore micro-benchmark (node lookup, BFS, orient path) — requires `openlore analyze` |
 | `npm run bench:mcp` | MCP handler benchmark — measures cold vs warm path for `readCachedContext`, `handleOrient`, `handleSearchCode`. Requires `openlore analyze`. Pass a project dir: `npm run bench:mcp -- /path/to/project` |
+
+## `openlore configure`
+
+Provider-free repository configuration operations: `inspect`, `preview`, `apply`, `verify`,
+`revert`. `--candidate-file` supplies a preview candidate; `--plan-file` supplies the exact
+revision-bound plan. Mutations require `--apply`, with `--replace-choices` separately authorizing
+existing-choice conflicts. `--json` emits the shared structured result. An explicit `--config`
+selects the confined project target. See [configuration assistance](configuration-assistant.md).

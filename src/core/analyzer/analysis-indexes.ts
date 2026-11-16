@@ -1,4 +1,6 @@
-import { mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import { FilePolicyResolver } from '../configuration/policy.js';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { findNestedSpecFiles } from '../spec-sources/openspec.js';
 import { tmpdir } from 'node:os';
 import { ANALYSIS_ARTIFACT_MAX_BYTES, readArtifactBounded } from '../../utils/bounded-artifact-read.js';
 import { join, resolve } from 'node:path';
@@ -228,6 +230,7 @@ function indexConfigurationHash(options: BuildAnalysisIndexesOptions): string {
     generation: options.config?.generation ?? null,
     openspecPath: options.config?.openspecPath ?? null,
     analysis: options.config?.analysis ?? null,
+    ...(options.config?.filePolicies?.rules.some(r => r.lanes.embed || r.lanes.index) ? {embeddingPolicyRevision:new FilePolicyResolver(options.config.filePolicies).revisionFor('embed')} : {}),
     include: options.include ?? [],
     exclude: options.exclude ?? [],
   })).digest('hex');
@@ -263,30 +266,11 @@ async function specCorpusPresent(options: BuildAnalysisIndexesOptions): Promise<
       resolveOpenspecDir(options.rootPath, options.config?.openspecPath ?? OPENSPEC_DIR),
       OPENSPEC_SPECS_SUBDIR,
     );
-    return (await findSpecMarkdown(specsDir, 0)).length > 0;
+    return (await findNestedSpecFiles(specsDir, 4)).length > 0;
   } catch {
     // Unreadable: do not invalidate on a transient error — the ordinary rebuild path still runs.
     return false;
   }
-}
-
-/** `spec.md` files under a specs directory, bounded in depth like the spec index's own discovery. */
-async function findSpecMarkdown(dir: string, depth: number): Promise<string[]> {
-  if (depth > 4) return [];
-  let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const found: string[] = [];
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name === 'spec.md') found.push(join(dir, entry.name));
-    else if (entry.isDirectory() && !entry.name.startsWith('.')) {
-      found.push(...await findSpecMarkdown(join(dir, entry.name), depth + 1));
-    }
-  }
-  return found;
 }
 
 /**
@@ -410,6 +394,7 @@ async function buildAnalysisIndexesUnlocked(options: BuildAnalysisIndexesOptions
               detail: `Reclaimed an index lock left by a process that is no longer running: ${lockPath}`,
             }),
           },
+          options.config?.filePolicies ? new FilePolicyResolver(options.config.filePolicies) : undefined,
         );
         result.functionIndex = 'built';
         const vocabulary = loadRepositoryVocabulary(options.outputPath);
@@ -641,9 +626,11 @@ async function buildClaimedLocalVectors(
       ? Promise.resolve(texts.map(text => recorded.get(text)!))
       : local.embed(texts),
   };
+  const policyConfig = await import('../services/config-manager.js').then(m => m.readOpenLoreConfig(rootPath));
+  const embeddingPolicy = policyConfig?.filePolicies ? new FilePolicyResolver(policyConfig.filePolicies) : undefined;
   const scratch = await mkdtemp(join(tmpdir(), 'openlore-vectors-'));
   try {
-    await VectorIndex.build(scratch, nodes, signatures, hubs, entries, recorder, fileContents, false, vocabularyExpansion, graph?.edges);
+    await VectorIndex.build(scratch, nodes, signatures, hubs, entries, recorder, fileContents, false, vocabularyExpansion, graph?.edges, undefined, embeddingPolicy);
     // The write, and the generation check it depends on, happen while this process owns the
     // repository's analysis: a full analyze cannot publish a new graph in between, so the
     // vectors always describe the graph that is published. A running analysis wins; the next
@@ -653,7 +640,7 @@ async function buildClaimedLocalVectors(
     try {
       const after = await readCurrentGeneration(outputPath, [...REQUIRED_ANALYSIS_ARTIFACTS]);
       if (after?.generationId !== before.generationId) return 'skipped';
-      await VectorIndex.build(outputPath, nodes, signatures, hubs, entries, replay, fileContents, false, vocabularyExpansion, graph?.edges);
+      await VectorIndex.build(outputPath, nodes, signatures, hubs, entries, replay, fileContents, false, vocabularyExpansion, graph?.edges, undefined, embeddingPolicy);
       return 'built';
     } finally {
       await ownership.release();

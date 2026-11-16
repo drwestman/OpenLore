@@ -6,6 +6,7 @@
  */
 
 import { setPriority } from 'node:os';
+import { noSpecSourceText } from '../../core/spec-sources/state.js';
 import { Command, Option } from 'commander';
 import { sanitizeForTerminal as safe } from '../../utils/misc.js';
 import {
@@ -19,6 +20,8 @@ import {
 import { mkdir, readFile, open as openFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { openBuildProgress, reportBuildPhase, reportFileDone } from '../../core/services/build-progress.js';
+import { setPass1ProgressListener } from '../../core/analyzer/extraction-pool.js';
 import { formatDuration, formatAge, getAnalysisAge } from '../../utils/command-helpers.js';
 import { safeJoin } from '../../utils/path-confinement.js';
 import { EdgeStore } from '../../core/services/edge-store.js';
@@ -455,7 +458,7 @@ Output files:
   ├── dependencies.mermaid   Visual dependency diagram
   └── SUMMARY.md             Human-readable analysis summary
 
-After analysis, run 'openlore generate' to create OpenSpec files.
+After analysis, agents query the index (openlore orient, or the MCP server). Spec generation is optional: openlore generate.
 `
   )
   .action(async (options: Partial<ExtendedAnalyzeOptions>) => {
@@ -566,6 +569,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
         opts.exclude,
         opts.maxFiles,
         analysisGeneratedExcludes(rootPath, outputPath, openloreConfig.openspecPath),
+        openloreConfig.filePolicies,
       );
 
       // Skip re-analysis only when the SOURCE is unchanged since the last run — a
@@ -671,7 +675,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
               }
             }
 
-            if (!options.embedded) logger.info('Next step', "Run 'openlore generate' to create OpenSpec files");
+            if (!options.embedded) logger.info('Next step', 'Ask about the code: openlore orient "<task>" (spec generation is optional: openlore generate)');
             return;
           } catch (readErr) {
             logger.debug(`Could not read existing analysis summary: ${(readErr as Error).message}`);
@@ -718,6 +722,11 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       }
 
       let result;
+      // Build progress for the user's status line (change: hook-reliability, group 9). Removed
+      // on exit, whatever the path; a killed build is read as not building by its dead pid.
+      const closeProgress = openBuildProgress(rootPath);
+      setPass1ProgressListener({ start: total => reportBuildPhase('parsing', total), fileDone: reportFileDone, end: () => reportBuildPhase('linking') });
+      process.once('exit', () => { setPass1ProgressListener(undefined); closeProgress(); });
       try {
         result = await runAnalysis(rootPath, outputPath, {
           maxFiles: opts.maxFiles,
@@ -731,6 +740,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       } finally {
         await ownership.release();
       }
+      reportBuildPhase('writing the index');
 
       // ========================================================================
       // PHASE 4: DISPLAY RESULTS
@@ -947,7 +957,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       const digestWritten = await generateCodebaseDigest(
         artifacts.llmContext,
         depGraph,
-        { rootPath, outputDir: outputPath, repoStructure: artifacts.repoStructure },
+        { rootPath, outputDir: outputPath, repoStructure: artifacts.repoStructure, openspecPath: openloreConfig.openspecPath },
       );
 
       // Generate AI tool config files — prompt user to select which assistants
@@ -1081,7 +1091,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
 
       logger.success('Ready for generation!');
       logger.blank();
-      if (!options.embedded) logger.info('Next step', "Run 'openlore generate' to create OpenSpec files");
+      if (!options.embedded) logger.info('Next step', 'Ask about the code: openlore orient "<task>" (spec generation is optional: openlore generate)');
 
     } catch (error) {
       logger.error(`Analysis failed: ${(error as Error).message}`);
@@ -1176,7 +1186,7 @@ export function formatSpecIndexFailure(
   defaultSpecs?: string,
 ): string {
   if (message.includes('No OpenSpec specs directory')) {
-    return '    ℹ No OpenSpec specs directory — spec index skipped';
+    return `    ℹ Spec index skipped: ${noSpecSourceText()}`;
   }
   if (message.includes('exists but contains no spec.md files')) {
     // change: align-first-run-ctas-with-repo-shape — an empty specs directory OpenLore's own

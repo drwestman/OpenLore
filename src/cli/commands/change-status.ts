@@ -1,6 +1,6 @@
 /**
  * `openlore change-status` computes the evidence pass documented in
- * `openspec/changes/STATUS.md` (change: add-change-evidence-audit).
+ * a planning table such as a status document (change: add-change-evidence-audit).
  *
  * This command deliberately does not decide whether an implementation is correct
  * and never mutates the OpenSpec lifecycle. Validation and archiving remain owned
@@ -45,6 +45,17 @@ export interface RequirementReceipt {
 export interface ValidationReceipt {
   passes: boolean;
   error?: string;
+  /**
+   * `false` when the validator could not run at all (no `openspec` on PATH, or not executable):
+   * the change is neither passing nor failing, so it is never archivable on this receipt
+   * (change: spec-framework-neutrality, task 1.4).
+   */
+  assessed?: false;
+  reason?: string;
+}
+
+function validatesText(v: ValidationReceipt): string {
+  return v.assessed === false ? `not assessed (${v.reason ?? 'validator unavailable'})` : v.passes ? 'yes' : 'no';
 }
 
 export interface TaskProgress {
@@ -87,7 +98,9 @@ export async function validateWithOpenSpec(rootPath: string, name: string): Prom
     });
     return { passes: true };
   } catch (error) {
-    const e = error as Error & { stderr?: string | Buffer; stdout?: string | Buffer };
+    const e = error as Error & { stderr?: string | Buffer; stdout?: string | Buffer; code?: unknown };
+    if (e.code === 'ENOENT') return { passes: false, assessed: false, reason: 'the openspec CLI is not on PATH' };
+    if (e.code === 'EACCES') return { passes: false, assessed: false, reason: 'the openspec CLI is not executable' };
     const detail = String(e.stderr || e.stdout || e.message).trim();
     return { passes: false, error: detail || 'openspec validate failed' };
   }
@@ -338,7 +351,8 @@ export async function auditChangeStatuses(options: AuditOptions): Promise<Change
     let requirements: RequirementReceipt[] = [];
     let assessmentError: string | undefined;
     try {
-      requirements = await requirementReceipts(options.rootPath, name, validates.passes);
+      // Not assessed is not a failure: the requirements are read as for a passing change.
+      requirements = await requirementReceipts(options.rootPath, name, validates.passes || validates.assessed === false);
     } catch (error) {
       assessmentError = error instanceof Error ? error.message : String(error);
     }
@@ -374,7 +388,7 @@ function renderHuman(results: ChangeStatusResult[]): string {
     for (const receipt of result.marker.receipts) lines.push(`    ${inlineText(receipt.file)}:${receipt.line}`);
     lines.push(
       `  requirements synced: ${result.requirementsSynced.synced}/${result.requirementsSynced.total}`,
-      `  validates: ${result.validates.passes ? 'yes' : 'no'}`,
+      `  validates: ${validatesText(result.validates)}`,
       `  tasks: ${result.tasks.checked}/${result.tasks.total} (display only)`,
     );
     if (result.caveat) lines.push(`  caveat: ${result.caveat}`);
@@ -401,13 +415,13 @@ export function renderStatusTable(results: ChangeStatusResult[]): string {
     const evidence = [
       `marker ${result.marker.present ? 'present' : 'absent'}`,
       `requirements ${result.requirementsSynced.synced}/${result.requirementsSynced.total}`,
-      `validates ${result.validates.passes ? 'yes' : 'no'}`,
+      `validates ${validatesText(result.validates)}`,
       `tasks ${result.tasks.checked}/${result.tasks.total} (display only)`,
       ...(result.caveat ? [result.caveat] : []),
       ...(result.assessmentError ? [`assessment error: ${inlineText(result.assessmentError)}`] : []),
       EVIDENCE_DISCLAIMER,
     ].join('; ');
-    // STATUS.md's human-owned table has two columns: Change | What it is. Keep
+    // A planning table (formerly STATUS.md) has two human-owned columns: Change | What it is. Keep
     // that shape so these body-only rows can be pasted without rewriting prose.
     return `| \`${markdownCell(result.name)}\` | ${markdownCell(`${result.verdict}; ${evidence}`)} |`;
   }).join('\n') + (results.length ? '\n' : '');
@@ -451,7 +465,7 @@ export const changeStatusCommand = new Command('change-status')
   .description('Compute open-change status from source markers, spec sync, and OpenSpec validation')
   .argument('[name]', 'Audit one open change (default: every open change)')
   .option('--json', 'Emit machine-readable evidence', false)
-  .option('--table', 'Emit STATUS.md table rows only', false)
+  .option('--table', 'Emit Markdown table rows (Change | Evidence) only, for a planning document', false)
   .action(async (name: string | undefined, options: { json?: boolean; table?: boolean }) => {
     process.exitCode = await runChangeStatusCli({ name, json: options.json, table: options.table });
   });

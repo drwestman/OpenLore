@@ -557,6 +557,8 @@ const countOf = (v: unknown): number => (Array.isArray(v) ? v.length : typeof v 
  * that is always false carries no information at all.
  */
 export const DISCLOSURE_CHANNELS: readonly DisclosureChannel[] = [
+  {path:'disclosures',fires:nonEmptyArray,detail:() => 'Configuration coverage or effects are partial; read the structured disclosures.'},
+  {path:'outcome',fires:v => typeof v === 'string' && ['blocked','stale-plan','needs-input','failed','partially-verified','applied-pending-verification'].includes(v),detail:() => 'An operation is incomplete or unverified; read its phase receipt.'},
   {
     path: 'verdict',
     fires: (v) => v === 'unverifiable',
@@ -691,6 +693,9 @@ export const NON_DISCLOSURE_RESPONSE_FIELDS: Readonly<Record<string, string>> = 
   truncation: 'Present on every answer; the `truncation.bounded` channel carries the firing form.',
   changeGranularity: 'Present whenever per-symbol detection ran; the `.reasons`/`.fallbacks` channels carry the firing form.',
   coverage: 'Describes which languages/signals the answer used, not a gap in it.',
+  lookedFor: 'Names the spec sources checked, beside `reason: "no-spec-source"`: a state of the repository, not a gap in the answer.',
+  skipped: 'Names a step that has nothing to act on in this repository (decision sync with no OpenSpec corpus): a state, not a gap in the answer.',
+  specSources: 'A state of the repository (no spec source found, and the sources looked for), not a gap in the computed answer (change: spec-framework-neutrality).',
   // Nested sub-receipts whose FIRING form is already a channel on the parent. The sweep
   // reads named paths, never a payload walk, so an inner count is reached through its
   // parent's registered channel or not at all.

@@ -15,6 +15,8 @@
 // tool spawning `openlore` under Node 20) gets one legible stderr line and a
 // stable exit code, never a stack trace. Keep this the first import.
 import './node-version-bootstrap.js';
+// Node 22 prints an ExperimentalWarning when `node:sqlite` loads; a hook must write nothing.
+import './sqlite-warning-filter.js';
 // Size the V8 heap to the machine BEFORE commander and the command modules load, so a large
 // repository analyzes with no `--max-old-space-size` flag (change: make-analyze-scale-to-any-repo).
 // Placed right after the Node-version guard: both are early import side effects, and a re-exec here
@@ -29,6 +31,7 @@ import { allowInsecureTls } from '../core/services/tls-scope.js';
 import { Command } from 'commander';
 import { createRequire } from 'node:module';
 import { initCommand } from './commands/init.js';
+import { configureCommand } from './commands/configure.js';
 import { analyzeCommand } from './commands/analyze.js';
 import { embedCommand } from './commands/embed.js';
 import { orientCommand } from './commands/orient.js';
@@ -127,7 +130,7 @@ program.hook('preAction', (thisCommand, actionCommand) => {
   // value came from the CLI, not the built-in default (OutputContractsAreUniform).
   const configSource = thisCommand.getOptionValueSource('config') as OptionValueSource;
   const configGuard = checkExplicitConfig(configSource, opts.config as string | undefined);
-  if (!configGuard.ok) {
+  if (!configGuard.ok && actionCommand.name() !== 'configure') {
     logger.error(configGuard.message!);
     process.exit(1);
   }
@@ -223,6 +226,7 @@ Learn more: https://github.com/clay-good/OpenLore
   );
 
 // Register subcommands
+program.addCommand(configureCommand);
 program.addCommand(initCommand);
 program.addCommand(analyzeCommand);
 program.addCommand(embedCommand);

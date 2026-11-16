@@ -43,7 +43,7 @@ This system is organized into the following domains (each link resolves to a spe
 | Operator-tls-trust | Which principal may relax TLS certificate verification for outbound requests, and for which network surface. | [spec.md](../operator-tls-trust/spec.md) |
 | Overview | This document: the system purpose, the domain index, the technical stack, and the north-star requirement. | [spec.md](../overview/spec.md) |
 | Project | Detects the project type of an analyzed repository and maps each type key to its display name. | [spec.md](../project/spec.md) |
-| Validator | Surfaces generation-time OpenSpec validation errors and warnings in the generation report (advisory). | `validator/spec.md` |
+| Validator | Surfaces generation-time OpenSpec validation errors and warnings in the generation report (advisory). | [spec.md](../validator/spec.md) |
 | Verifier | Verifies the accuracy of a generated spec against the codebase by analyzing file purposes, imports, exports, and requirement coverage. | [spec.md](../verifier/spec.md) |
 
 ## Technical Stack
@@ -62,6 +62,13 @@ This system is organized into the following domains (each link resolves to a spe
 
 The system SHALL provide deterministic, locally-computed structural context as a substrate for coding agents, grounding all capabilities in static analysis rather than LLM inference.
 
+The system SHALL deliver that context to the agent as evidence at four moments: when a prompt is
+submitted, before an edit, after an edit, and before the agent stops. Every finding SHALL carry
+proof (a file and line, a graph edge, or a receipt) and SHALL lead to one of three actions: the
+agent fixes it; the agent decides and records the decision with a link to the proof; or the agent
+raises it to a human in its own final message or pull-request body. The system SHALL stay quiet
+unless a finding is new and real.
+
 > Decision recorded: c6d1ad07
 > Date: 2026-06-01
 
@@ -69,6 +76,16 @@ The system SHALL provide deterministic, locally-computed structural context as a
 
 - **WHEN** any capability serves structural context to an agent
 - **THEN** the answer is computed deterministically and locally from static analysis, with no LLM in the retrieval or guardrail path
+
+#### Scenario: A finding carries proof and one action
+
+- **WHEN** a moment gives the agent a finding
+- **THEN** the finding names its proof and exactly one of the actions fix, decide, or raise
+
+#### Scenario: Nothing new means nothing said
+
+- **WHEN** a moment runs and no finding is new and real
+- **THEN** the system gives the agent no finding
 
 ## Technical Notes
 

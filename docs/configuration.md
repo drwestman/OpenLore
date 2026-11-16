@@ -10,7 +10,6 @@
 {
   "version": "1.2.0",
   "projectType": "nodejs",
-  "openspecPath": "./openspec",
   "analysis": {
     "maxFiles": 500,
     "includePatterns": [],
@@ -22,6 +21,18 @@
   }
 }
 ```
+
+### Spec sources
+
+OpenLore needs no spec folder. Two keys point it at specs you already keep; both are optional.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `openspecPath` | string | The OpenSpec folder. `init` writes it only when it finds an OpenSpec corpus or you pass `--openspec-path`; without it, readers use `openspec`. |
+| `adrPaths` | string[] | Folders of architecture decision records, read-only. Each must be inside the repository (no absolute path, no `..`); an entry that is not is named in the config check and ignored. Validated now; no OpenLore feature reads ADR folders yet. |
+
+With no spec source, spec answers say `no spec source found (looked for: …)` instead of an empty or
+failed result; code answers work in full.
 
 ### Workspace shards
 
@@ -286,7 +297,14 @@ The governable finding codes (the **finding-code catalogue** — every code defa
 |------|--------|---------|---------|
 | `stale-decision-reference` | stale-decision-reference | advisory | A live, authoritative artifact (approved decision, non-orphaned anchored memory, or spec requirement) references a decision that has since been superseded. |
 | `orphans-anchored-memory` | blast-radius | advisory | The change orphans one or more code-anchored memories. |
-| `memory-anchor-lost` | memory-freshness | advisory | A recorded memory has an anchor that is lost or ambiguous (`needs-human-reselection`), so `recall` withholds it. One finding per memory, with the memory id as subject; `openlore enforce` always collects it, and `recall` also returns it in `findings`. Set to `blocking` or `frozen`, it also fails the gate when the check is incomplete: no analysis, an unreadable memory store, or an anchored file whose content differs from what the analysis recorded (a file the index has no content key for, such as one from an imported bundle, is disclosed but does not fail it). `openlore enforce` never renames a torn `notes.json` or `decisions/pending.json`; it stays in place and is reported until repaired, and the corpus-integrity codes (blocking by default) fail on it, so a commit is blocked until it is fixed. |
+| `memory-anchor-lost` | memory-freshness | advisory | A recorded memory has an anchor that is lost or ambiguous (`needs-human-reselection`), so `recall` withholds it. One finding per memory, with the memory id as subject; `openlore enforce` always collects it, and `recall` also returns it in `findings`. Set to `blocking` or `frozen`, it also fails the gate when the check is incomplete: no analysis, an unreadable memory store, or an anchored file whose content differs from what the analysis recorded (a file the index has no content key for, such as one from an imported bundle, is disclosed but does not fail it). `openlore enforce` never renames a torn `notes.json` or `decisions/pending.json`; it stays in place and is reported until repaired, and a corpus-integrity code that `enforcement.policy` names as blocking fails on it. |
+| `corpus-reference-unresolved` | corpus-integrity | advisory | A declared corpus edge names a target that cannot be resolved. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
+| `corpus-reference-ambiguous` | corpus-integrity | advisory | A declared corpus edge resolves to more than one target. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
+| `corpus-self-reference` | corpus-integrity | advisory | A corpus artifact declares a graph edge to itself where self-reference is invalid. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
+| `corpus-duplicate-identifier` | corpus-integrity | advisory | Multiple corpus artifacts declare the same identifier. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
+| `corpus-edge-unsupported` | corpus-integrity | advisory | A corpus artifact declares an edge kind that its artifact type does not support. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
+| `corpus-target-type-mismatch` | corpus-integrity | advisory | A declared corpus edge resolves to an artifact outside the edge's target range. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
+| `corpus-supersession-cycle` | corpus-integrity | advisory | Decision supersession edges form a cycle, so no member can be treated as authoritative. Severity stays `error`, so `openlore doctor` still reports it as a failure. |
 | `declining-health` | health-map | advisory | A high-complexity function in a churned file never got simpler and ended more complex over its sampled recent commits (`rising` in `get_health_map`'s `complexityTrend`). |
 | `deprecated-symbol-use` | structural-diff | advisory | A diff adds a call into a symbol marked deprecated by its language's standard marker (see `deprecationMarkers` in [language support](language-support.md)). Calls that were already there do not fire it. `structural_diff` returns these findings in `deprecatedCalls`, classified by this policy. |
 | `unresolved-internal-import` | phantom-references | advisory | A diff adds a relative import whose target is not a file in this repository. A path alias the resolver cannot follow is disclosed instead. `verify_change` returns these in `findings`, classified by this policy; `openlore enforce` does not collect them. See [phantom references](phantom-references.md). |
@@ -330,18 +348,26 @@ The governable finding codes (the **finding-code catalogue** — every code defa
 
 ### Agent-loop hooks
 
-`openlore install` wires four agent-loop moments in a repository's Claude Code settings (see
+`openlore install` wires the agent-loop moments in a repository's Claude Code settings (see
 [install](install.md#agent-loop-hooks)). Each is on unless turned off here:
 
 ```json
-{ "hooks": { "before-edit": true, "after-tools": true, "before-stop": false } }
+{ "hooks": { "prompt-submitted": true, "before-edit": true, "after-tools": true, "before-stop": false } }
 ```
+
+A moment that is off does nothing and prints nothing. A moment that fails (a check throws, its time
+limit passes, the store or index is unreadable) also prints nothing.
+
+Each finding from `before-edit`, `after-tools` and `before-stop` carries its proof and one action:
+`fix`, `decide`, or `raise` (see [install](install.md#agent-loop-hooks)). `hooks.before-stop: false`
+turns off the receipt and its certificates together.
 
 | Key | Moment |
 |-----|--------|
+| `prompt-submitted` | when a prompt is submitted (`openlore orient --inject`): the task-scoped briefing. `contextInjection.mode: "off"` also turns it off |
 | `before-edit` | before an edit tool runs: generated, vendored, or lockfile target; unresolved references in the pending text |
 | `after-tools` | after an edit: session-ledger record and facts, check weakening, phantom references, peer changes to declared or served symbols |
-| `before-stop` | before the agent stops: the `verify_change` receipt (blocks only on policy-blocking findings) |
+| `before-stop` | before the agent stops: the `verify_change` receipt, plus the public-surface, service-contract and change-impact certificates when the diff can trigger them (blocks only on policy-blocking findings) |
 | `after-compact` | after the conversation is compacted: the handoff briefing of the in-flight change |
 | `before-subagent` | before an `Agent`/`Task` call: queues the sub-agent's task (prints nothing) |
 | `subagent-start` | when a sub-agent starts: its task-scoped briefing and the live peers on the board |
@@ -354,10 +380,7 @@ An optional `contextInjection` block controls the per-task orientation that `ope
 {
   "contextInjection": {
     "mode": "task-scoped",
-    "tokenBudget": 600,
-    "relevanceMinMatches": 2,
-    "relevanceMinFanIn": 2,
-    "relevanceMinScore": 0.3
+    "tokenBudget": 600
   }
 }
 ```
@@ -366,10 +389,10 @@ An optional `contextInjection` block controls the per-task orientation that `ope
 |-------|:---:|---------|
 | `mode` | `task-scoped` | `task-scoped` enables injection; `off` makes `orient --inject` a no-op (exit 0). Disabling does **not** affect the MCP server or the `SessionStart` primer. |
 | `tokenBudget` | `600` | Hard cap on the injected block, in estimated tokens, with a 68-token minimum for the mandatory framed task and stale-index disclosure. Lower positive values are clamped to `68`; lower-priority detail (functions → files → call neighbours → specs → tools) is dropped to stay within budget. |
-| `relevanceMinMatches` | `2` | Relevance gate: minimum matched-function count unless the prompt names a matched identifier exactly (below it → a one-line pointer). |
-| `relevanceMinFanIn` | `2` | Relevance gate: a match with at least this fan-in (or a hub) clears the gate structurally. Exact identifier mentions and scale-free top-match identifier overlap can also clear the gate. |
-| `relevanceMinScore` | `0.3` | Relevance gate: minimum top match score — used **only** on the bounded semantic/hybrid score scale (BM25-fallback scores are corpus-relative and the score path is disabled there). |
+| `relevanceMinMatches`, `relevanceMinFanIn`, `relevanceMinScore` | — | Accepted for compatibility; no longer used. The prompt hook briefs only code the prompt names exactly (see [install](install.md#task-scoped-context-injection)). |
 
-The relevance gate is deterministic and never learned: when a task's graph match is weak (the small/familiar/shallow case), injection degrades to a single pointer line rather than taxing a task that needs no orientation. Injection is fail-open — any failure (no graph, parse error, empty/weak match) emits the pointer line and exits 0, so the hook can never break the agent's turn. Set `OPENLORE_INJECT_DEBUG=1` to write the gate verdict and applicable failed criteria to stderr; stdout remains injection-only.
-
-> **Without embeddings** (the default keyword/BM25 index) the gate never compares the unbounded, corpus-relative BM25 score to a fixed threshold. It uses matched-function count plus scale-free evidence: an exact identifier mention, top-match identifier-token overlap, or fan-in/hub centrality. Running `openlore embed --local` (one command, on-device, no API key) — or configuring a remote `EMBED_*` endpoint — additionally enables the bounded semantic-score path (`relevanceMinScore`). The injected block is always explicitly ignorable, so a false positive costs only a few tokens.
+The gate is deterministic and never learned: a prompt is briefed only when it names code that
+resolves exactly in the index, and the block shows only that code. Every other prompt is silent;
+the first silent prompt of a session gets one line explaining this. Injection is fail-open: a
+failure prints nothing and exits 0. Set `OPENLORE_INJECT_DEBUG=1` to write the verdict and the
+withhold reason to stderr; stdout remains injection-only.

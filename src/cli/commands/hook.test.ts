@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -13,7 +14,7 @@ vi.mock('../../core/services/mcp-handlers/verify-change.js', async () => {
   };
 });
 
-import { runHook, parseHookPayload, repoPath, renderReceipt } from './hook.js';
+import { runHook, parseHookPayload, repoPath, renderReceipt, hasProof } from './hook.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
@@ -23,11 +24,12 @@ function write(root: string, rel: string, content: string): void {
   mkdirSync(dirname(join(root, rel)), { recursive: true });
   writeFileSync(join(root, rel), content);
 }
-/** A git repository with OpenLore set up (an `.openlore` directory) and one commit. */
+/** A git repository with OpenLore set up (`.openlore/config.json`) and one commit. */
 function repo(files: Record<string, string> = {}): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'olhook-')));
   dirs.push(root);
   mkdirSync(join(root, '.openlore'));
+  writeFileSync(join(root, '.openlore', 'config.json'), '{}');
   for (const [rel, c] of Object.entries({ 'README.md': '# x\n', ...files })) write(root, rel, c);
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root, env: GIT_ENV });
   execFileSync('git', ['add', '-A'], { cwd: root, env: GIT_ENV });
@@ -208,6 +210,15 @@ describe('review round 1', () => {
     expect(context(r.stdout)?.additionalContext).toContain('is generated');
   });
 
+  it('a bare .openlore/ a tool left in a subdirectory does not capture the hook', async () => {
+    const root = repo({ 'gen/order.pb.go': GENERATED });
+    // The project turns this moment off; a stray folder below it must not hide that setting.
+    writeFileSync(join(root, '.openlore', 'config.json'), JSON.stringify({ hooks: { 'before-edit': false } }));
+    mkdirSync(join(root, 'gen/.openlore/logs'), { recursive: true });
+    const r = await runHook('before-edit', JSON.stringify({ session_id: 'stray', cwd: join(root, 'gen'), tool_input: { file_path: join(root, 'gen/order.pb.go') } }));
+    expect(r.stdout).toBe('');
+  });
+
   it('never takes the home directory or a parent repository for the OpenLore root', async () => {
     const home = realpathSync(mkdtempSync(join(tmpdir(), 'olhome-')));
     dirs.push(home);
@@ -270,6 +281,7 @@ describe('review round 1', () => {
     const top = repo({ 'packages/app/gen/x.pb.go': GENERATED });
     rmSync(join(top, '.openlore'), { recursive: true });
     mkdirSync(join(top, 'packages/app/.openlore'));
+    writeFileSync(join(top, 'packages/app/.openlore/config.json'), '{}');
     const r = await runHook('before-edit', JSON.stringify({ session_id: 'mt', cwd: top, tool_input: { file_path: join(top, 'packages/app/gen/x.pb.go') } }));
     expect(context(r.stdout)?.additionalContext).toContain('is generated');
   });
@@ -278,6 +290,7 @@ describe('review round 1', () => {
     const top = repo({ 'packages/app/src/f.ts': 'export function f() { return 1; }\n', 'packages/app/src/f.test.ts': TEST });
     const app = join(top, 'packages/app');
     mkdirSync(join(app, '.openlore'));
+    writeFileSync(join(app, '.openlore', 'config.json'), '{}');
     write(app, 'src/f.test.ts', TEST.replace("it('b'", "it.skip('b'"));
     const r = await runHook('after-tools', JSON.stringify({ session_id: 'mono', cwd: app, tool_input: { file_path: join(app, 'src/f.test.ts') } }));
     expect(context(r.stdout)?.additionalContext).toContain('test `b`');
@@ -377,3 +390,263 @@ describe('Codex payloads (change: add-agent-loop-hooks-codex-and-pi)', () => {
     expect(out?.additionalContext).toContain('src/gen.ts is generated');
   });
 });
+
+describe('once per session (change: hook-reliability, group 4)', () => {
+  const G0 = "import { f } from './f';\nexport const g = f;\n";
+  const MISSING = "import { f, missing } from './f';";
+  const setup = () => {
+    const root = repo({ 'src/f.ts': 'export function f() { return 1; }\n', 'src/g.ts': G0 });
+    write(root, 'src/g.ts', `${MISSING}\nexport const g = [f, missing];\n`);
+    return root;
+  };
+  const say = async (root: string, moment: 'after-tools' | 'before-edit', session = 's1', extra: Record<string, unknown> = {}) =>
+    context((await runHook(moment, payload(root, 'src/g.ts', { session_id: session, ...extra }))).stdout)?.additionalContext ?? '';
+
+  it('prints a finding id after each finding', async () => {
+    expect(await say(setup(), 'after-tools')).toMatch(/missing.*\[f:[0-9a-f]{8}\]/);
+  });
+
+  it('a finding shown at after-tools is not shown again at after-tools or before-edit', async () => {
+    const root = setup();
+    expect(await say(root, 'after-tools')).toContain('missing');
+    expect(await say(root, 'after-tools')).toBe('');
+    // A pending edit that leaves the import unchanged.
+    expect(await say(root, 'before-edit', 's1', { tool_input: { file_path: join(root, 'src/g.ts'), old_string: 'export const g', new_string: 'export const gg' } })).toBe('');
+  });
+
+  it('a line shift is not a new finding; a changed cited line is', async () => {
+    const root = setup();
+    const first = await say(root, 'after-tools');
+    expect(first).toContain('missing');
+    write(root, 'src/g.ts', `// a comment above\n\n${MISSING}\nexport const g = [f, missing];\n`);
+    expect(await say(root, 'after-tools')).toBe('');
+    write(root, 'src/g.ts', "// a comment above\n\nimport { f, missing, other } from './f';\nexport const g = [f, missing, other];\n");
+    const again = await say(root, 'after-tools');
+    expect(again).toContain('missing');
+    expect(again.match(/\[f:([0-9a-f]{8})\]/)?.[1]).not.toBe(first.match(/\[f:([0-9a-f]{8})\]/)?.[1]);
+  });
+
+  it('a new session starts clean', async () => {
+    const root = setup();
+    expect(await say(root, 'after-tools', 's1')).toContain('missing');
+    expect(await say(root, 'after-tools', 's2')).toContain('missing');
+  });
+
+  it('the stop receipt still shows the user a finding the agent was told', async () => {
+    const root = setup();
+    verify.result = { items: [{ subject: 'src/g.ts', check: 'unresolved-internal-symbol', severity: 'error', nextAction: 'fix the import' }], gated: false };
+    const stop = async () => (JSON.parse((await runHook('before-stop', payload(root))).stdout || '{}') as { systemMessage?: string }).systemMessage ?? '';
+    expect(await stop()).toMatch(/src\/g\.ts \[unresolved-internal-symbol\].*\[f:[0-9a-f]{8}\]/);
+    // Once to the user too.
+    expect(await stop()).toBe('');
+  });
+
+  it('a record from before finding ids (keys only) does not hide a finding', async () => {
+    const root = setup();
+    const id = createHash('sha256').update('s1').digest('hex').slice(0, 24);
+    write(root, `.openlore/session-ledger/hook-delivered/${id}.json`, JSON.stringify({ keys: ['unrelated'] }));
+    expect(await say(root, 'after-tools')).toContain('missing');
+  });
+});
+
+describe('time limits (change: hook-reliability, task 5.1)', () => {
+  it('every moment stops below its harness timeout, the prompt moment included', async () => {
+    const { TIMEOUT_MS } = await import('./hook.js');
+    const { MANAGED_HOOKS } = await import('../install/adapters/claude-code.js');
+    const { PROMPT_SUBMITTED_LIMIT_MS } = await import('./orient.js');
+    for (const def of MANAGED_HOOKS) {
+      if (!def.moment || !def.timeout) continue;
+      expect(TIMEOUT_MS[def.moment as keyof typeof TIMEOUT_MS], def.moment).toBeLessThan(def.timeout * 1000);
+    }
+    expect(TIMEOUT_MS).toMatchObject({ 'before-edit': 3_000, 'after-tools': 6_000, 'before-stop': 20_000 });
+    // The plugin's prompt hook sets the tightest harness timeout for the prompt moment.
+    const plugin = JSON.parse(readFileSync(join(__dirname, '../../../plugin/hooks/hooks.json'), 'utf8')) as { hooks: Record<string, Array<{ hooks: Array<{ timeout?: number }> }>> };
+    const promptTimeout = plugin.hooks.UserPromptSubmit[0].hooks[0].timeout!;
+    expect(PROMPT_SUBMITTED_LIMIT_MS).toBe(3_000);
+    expect(PROMPT_SUBMITTED_LIMIT_MS).toBeLessThan(promptTimeout * 1000);
+  });
+});
+
+describe('the run report for hook health (change: hook-reliability, task 6.1)', () => {
+  const capture = async (moment: Parameters<typeof runHook>[0], raw: string, opts: { timeoutMs?: number } = {}) => {
+    let report: unknown;
+    const r = await runHook(moment, raw, { ...opts, onRun: rep => { report = rep; } });
+    return { r, report: report as { root?: string; outcome: string; shown: number; reason?: string } };
+  };
+
+  it('ok, with the number of findings shown', async () => {
+    const root = repo({ 'gen/order.pb.go': GENERATED });
+    const { report } = await capture('before-edit', payload(root, 'gen/order.pb.go'));
+    expect(report).toEqual({ root, outcome: 'ok', shown: 1 });
+  });
+
+  it('a slow check is stopped, prints nothing, and is an overrun', async () => {
+    const root = repo({ 'gen/order.pb.go': GENERATED });
+    const { r, report } = await capture('before-edit', payload(root, 'gen/order.pb.go'), { timeoutMs: 1 });
+    expect(r).toEqual({ stdout: '', exitCode: 0 });
+    expect(report).toEqual({ root, outcome: 'overrun', shown: 0 });
+  });
+
+  it('a check that throws is an error', async () => {
+    const root = repo();
+    verify.result = undefined as unknown as Record<string, unknown>; // handleVerifyChange returns undefined: reading .error throws
+    const { r, report } = await capture('before-stop', payload(root));
+    expect(r).toEqual({ stdout: '', exitCode: 0 });
+    expect(report.outcome).toBe('error');
+    // What failed is kept for hook health, one line, and never printed to the agent.
+    expect(report.reason).toMatch(/^TypeError: /);
+  });
+
+  it('outside an OpenLore repository there is no root, so nothing is recorded', async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'olnoroot-')));
+    dirs.push(dir);
+    const { report } = await capture('before-edit', JSON.stringify({ session_id: 's', cwd: dir, tool_name: 'Edit', tool_input: { file_path: join(dir, 'a.ts') } }));
+    expect(report.root).toBeUndefined();
+  });
+});
+
+describe('acted-on states (change: hook-reliability, task 7.1)', () => {
+  const TEST = "import { f } from './f';\nit('a', () => { expect(f()).toBe(1); });\nit('b', () => { expect(f()).toBe(2); });\n";
+  const record = (root: string) => JSON.parse(readFileSync(join(root, '.openlore/session-ledger/hook-delivered', `${createHash('sha256').update('s1').digest('hex').slice(0, 24)}.json`), 'utf8')) as { findings: Record<string, { code: string; state?: string; check?: string; file?: string }> };
+  const weakened = () => {
+    const root = repo({ 'src/f.ts': 'export function f() { return 1; }\n', 'src/f.test.ts': TEST });
+    write(root, 'src/f.test.ts', TEST.replace("it('b'", "it.skip('b'"));
+    return root;
+  };
+
+  it('show, edit away, re-run: fixed', async () => {
+    const root = weakened();
+    expect(context((await runHook('after-tools', payload(root, 'src/f.test.ts'))).stdout)!.additionalContext).toContain('`it.skip` was added');
+    const [shown] = Object.values(record(root).findings);
+    expect(shown).toMatchObject({ code: 'test-disabled', check: 'weakening', file: 'src/f.test.ts' });
+    expect(shown.state).toBeUndefined();
+    write(root, 'src/f.test.ts', TEST); // the agent re-enables the test
+    expect((await runHook('after-tools', payload(root, 'src/f.test.ts'))).stdout).toBe('');
+    expect(Object.values(record(root).findings)[0].state).toBe('fixed');
+  });
+
+  it('a fixed finding that comes back is shown again and is no longer fixed', async () => {
+    const root = weakened();
+    await runHook('after-tools', payload(root, 'src/f.test.ts'));
+    write(root, 'src/f.test.ts', TEST);
+    await runHook('after-tools', payload(root, 'src/f.test.ts'));
+    write(root, 'src/f.test.ts', TEST.replace("it('b'", "it.skip('b'"));
+    expect(context((await runHook('after-tools', payload(root, 'src/f.test.ts'))).stdout)!.additionalContext).toContain('`it.skip` was added');
+    expect(Object.values(record(root).findings)[0].state).toBeUndefined();
+  });
+
+  it('an edit to another file does not fix it', async () => {
+    const root = weakened();
+    await runHook('after-tools', payload(root, 'src/f.test.ts'));
+    await runHook('after-tools', payload(root, 'src/f.ts'));
+    expect(Object.values(record(root).findings)[0].state).toBeUndefined();
+  });
+
+  it('a check that timed out leaves the state unset', async () => {
+    const root = weakened();
+    await runHook('after-tools', payload(root, 'src/f.test.ts'));
+    write(root, 'src/f.test.ts', TEST);
+    expect(await runHook('after-tools', payload(root, 'src/f.test.ts'), { timeoutMs: 1 })).toEqual({ stdout: '', exitCode: 0 });
+    expect(Object.values(record(root).findings)[0].state).toBeUndefined();
+  });
+
+  it('show, stop: open', async () => {
+    const root = repo();
+    verify.result = { items: [{ subject: 'src/f.test.ts', check: 'check_weakening', severity: 'warning', nextAction: 're-enable it' }], gated: false };
+    await runHook('before-stop', payload(root));
+    expect(Object.values(record(root).findings)).toEqual([expect.objectContaining({ code: 'check_weakening', state: 'open' })]);
+  });
+});
+
+describe('one problem, one finding, at after-tools and at stop (task 7.2)', () => {
+  it('a stop item built from a phantom finding carries the after-tools id', async () => {
+    const root = repo({ 'src/f.ts': 'export function f() { return 1; }\n', 'src/g.ts': "import { f } from './f';\nexport const g = f;\n" });
+    write(root, 'src/g.ts', "import { f, missing } from './f';\nexport const g = [f, missing];\n");
+    const after = context((await runHook('after-tools', payload(root, 'src/g.ts'))).stdout)!.additionalContext;
+    const id = after.match(/\[f:([0-9a-f]{8})\]/)![1];
+    const message = after.split('\n')[1].replace(/^- /, '').replace(/ \[f:[0-9a-f]{8}\]$/, '');
+    // The finding as the after-tools hook recorded it (its real code and subject).
+    const rec = JSON.parse(readFileSync(join(root, '.openlore/session-ledger/hook-delivered', `${createHash('sha256').update('s1').digest('hex').slice(0, 24)}.json`), 'utf8')) as { findings: Record<string, { code: string; subject: string }> };
+    const shown = Object.values(rec.findings)[0];
+    verify.result = {
+      items: [{ subject: message, check: 'phantom_references', severity: 'error', nextAction: 'fix it' }],
+      findings: [{ code: shown.code, subject: shown.subject, message, location: { path: 'src/g.ts', line: 1 }, discriminator: 'src/g.ts:1' }],
+      gated: false,
+    };
+    const stop = (JSON.parse((await runHook('before-stop', payload(root))).stdout) as { systemMessage: string }).systemMessage;
+    expect(stop).toContain(`[f:${id}]`);
+  });
+});
+
+describe('proof and action on every finding (change: reframe-governance-as-agent-evidence, group 4)', () => {
+  it('prints action and proof as labeled data, and the cited line only when the text does not quote it', () => {
+    const quoted = renderReceipt('after-tools', [{ key: 'a', severity: 'error', text: "src/a.ts imports './y', which is missing", next: 'fix the path', action: 'fix', proof: { path: 'src/a.ts', lineText: "import x from './y';" } }])!;
+    expect(quoted).toContain("(next action: fix the path; action: fix; proof: src/a.ts: import x from './y';)");
+    const already = renderReceipt('after-tools', [{ key: 'b', severity: 'error', text: "import x from './y'; does not resolve", action: 'fix', proof: { path: 'src/a.ts', lineText: "import x from './y';" } }])!;
+    expect(already).toContain('(action: fix; proof: src/a.ts)');
+    const receiptOnly = renderReceipt('before-stop', [{ key: 'c', severity: 'warning', text: 't', action: 'decide', proof: { discriminator: 'verify_change:blast_radius' } }])!;
+    expect(receiptOnly).toContain('- t (action: decide)');
+  });
+
+  it('the not-observed disclosure carries no action', async () => {
+    const root = repo({ 'src/f.ts': 'export const f = 1;\n' });
+    write(root, 'src/f.ts', 'export const f = 2;\n');
+    await runHook('after-tools', payload(root, 'src/f.ts'));
+    verify.result = { items: [], findings: [] };
+    const text = (JSON.parse((await runHook('before-stop', payload(root))).stdout || '{"systemMessage":""}') as { systemMessage: string }).systemMessage;
+    expect(text).toContain('Test runs are not observed');
+    expect(text).not.toMatch(/not stated\. \(action/);
+  });
+
+  it('a finding with no proof is not a finding', () => {
+    expect(hasProof({ key: 'k', severity: 'error', text: 't' })).toBe(false);
+    expect(hasProof({ key: 'k', severity: 'error', text: 't', proof: {} })).toBe(false);
+    expect(hasProof({ key: 'k', severity: 'error', text: 't', proof: { path: 'a.ts' } })).toBe(true);
+    expect(hasProof({ key: 'k', severity: 'error', text: 't', proof: { discriminator: 'd' } })).toBe(true);
+  });
+
+  it('after-tools: a phantom import is a fix with the cited file as proof, stated once per session', async () => {
+    const root = repo({ 'src/f.ts': 'export const f = 1;\n' });
+    write(root, 'src/g.ts', "import { f, missing } from './f';\nexport const g = [f, missing];\n");
+    const first = context((await runHook('after-tools', payload(root, 'src/g.ts'))).stdout)!.additionalContext;
+    expect(first).toMatch(/missing.*action: fix; proof: src\/g\.ts/);
+    expect((await runHook('after-tools', payload(root, 'src/g.ts'))).stdout).toBe('');
+  });
+
+  it('before-stop: each verify_change line carries its action', async () => {
+    const root = repo();
+    verify.result = { items: [
+      { subject: '2 changed symbol(s), up to 9 affected caller(s)', check: 'blast_radius', severity: 'warning', nextAction: 'Review callers.' },
+      { subject: 'removed helper (src/a.ts)', check: 'structural_diff', severity: 'error', nextAction: 'Confirm no caller still references it.' },
+    ], findings: [] };
+    const text = (JSON.parse((await runHook('before-stop', payload(root))).stdout) as { systemMessage: string }).systemMessage;
+    expect(text).toContain('[blast_radius] (next action: Review callers.; action: decide)');
+    expect(text).toContain('[structural_diff] (next action: Confirm no caller still references it.; action: fix)');
+  });
+});
+
+describe('user-scope wiring stands down where the repository wires the moment (change: user-scope-loop-hooks)', () => {
+  const wire = (root: string, command: string) => write(root, '.claude/settings.json', JSON.stringify({
+    hooks: { PreToolUse: [{ matcher: 'Edit', _openlore: true, _openloreHook: 'before-edit', hooks: [{ type: 'command', command }] }] },
+  }));
+  const edit = (root: string) => JSON.stringify({ session_id: 'su', cwd: root, tool_name: 'Write', tool_input: { file_path: join(root, 'gen/order.pb.go') } });
+
+  it('a user-scope hook speaks where the repository does not wire the moment, and once (not twice) where it does', async () => {
+    const root = repo({ 'gen/order.pb.go': GENERATED });
+    expect(context((await runHook('before-edit', edit(root), { userScope: true })).stdout)?.additionalContext).toContain('generated');
+
+    const other = repo({ 'gen/order.pb.go': GENERATED });
+    wire(other, "'/usr/local/bin/node' '/opt/openlore/dist/cli/index.js' hook before-edit");
+    let reported = false;
+    expect((await runHook('before-edit', edit(other), { userScope: true, onRun: r => { reported = !!r.root; } })).stdout).toBe('');
+    expect(reported).toBe(false); // no hook-health record for the stood-down run
+    expect(context((await runHook('before-edit', edit(other))).stdout)?.additionalContext).toContain('generated');
+  });
+
+  it('another user-scope command in the repository settings does not make it stand down', async () => {
+    const root = repo({ 'gen/order.pb.go': GENERATED });
+    wire(root, "'/usr/local/bin/node' '/opt/openlore/dist/cli/index.js' hook before-edit --scope user");
+    expect(context((await runHook('before-edit', edit(root), { userScope: true })).stdout)?.additionalContext).toContain('generated');
+  });
+});
+

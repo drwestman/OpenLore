@@ -668,59 +668,39 @@ present, otherwise read from the command's stdin (the prompt payload a pre-turn 
 The emitted block SHALL reuse the lean orientation output (Spec 27), SHALL be bounded by a documented
 token budget, SHALL be clearly attributed to OpenLore, and SHALL open with a one-line statement that
 it is informational and may be ignored (the same facts-not-coercion posture as the Epistemic Lease,
-decision `8e95746d`). The mode SHALL be deterministic with no LLM. Any failure — missing graph, parse
-error, empty match, or empty prompt — SHALL degrade to a single pointer line and exit 0, so a hook
-that invokes it can never break the user's turn.
-
-> Implemented by `add-task-scoped-context-injection` (2026-06-22). `orient --inject` reuses
-> `handleOrient(lean=true)`; stdin is parsed for a Claude Code `UserPromptSubmit` JSON payload
-> (`.prompt`) or treated as raw text. stdout is kept clean (diagnostics → stderr) so only the block
-> is injected. Default budget 600 tokens. Verified e2e on this repo: strong match emits the block at
-> exit 0, no-graph/empty prompt emit the pointer line at exit 0. Adds no MCP tool. Decisions:
-> `27c4bb53`, `0fc964d3`.
+decision `8e95746d`). The mode SHALL be deterministic with no LLM. The mode SHALL be the
+prompt-submitted hook moment under its existing command name: it SHALL be turned off by
+`hooks.prompt-submitted: false` as well as by `contextInjection.mode: "off"`, SHALL stop at that
+moment's runtime limit, and SHALL be listed by `openlore status`. A missing index SHALL be stated as
+a single line, once per harness session. A withheld briefing for any other cause SHALL print nothing
+on that turn (see `SilenceIsExplainedOncePerSession`). A thrown error or a passed runtime limit
+SHALL print nothing and exit 0. A hook that invokes the mode can never break the user's turn.
 
 #### Scenario: Inject emits a budgeted, ignorable block for a real task
 
-- **GIVEN** an analyzed repository and a task supplied via `--task`
+- **GIVEN** an analyzed repository and a task that names an indexed function in backticks
 - **WHEN** `openlore orient --inject` runs
 - **THEN** it emits a lean, OpenLore-attributed orientation block that opens with an
   informational/ignorable framing line and does not exceed the configured token budget
 
 #### Scenario: Inject never breaks the turn
 
-- **GIVEN** a repository with no analysis graph
+- **GIVEN** a repository with no analysis index
 - **WHEN** `openlore orient --inject` runs from a hook
-- **THEN** it emits a single pointer line indicating OpenLore is available and exits 0, emitting no
+- **THEN** it emits a single line stating that no index is available and exits 0, emitting no
   error to the harness
 
-### Requirement: OrientationRelevanceGate
+#### Scenario: An orientation error is silent
 
-The `--inject` mode SHALL compute a deterministic, local orientation-relevance signal from the
-orientation result — the matched-function count, the fan-in / hub centrality of the matches, and
-(only on the bounded semantic/hybrid score scale) the top match score — and SHALL compare it to a
-documented threshold. When the signal is at or above the threshold, `--inject` SHALL emit the full
-orientation block; when below it, `--inject` SHALL emit only a single pointer line. The threshold and
-its inputs SHALL be documented and overridable in repository configuration, and SHALL never be
-learned or LLM-derived.
+- **GIVEN** an analyzed repository where the orientation lookup throws
+- **WHEN** `openlore orient --inject` runs from a hook
+- **THEN** it prints nothing and exits 0
 
-> Implemented by `add-task-scoped-context-injection` (2026-06-22). The gate passes when matched-count
-> ≥ `relevanceMinMatches` (default 2) AND there is structural centrality (a match with fan-in ≥
-> `relevanceMinFanIn` (default 2), or a hub) — or, only on the bounded semantic/hybrid score scale, a
-> top score ≥ `relevanceMinScore` (default 0.3). BM25-fallback scores are corpus-relative and
-> unbounded, so the score path is disabled there and the gate relies on count + centrality. Decision:
-> `0fc964d3`.
+#### Scenario: The moment's own off switch works
 
-#### Scenario: A weak-orientation task gates down to a pointer
-
-- **GIVEN** a task whose graph match is sparse or low-scoring (the small/familiar/shallow case)
+- **GIVEN** `hooks.prompt-submitted: false` in `.openlore/config.json`
 - **WHEN** `openlore orient --inject` runs
-- **THEN** it emits only the single pointer line, not a full orientation block
-
-#### Scenario: A strong-orientation task emits the full block
-
-- **GIVEN** a deep task with a strong, high-fan-in graph match
-- **WHEN** `openlore orient --inject` runs
-- **THEN** it emits the full lean orientation block within budget
+- **THEN** it prints nothing and exits 0, and `openlore status` marks the moment as off
 
 ### Requirement: TaskScopedInjectionInstallWiring
 
@@ -1749,12 +1729,10 @@ timeout.
 
 ### Requirement: InjectionRelevanceGateIsDecidableInEveryShippedRetrievalMode
 
-The task-scoped injection relevance gate SHALL have at least one satisfiable pass criterion in
-every retrieval mode the product ships as a default or fallback (hybrid, keyword/BM25). A gate
-criterion SHALL NOT compare an unbounded score to a fixed constant. In keyword mode the gate
-SHALL accept scale-free evidence — at minimum, an exact identifier mention (the prompt contains a
-matched function's exact name) — independent of hub status and fan-in, so small and young
-repositories are not structurally excluded from injection.
+The task-scoped injection gate SHALL be decidable in every retrieval mode the product ships as a
+default or fallback (hybrid, keyword/BM25). It SHALL NOT compare a score to a fixed constant: the
+gate is the exact anchor of `PromptBriefingRequiresAnExactAnchor`, independent of hub status and
+fan-in, so small and young repositories are not structurally excluded from injection.
 
 #### Scenario: An exact identifier mention passes the gate in keyword mode
 
@@ -1762,28 +1740,28 @@ repositories are not structurally excluded from injection.
   fan-in below the gate's fan-in criterion
 - **WHEN** the `UserPromptSubmit` hook runs with a prompt that names an indexed function verbatim
   (e.g. "fix the bug where chargeCard rejects zero amounts")
-- **THEN** `orient --inject` emits the full injection block, not the pointer line
+- **THEN** `orient --inject` emits the injection block for that function
 
-#### Scenario: A genuinely weak match still degrades to the pointer line
+#### Scenario: A genuinely weak match gets no briefing
 
 - **GIVEN** the same repository
 - **WHEN** the hook runs with a prompt whose tokens match no indexed identifier and whose
   matches carry no hub or fan-in evidence
-- **THEN** the pointer line is emitted, and the behavior is unchanged from today
+- **THEN** no briefing is emitted (the once-per-session line of `SilenceIsExplainedOncePerSession`
+  aside)
 
 ### Requirement: InjectionSuppressionIsObservable
 
-When the relevance gate suppresses a full injection block, the gate verdict and the failing
-criterion SHALL be observable under an opt-in debug switch, written to stderr only; stdout SHALL
-carry nothing but the injected block or pointer line. Without the debug switch, output is
+When the gate withholds a briefing, the verdict and the withhold reason SHALL be observable under
+an opt-in debug switch, written to stderr only; stdout SHALL carry nothing but the injected block or
+a line required by `SilenceIsExplainedOncePerSession`. Without the debug switch, output is
 unchanged.
 
 #### Scenario: Debugging why a block was suppressed
 
 - **GIVEN** a prompt whose match fails the gate
 - **WHEN** `orient --inject` runs with the debug switch enabled
-- **THEN** stderr states the verdict (suppressed) and which criteria failed, and stdout contains
-  only the pointer line
+- **THEN** stderr states the verdict (suppressed) and the reason, and stdout contains no briefing
 
 ### Requirement: DecisionApprovalDisplaysSafeContentOrigin
 
@@ -1874,13 +1852,21 @@ with an optional next step — including any secondary precondition of that step
 ### Requirement: UninstallDisclosesWhatItKeeps
 
 `openlore install --uninstall` SHALL end its summary by naming the paths it deliberately keeps
-(the `.openlore/` data directory: index, decisions, memories) and the command to remove them.
+(the `.openlore/` data directory: index, decisions, memories; and each skill directory copied by
+`openlore setup`) and the command to remove them. It SHALL NOT delete them.
 
 #### Scenario: Uninstall names the kept data directory
 
 - **GIVEN** a repository with an initialized `.openlore/` store
 - **WHEN** `openlore install --uninstall` completes
 - **THEN** the summary lists `.openlore/` as kept and shows how to delete it
+
+#### Scenario: Uninstall names what it keeps
+
+- **GIVEN** a repository with `.openlore/` and skills copied by `openlore setup`
+- **WHEN** `openlore install --uninstall` completes
+- **THEN** no hook entry calls OpenLore, and the summary lists `.openlore/` and the copied skills as
+  kept, with the command to remove each
 
 ### Requirement: UninstallDisclosesTheUserScopeItRemoves
 
@@ -3016,69 +3002,37 @@ only in a daemon log file SHALL NOT satisfy this requirement.
 
 ### Requirement: InjectionRequiresCodeWorkIntent
 
-The pre-turn context injection SHALL emit a structural briefing only for a turn whose intent involves reading or changing code. A turn whose intent is repository or process management — pushing, opening, reviewing, merging or closing a pull request, releasing, tagging, writing a changelog, rebasing, or asking for repository status — SHALL receive the pointer line instead of a briefing, even when its words match indexed symbols.
+The pre-turn context injection SHALL emit a structural briefing only for a turn whose intent involves reading or changing code. A turn whose intent is repository or process management — pushing, opening, reviewing, merging or closing a pull request, releasing, tagging, writing a changelog, rebasing, or asking for repository status — SHALL receive no briefing, even when its words match indexed symbols.
 
-The intent classification SHALL be deterministic and local, with no LLM call and no new relevance score. It SHALL run before the existing relevance gate; a turn that passes the intent gate is still subject to that gate. Classification failure SHALL fail open to the code-work branch, so an unrecognized turn keeps today's behavior.
+The intent classification SHALL be deterministic and local, with no LLM call and no new relevance score. It SHALL run before the anchor gate; a turn that passes the intent gate is still subject to that gate. Classification failure SHALL fail open to the code-work branch.
 
 #### Scenario: Repository-management turn gets no briefing
 
 - **GIVEN** an indexed repository whose graph contains symbols named in the prompt
 - **WHEN** the user's turn is "push and open the PR"
-- **THEN** the hook emits the pointer line and no structural briefing
+- **THEN** the hook emits no structural briefing and records the reason `management-intent`
 
 #### Scenario: Code-work turn still gets its briefing
 
 - **GIVEN** the same repository
-- **WHEN** the user's turn is "add a test for the file browser's write path"
-- **THEN** the intent gate passes and the relevance gate decides the block as it does today
+- **WHEN** the user's turn is "add a test for `writeFileBrowserEntry`" and that function is indexed
+- **THEN** the intent gate passes and the anchor gate decides the briefing
 
 #### Scenario: Unrecognized intent keeps current behavior
 
 - **GIVEN** a turn the intent classifier matches no management pattern in
 - **WHEN** the injection is built
-- **THEN** the turn is treated as code work and only the relevance gate applies
+- **THEN** the turn is treated as code work and only the anchor gate applies
 
 ### Requirement: WithheldInjectionDisclosesItsReason
 
-When the injection is withheld, the hook SHALL record a stable machine-readable reason — at minimum `management-intent`, `weak-relevance`, `no-graph`, `empty-prompt`, and `error` — through the existing gate-evaluation callback, and telemetry SHALL carry it. Withholding SHALL remain fail-open and exit zero.
+When the injection is withheld, the hook SHALL record a stable machine-readable reason — at minimum `management-intent`, `no-anchor`, `no-graph`, `empty-prompt`, and `error` — through the existing gate-evaluation callback, and telemetry SHALL carry it. With `OPENLORE_INJECT_DEBUG=1` the reason SHALL be written to stderr, never to the agent's context. Withholding SHALL remain fail-open and exit zero.
 
 #### Scenario: Management-intent withhold is attributable
 
 - **GIVEN** telemetry is enabled
 - **WHEN** a turn is withheld by the intent gate
-- **THEN** the emitted event carries reason `management-intent`, distinguishable from a weak-relevance withhold
-
-### Requirement: AbsenceOfABriefingIsNeverAmbiguous
-
-While injection is enabled, the hook SHALL always emit output. A withheld briefing SHALL be replaced by a pointer line that states, in the agent-visible text, that the gate withheld it and why — at minimum distinguishing "this turn was not classified as code work" from "nothing in the graph matched this turn strongly" and from "orientation was unavailable" — and SHALL name the manual call that retrieves the structure on demand.
-
-The agent SHALL never have to infer whether an absent briefing means "nothing relevant was found" or "no lookup was performed". Emitting nothing SHALL be reserved for an operator who disabled injection (`mode: "off"`), which is a configured absence, not a gate decision.
-
-This requirement bounds the intent gate's failure mode: a misclassified code-work turn loses the pre-computed briefing but never the knowledge that a briefing was skipped, nor the way to ask for one.
-
-#### Scenario: A misclassified turn still tells the agent what happened
-
-- **GIVEN** a code-work turn the intent gate wrongly classifies as repository management
-- **WHEN** the hook runs
-- **THEN** the agent receives a pointer line stating the turn was not classified as code work and naming the manual orientation call
-
-#### Scenario: Weak relevance is distinguishable from a skipped lookup
-
-- **GIVEN** two turns, one withheld for weak relevance and one withheld by the intent gate
-- **WHEN** each hook runs
-- **THEN** the two pointer lines differ in their stated reason, so absence never reads the same for both causes
-
-#### Scenario: An enabled install never emits silence
-
-- **GIVEN** injection is enabled in any mode other than `off`
-- **WHEN** the hook runs on any turn, including failure paths
-- **THEN** the output is non-empty and carries a stated reason
-
-#### Scenario: A disabled install stays silent
-
-- **GIVEN** `contextInjection.mode` is `off`
-- **WHEN** the hook runs
-- **THEN** nothing is emitted, and no pointer line implies a gate decision
+- **THEN** the emitted event carries reason `management-intent`, distinguishable from a `no-anchor` withhold
 
 ### Requirement: TelemetryEventsCarryAgentAndSessionIdentity
 
@@ -3409,12 +3363,17 @@ SHALL list the wired moments.
 
 ### Requirement: LoopHooksAreAdvisoryUnlessPolicyBlocks
 
-Every `openlore hook <moment>` command SHALL exit 0, and SHALL print nothing on timeout or error,
-whatever the policy. Only when the repository's `enforcement.policy` names one or more finding codes
-as blocking MAY the before-stop hook block, and its message SHALL list the blocking findings and
-their next actions; it SHALL NOT block when the payload says a stop hook is already active. The hook
-SHALL add no imperative of its own; receipt next actions SHALL be carried as labeled data. The
-hook's standard output SHALL carry only the receipt.
+Every hook moment SHALL fail open. The moments are prompt submitted (`openlore orient --inject`)
+and the `openlore hook <moment>` commands. Each SHALL exit 0, and SHALL print nothing on a timeout,
+an error, a missing or unreadable `.openlore/`, a missing or unusable index, or an unreadable
+payload, whatever the policy. A hook command that `openlore install` writes SHALL exit 0 with no
+output when its runtime no longer exists. Only when the repository's `enforcement.policy` names one
+or more finding codes as blocking MAY the before-stop hook block, and its message SHALL list the
+blocking findings and their next actions; a finding that is blocking only by its source default
+SHALL NOT block a stop, and the hook SHALL NOT block when the payload says a stop hook is already
+active. The hook SHALL add no imperative of its own; receipt next actions SHALL be carried as
+labeled data. The hook's standard output SHALL carry only the receipt. A test SHALL assert this
+contract for every moment in `LOOP_MOMENTS`.
 
 #### Scenario: Stop does not block by default
 
@@ -3428,6 +3387,24 @@ hook's standard output SHALL carry only the receipt.
 - **GIVEN** `enforcement.policy` naming `test-disabled` as blocking
 - **WHEN** the before-stop hook runs on the same diff
 - **THEN** the hook blocks the stop and its message names the finding
+
+#### Scenario: A finding the policy does not name does not block a stop
+
+- **GIVEN** no `enforcement.policy` and a finding whose code the policy does not name
+- **WHEN** the before-stop hook runs
+- **THEN** it does not block
+
+#### Scenario: A broken store is silent at every moment
+
+- **GIVEN** a repository whose `.openlore/config.json` and index files are corrupt
+- **WHEN** each of the four moments runs
+- **THEN** each exits 0 and prints nothing
+
+#### Scenario: A removed runtime is silent
+
+- **GIVEN** a hook command written by `openlore install`, and the OpenLore install then deleted
+- **WHEN** the harness runs the command
+- **THEN** it exits 0 and prints nothing
 
 ### Requirement: HandoffBriefingIsDeterministicAndReplayable
 
@@ -3551,6 +3528,253 @@ mode, `hooks.after-compact: false`, or a directory outside an OpenLore project S
 - **WHEN** Pi compacts the session
 - **THEN** the next prompt carries the latest handoff briefing as a conversation message, once
 
+### Requirement: FindingsAreShownOncePerSessionAndTheirOutcomeIsCounted
+
+Across all four hook moments, a finding SHALL be identified by its code, its subject, and a hash
+of its proof, and SHALL be shown at most once per harness session to the agent and at most once to
+the user. The session record SHALL keep one outcome for each shown finding (`fixed`, `decided`,
+`open`, or `not-assessed`), SHALL stay in `.openlore/`, and SHALL NOT be sent anywhere.
+
+#### Scenario: One finding, two moments, one statement
+
+- **GIVEN** a session where the after-edit hook showed an unresolved import in `src/a.ts`
+- **WHEN** the before-edit hook next runs on `src/a.ts` with the import unchanged
+- **THEN** it does not show that finding again
+
+#### Scenario: A changed proof is a new finding
+
+- **GIVEN** a finding shown earlier in the session
+- **WHEN** the cited source line changes and the check reports the finding again
+- **THEN** the hook shows it again
+
+#### Scenario: A line shift is not a new finding
+
+- **GIVEN** a finding shown earlier in the session
+- **WHEN** lines are added above it and the cited line's text is the same
+- **THEN** the hook does not show it again
+
+#### Scenario: A new session starts clean
+
+- **GIVEN** a finding shown in one harness session
+- **WHEN** a hook reports the same finding under a different `session_id`
+- **THEN** the hook shows it
+
+#### Scenario: Fixed is counted only when the check ran again
+
+- **GIVEN** a shown finding, and an agent edit to its subject's file
+- **WHEN** the same check runs on that file and does not report the finding
+- **THEN** its outcome is `fixed`
+- **AND** when the check instead fails or times out, the outcome stays `not-assessed`
+
+#### Scenario: A decision that cites the finding counts as decided
+
+- **GIVEN** a finding shown with the id `f:1a2b3c4d`
+- **WHEN** a decision is recorded whose rationale contains `f:1a2b3c4d`
+- **THEN** `openlore status` counts that finding as `decided`
+
+#### Scenario: Still present at stop is open
+
+- **GIVEN** a shown finding that the before-stop receipt still reports
+- **WHEN** the session stops
+- **THEN** its outcome is `open`
+
+### Requirement: HookRunsAreBudgetedMeasuredAndReported
+
+Each of the four hook moments SHALL have a documented p95 latency target, asserted by a test on a
+fixture repository of fixed size, and a runtime limit past which the run stops, prints nothing,
+exits 0, and is recorded as an overrun. Each run SHALL be recorded in `.openlore/` only, and
+`openlore status` SHALL report hook health from those records in one line and in `--json`. The
+records SHALL NOT be sent anywhere.
+
+#### Scenario: A slow hook is stopped and counted
+
+- **GIVEN** a before-edit run whose check takes longer than the moment's runtime limit
+- **WHEN** the limit passes
+- **THEN** the hook prints nothing and exits 0
+- **AND** `openlore status` shows one more overrun for `before-edit`
+
+#### Scenario: The budget test fails on a regression
+
+- **GIVEN** the fixture repository and a change that adds 2 seconds to the before-edit handler
+- **WHEN** the latency test runs
+- **THEN** it fails and names the moment and the measured p95
+
+#### Scenario: Status reports hook health
+
+- **GIVEN** a repository where the four moments ran during the last 7 days
+- **WHEN** `openlore status` runs
+- **THEN** one line shows each moment's last run and p95, the errors and overruns, the findings
+  shown, and how many were fixed, decided, open, and not assessed
+
+#### Scenario: A record that cannot be written changes nothing
+
+- **GIVEN** a `.openlore/` directory that is read-only
+- **WHEN** a hook runs
+- **THEN** its output and exit code are the same as with a writable directory
+
+#### Scenario: No run recorded prints no health line
+
+- **GIVEN** a repository where no hook has run
+- **WHEN** `openlore status` runs
+- **THEN** it prints no hook health line and exits 0
+
+### Requirement: ManagedHooksStayCleanAcrossUpgradeAndUninstall
+
+`openlore install` run again after an upgrade SHALL leave exactly one current OpenLore group for
+each managed hook and none for a moment the installed version no longer has. `openlore install
+--uninstall` SHALL leave no hook entry that calls OpenLore, SHALL leave the user's own hooks
+byte-identical, and SHALL name what it keeps on purpose without deleting it (see
+`UninstallDisclosesWhatItKeeps`). `openlore doctor`
+SHALL report a wired hook command whose runtime file does not exist.
+
+#### Scenario: Upgrade leaves no duplicate
+
+- **GIVEN** a repository wired by an older OpenLore version
+- **WHEN** the newer version runs `openlore install`
+- **THEN** each managed hook has exactly one OpenLore group, and each group names the current command
+
+#### Scenario: A retired moment is removed
+
+- **GIVEN** a settings file with an OpenLore group for a moment the installed version does not have
+- **WHEN** `openlore install` or `openlore install --uninstall` runs
+- **THEN** that group is removed and the user's own hooks are unchanged
+
+#### Scenario: Doctor finds a hook with no runtime
+
+- **GIVEN** a wired hook command whose entry file was deleted
+- **WHEN** `openlore doctor` runs
+- **THEN** it reports the missing path and names `openlore install` as the fix
+
+### Requirement: IndexProgressIsShownToTheUserNotTheAgent
+
+While an index build or a background repair runs, OpenLore SHALL record its progress (phase, files
+done, files total, start time) in a local file under `.openlore/`, and `openlore statusline` and
+`openlore status` SHALL show it as a percentage with the file counts. When no build or repair
+runs, they SHALL show their usual state and nothing more. Progress text SHALL NOT be added to the
+agent's context. Where OpenLore's status line is not wired, the prompt-submitted moment MAY show
+the user one line when a build starts and one when it is ready, through a channel the harness
+shows to the user and not to the model; it SHALL show no other progress text.
+
+#### Scenario: The status line shows a running build
+
+- **GIVEN** a first index build that has parsed 1,310 of 2,900 files
+- **WHEN** `openlore statusline` runs
+- **THEN** it prints `OpenLore: indexing 45% (1,310/2,900 files)`
+
+#### Scenario: A stale progress record is not a running build
+
+- **GIVEN** a progress record whose process has exited
+- **WHEN** `openlore statusline` runs
+- **THEN** it prints the usual index state, not a percentage
+
+#### Scenario: A user without OpenLore's status line hears twice
+
+- **GIVEN** a Claude Code session where OpenLore's status line is not wired and no index exists
+- **WHEN** the first prompt starts a build, and a later prompt arrives after it is ready
+- **THEN** the user sees one start line and one ready line
+- **AND** neither line is in the model's context, and no other prompt shows a progress line
+
+### Requirement: PromptBriefingRequiresAnExactAnchor
+
+The `--inject` mode SHALL brief a turn only on code the prompt names. It SHALL extract anchors from
+the user's own words — `backticked` names, file paths, and identifier-shaped words (camelCase,
+two-hump PascalCase, snake_case, CONSTANT_CASE, `Class.method(`) — and SHALL NOT search prose. Text
+inside `<pasted_content>` blocks SHALL NOT supply anchors. The briefing SHALL contain only what an
+anchor names exactly: a function whose name, or the last segment of a `Class.method` name, equals an
+anchor, or a file that an anchored path names, with their call neighbours. A file under a
+`fixtures`, `__fixtures__`, `examples` or `testdata` folder SHALL be shown only for a path anchor
+into it. A name that the lookup finds defined in more than two files SHALL NOT be an anchor. When no
+anchor resolves exactly, no briefing SHALL be emitted. The rule SHALL be deterministic, local, and
+never learned or LLM-derived.
+
+> Replaces the matched-count / centrality / score gate. Audit (2026-11-15): on 68 real code prompts
+> that gate briefed 25 turns with 4% file precision; the exact-anchor gate briefs 2, both naming a
+> file the agent then worked on (change: anchor-gated-prompt-briefing).
+
+#### Scenario: A process prompt is not searched
+
+- **GIVEN** an analyzed repository
+- **WHEN** the prompt is "please fix ci on 708" or "start group 2 and drive it to merge"
+- **THEN** no lookup runs and no briefing is emitted
+
+#### Scenario: A named symbol is briefed alone
+
+- **GIVEN** an analyzed repository where `detectExistingSpecDir` is defined once
+- **WHEN** the prompt is "why does `detectExistingSpecDir` miss docs/specs?"
+- **THEN** the briefing lists `detectExistingSpecDir` and its file and callers, and no other function
+
+#### Scenario: A fixture or an ambiguous name is not an anchor
+
+- **GIVEN** a prompt naming `GetOrder`, defined only in a test fixture, or `main`, defined in many files
+- **WHEN** the hook runs
+- **THEN** no briefing is emitted
+
+### Requirement: SilenceIsExplainedOncePerSession
+
+What an absent briefing means SHALL be stated to the agent once per harness session, on the first
+turn that the intent or anchor gate withholds: briefings are given only when a prompt names code that
+resolves exactly in the index, so no briefing means none did, and `orient` searches on demand. Later
+withheld turns in the same session SHALL emit nothing. A missing index SHALL be stated as its own
+line, once per session. Emitting nothing on every turn SHALL be reserved for an operator who disabled
+the moment (`contextInjection.mode: "off"` or `hooks.prompt-submitted: false`), and a hook failure (a
+thrown error or a passed runtime limit) SHALL emit nothing and be counted in the hook health that
+`openlore status` reports.
+
+> Replaces a pointer line on every withheld turn, which cost context on most turns (change:
+> anchor-gated-prompt-briefing).
+
+#### Scenario: Silence is explained once per session
+
+- **GIVEN** an analyzed repository and a harness session
+- **WHEN** three process prompts arrive in that session
+- **THEN** the first prompt receives the one line explaining silence, and the next two receive nothing
+- **AND** a new session receives the line again on its first withheld prompt
+
+#### Scenario: A running build says nothing to the agent
+
+- **GIVEN** an index build or repair is running
+- **WHEN** the hook runs
+- **THEN** the agent's context gets no build or progress line
+
+#### Scenario: A disabled install stays silent
+
+- **GIVEN** `contextInjection.mode` is `off`
+- **WHEN** the hook runs
+- **THEN** nothing is emitted
+
+#### Scenario: A failed hook is silent to the agent and counted for the operator
+
+- **GIVEN** injection is enabled and the orientation lookup throws
+- **WHEN** the hook runs
+- **THEN** the agent receives nothing, and `openlore status` counts one error for the prompt-submitted moment
+
+### Requirement: UserScopeLoopHooksAreGuardedAndStandDown
+
+A user-scope Claude Code install SHALL wire the agent-loop moments as well as the session-start and
+prompt hooks. Each user-scope loop command SHALL exit 0 before starting Node when the project
+directory has no `.openlore/`. Every user-scope hook command SHALL carry `--scope user`, and such a
+command SHALL do nothing when the repository's own Claude settings wire the same step with a
+repo-scope command, so one event yields one receipt. `openlore doctor` SHALL NOT report that pair
+as a duplicate.
+
+#### Scenario: Outside an OpenLore project the loop hooks cost nothing
+
+- **GIVEN** a user-scope install
+- **WHEN** an edit happens in a project with no `.openlore/`
+- **THEN** the hook exits 0 before Node starts and prints nothing
+
+#### Scenario: A worktree with no repo wiring gets the receipts
+
+- **GIVEN** a user-scope install and a git worktree with `.openlore/` and no `.claude/settings.json`
+- **WHEN** the agent writes to a generated file
+- **THEN** the before-edit receipt is printed
+
+#### Scenario: A repository wired at both scopes is told once
+
+- **GIVEN** a user-scope install and a repository whose `.claude/settings.json` wires the same moment
+- **WHEN** the moment fires
+- **THEN** only the repo-scope command prints, and `openlore doctor` reports no duplicate
+
 ## Technical Notes
 
 - **Dependencies**: ora, logger, ProgressIndicator, showNextSteps, @inquirer/prompts
@@ -3567,7 +3791,7 @@ openlore emits SCIP for interop with external indexers but never imports it; the
 
 **Consequences:** SCIP consumers get a snapshot; openlore never depends on SCIP being read back.
 
-### MCP exposes a curated navigation tool preset, not all 83 tools
+### MCP exposes a curated navigation tool preset, not all 84 tools
 
 **Status:** Approved
 **Date:** 2026-06-01

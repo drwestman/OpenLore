@@ -1,3 +1,4 @@
+import type { FilePolicies, ConfigurationAssistantConfig } from '../core/configuration/types.js';
 /**
  * Core type definitions for openlore
  */
@@ -17,9 +18,16 @@ export type PanicResponseMode = 'off' | 'observe' | 'advisory' | 'experimental_b
 
 // Configuration types
 export interface OpenLoreConfig {
+  filePolicies?: FilePolicies;
+  configurationAssistant?: ConfigurationAssistantConfig;
   version: string;
   projectType: ProjectType;
-  openspecPath: string;
+  openspecPath?: string;
+  /**
+   * Extra folders of architecture decision records, read-only and repository-relative (change:
+   * spec-framework-neutrality, task 3.2). `docs/adr` and `docs/decisions` are read without it.
+   */
+  adrPaths?: string[];
   analysis: AnalysisConfig;
   generation: GenerationConfig;
   llm?: LLMConfig;
@@ -128,6 +136,8 @@ export interface OpenLoreConfig {
 
 /** Each agent-loop moment wired by `openlore install`; absent or `true` is on, `false` is off. */
 export interface HooksConfig {
+  /** `openlore orient --inject` on a submitted prompt (change: hook-reliability). */
+  'prompt-submitted'?: boolean;
   'before-edit'?: boolean;
   'after-tools'?: boolean;
   'before-stop'?: boolean;
@@ -423,7 +433,7 @@ export interface GlobalOptions {
 
 export interface InitOptions extends GlobalOptions {
   force: boolean;
-  openspecPath: string;
+  openspecPath?: string;
 }
 
 export interface AnalyzeOptions extends GlobalOptions {
@@ -725,6 +735,8 @@ export interface MappingCoverageStatus {
   reason?: MappingCoverageReason;
   message?: string;
   remediation?: string;
+  /** With `specs-unavailable`: the spec sources checked (change: spec-framework-neutrality). */
+  lookedFor?: string[];
   artifactPath: string;
   /** Where available coverage came from: the persisted cache, or an in-memory rebuild. */
   source?: 'cache' | 'derived';

@@ -1,3 +1,6 @@
+import { configurationCandidateSchema } from '../../core/configuration/tool-schema.js';
+import { redactSecretString } from '../../core/services/secret-redaction.js';
+import { configureOpenLoreMcp } from '../../core/configuration/mcp.js';
 /**
  * openlore MCP Server
  *
@@ -180,6 +183,11 @@ const FEDERATION_PROPS = {
 } as const;
 
 export const TOOL_DEFINITIONS = [
+  {
+    name:'configure_openlore',
+    description:'Inspect repository configuration without an index or daemon; preview, apply, verify or revert a revision-bound plan. Writes require a scoped host startup grant. Does not reason with an internal model.',
+    inputSchema:{type:'object',additionalProperties:false,properties:{directory:{type:'string',description:'Absolute path; default cwd'},action:{type:'string',enum:['inspect','preview','apply','verify','revert'],description:'inspect; preview a candidate; apply/verify/revert a preview plan.'},scope:{type:'string',description:'Repository-relative directory to inspect (default: root).'},candidate:configurationCandidateSchema,plan:{type:'object',description:'Exact complete preview result, unchanged, required for apply/verify/revert.'}},required:['action']},
+  },
   {
     name: 'orient',
     description:
@@ -747,20 +755,21 @@ export const TOOL_DEFINITIONS = [
             'Shape { taskId?, writeSet: [{ id:"file::name", filePath?, writeMode?:append|modify }], readSet?:string[] }. ' +
             'Adds an `escapeAnalysis` block; omit = unchanged behavior.',
           properties: {
-            taskId: { type: 'string' },
+            taskId: { type: 'string', description: 'The task id, as named in plan_parallel_work.' },
             writeSet: {
               type: 'array',
+              description: 'The symbols the task declared it would edit.',
               items: {
                 type: 'object',
                 properties: {
-                  id: { type: 'string' },
-                  filePath: { type: 'string' },
-                  writeMode: { type: 'string', enum: ['append', 'modify'] },
+                  id: { type: 'string', description: 'Symbol id, "file::name".' },
+                  filePath: { type: 'string', description: 'The file that holds the symbol.' },
+                  writeMode: { type: 'string', enum: ['append', 'modify'], description: '"append" for pure registration-site additions (default "modify").' },
                 },
                 required: ['id'],
               },
             },
-            readSet: { type: 'array', items: { type: 'string' } },
+            readSet: { type: 'array', items: { type: 'string' }, description: 'Symbol ids the task reads but declared it would not edit.' },
           },
         },
         peerFootprints: {
@@ -1090,37 +1099,42 @@ export const TOOL_DEFINITIONS = [
       additionalProperties: false,
       properties: {
         directory: { type: 'string', description: DIR_DESC },
-        query: { type: 'string', maxLength: 1000 },
+        query: { type: 'string', maxLength: 1000, description: 'The query that missed, exactly as passed to the search.' },
         surface: {
           type: 'string',
           enum: ['code', 'spec'],
+          description: '"code" for search_code, "spec" for search_specs.',
         },
         target: {
           type: 'object',
           additionalProperties: false,
+          description: 'The result you expected the search to return.',
           properties: {
             kind: {
               type: 'string',
               enum: ['symbol', 'file', 'requirement'],
+              description: '"symbol" or "file" on surface "code"; "requirement" on surface "spec".',
             },
             value: {
               type: 'string',
               minLength: 1,
               maxLength: 2048,
+              description: 'A symbol name or node id, a repository-relative file path, or a requirement id.',
             },
             filePath: {
               type: 'string',
               minLength: 1,
               maxLength: 2048,
+              description: 'Symbol targets only: the file that declares it, when the name is in more than one file.',
             },
           },
           required: ['kind', 'value'],
         },
-        limit: { type: 'integer', minimum: 1, maximum: 100 },
-        language: { type: 'string', maxLength: 256 },
-        minFanIn: { type: 'integer', minimum: 0 },
-        domain: { type: 'string', maxLength: 256 },
-        section: { type: 'string', maxLength: 256 },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'The limit the search used (default 10).' },
+        language: { type: 'string', maxLength: 256, description: 'The language filter the search used (surface "code" only).' },
+        minFanIn: { type: 'integer', minimum: 0, description: 'The minFanIn filter the search used (surface "code" only).' },
+        domain: { type: 'string', maxLength: 256, description: 'The domain filter the search used (surface "spec" only).' },
+        section: { type: 'string', maxLength: 256, description: 'The section filter the search used (surface "spec" only).' },
       },
       required: ['query', 'surface', 'target'],
     },
@@ -1768,9 +1782,9 @@ export const TOOL_DEFINITIONS = [
         action: { type: 'string', enum: ['declare', 'release', 'list'], description: 'declare (default), release, or list.' },
         actorId: { type: 'string', description: 'Stable agent id (default <branch>@<worktree>).' },
         title: { type: 'string', description: 'Task title (120 chars).' },
-        writeSet: { type: 'array', items: { type: 'string' } },
-        readSet: { type: 'array', items: { type: 'string' } },
-        writeMode: { type: 'string', enum: ['modify', 'append'] },
+        writeSet: { type: 'array', items: { type: 'string' }, description: 'Symbols or files this agent will edit; a name not in the index is an intended creation.' },
+        readSet: { type: 'array', items: { type: 'string' }, description: 'Symbols or files this agent depends on but will not edit.' },
+        writeMode: { type: 'string', enum: ['modify', 'append'], description: '"append" for pure registration-site additions (default "modify").' },
       },
     },
   },
@@ -1862,11 +1876,11 @@ export const TOOL_DEFINITIONS = [
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string' },
-              seedSymbols: { type: 'array', items: { type: 'string' } },
-              seedFiles: { type: 'array', items: { type: 'string' } },
-              intent: { type: 'string' },
-              writeMode: { type: 'string', enum: ['append', 'modify'] },
+              id: { type: 'string', description: 'Unique task id within this call.' },
+              seedSymbols: { type: 'array', items: { type: 'string' }, description: 'Symbol names/ids the task will edit.' },
+              seedFiles: { type: 'array', items: { type: 'string' }, description: 'File paths the task will edit (every symbol in the file enters the write-set).' },
+              intent: { type: 'string', description: 'Optional intent text (widens sparse seeds only; never guesses edits).' },
+              writeMode: { type: 'string', enum: ['append', 'modify'], description: '"append" for pure registration-site additions (default "modify").' },
             },
             required: ['id'],
           },
@@ -2257,8 +2271,9 @@ export const TOOL_DEFINITIONS = [
           additionalProperties: false,
           description: 'Optional versioned architecture constraints. Rules use the existing layers / forbidden / allowedOnly vocabulary and inherit this decision\'s lifecycle.',
           properties: {
-            version: { type: 'integer', enum: [1] },
+            version: { type: 'integer', enum: [1], description: 'Constraint format version; always 1.' },
             eligibility: {
+              description: 'Whether the decision reduces to a checkable repository property: eligible (state the enforced boundary), ineligible (state why), or unclassified.',
               oneOf: [
                 {
                   type: 'object', additionalProperties: false,
@@ -2287,6 +2302,7 @@ export const TOOL_DEFINITIONS = [
             rules: {
               type: 'array',
               maxItems: 10,
+              description: 'The checkable rules: layers, forbidden, or allowedOnly, each with an id and a scope.',
               items: {
                 oneOf: [
                   {
@@ -2440,9 +2456,9 @@ export const TOOL_DEFINITIONS = [
           maxProperties: 1,
           description: 'One predicate; pushed into orient/blast_radius on a match. Globs: * ? **.',
           properties: {
-            fileGlob: { type: 'string', minLength: 1, maxLength: 256 },
-            symbolPattern: { type: 'string', minLength: 1, maxLength: 256 },
-            specDomain: { type: 'string', minLength: 1, maxLength: 256 },
+            fileGlob: { type: 'string', minLength: 1, maxLength: 256, description: 'Fires when a touched file matches this glob.' },
+            symbolPattern: { type: 'string', minLength: 1, maxLength: 256, description: 'Fires when a touched symbol name matches this glob.' },
+            specDomain: { type: 'string', minLength: 1, maxLength: 256, description: 'Fires when the touched code is in this spec domain.' },
             withinHops: { type: 'integer', minimum: 1, maximum: 20, description: 'Call hops from a touched symbol.' },
           },
         },
@@ -2456,9 +2472,9 @@ export const TOOL_DEFINITIONS = [
             additionalProperties: false,
             required: ['kind', 'subject'],
             properties: {
-              kind: { type: 'string', enum: ['calls', 'reaches', 'dead', 'impacts', 'safe-to-change', 'decision-current'] },
-              subject: { type: 'string', minLength: 1, maxLength: 256 },
-              object: { type: 'string', minLength: 1, maxLength: 256 },
+              kind: { type: 'string', enum: ['calls', 'reaches', 'dead', 'impacts', 'safe-to-change', 'decision-current'], description: 'The verify_claim kind.' },
+              subject: { type: 'string', minLength: 1, maxLength: 256, description: 'A symbol, or a decision id for decision-current.' },
+              object: { type: 'string', minLength: 1, maxLength: 256, description: 'The second symbol, for calls, reaches and impacts.' },
             },
           },
         },
@@ -2504,6 +2520,7 @@ const _RWD  = { readOnlyHint: false, destructiveHint: true, idempotentHint: fals
 const _RWDI = { readOnlyHint: false, destructiveHint: true, idempotentHint: true  } as const;
 
 const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | typeof _RWD | typeof _RWDI> = {
+  configure_openlore: _RWD,
   orient: _RO, analyze_codebase: _RWI, get_architecture_overview: _RO,
   prepare_spec_generation: _RO, prepare_spec_repair: _RO,
   get_refactor_report: _RO, get_call_graph: _RO, get_duplicate_report: _RO,
@@ -2618,6 +2635,7 @@ const MINIMAL_TOOLS = new Set([
 // (orient + search + governance) omits. CodeGraph wins its benchmark with a
 // surface like this; openlore's was either too lean (no traversal) or all ~60.
 export const TOOL_PRESETS: Record<string, Set<string>> = {
+  configuration: new Set(['configure_openlore']),
   minimal: MINIMAL_TOOLS,
   // Graph-navigation core: orient to enter, then traverse/trace/impact + compact
   // symbol bodies — no governance tools, no inventories.
@@ -2680,6 +2698,17 @@ export const TOOL_PRESETS: Record<string, Set<string>> = {
     'recall', 'verify_claim', 'blast_radius',
     'prepare_spec_generation', 'prepare_spec_repair',
   ]),
+  // The Claude Code plugin's set (change: reframe-governance-as-agent-evidence, design 1-2):
+  // deterministic evidence tools only. It leaves out spec generation (prepare_spec_*) and the
+  // orientation views a plugin user rarely needs (trace_execution_path, get_landmarks, get_map),
+  // and adds verify_change, the pull form of the before-stop moment. Every other tool is in
+  // `substrate` too; verify_change joins `substrate` only after a benchmark-protocol run
+  // (DefaultSurfaceDecisionsRideTheBenchmarkProtocol). Every tool left out stays available under
+  // its own name through another preset, `--preset full`, and Pi.
+  plugin: new Set([
+    'orient', 'search_code', 'get_subgraph', 'analyze_impact', 'suggest_insertion_points',
+    'get_function_skeleton', 'find_path', 'recall', 'verify_claim', 'blast_radius', 'verify_change',
+  ]),
 };
 
 /**
@@ -2697,14 +2726,16 @@ export const STANDING_CONTEXT_BUDGETS: Record<string, {
   maxTokens: number;
   rationale: string;
 }> = {
+  configuration: {baselineTokens:707,maxTokens:760,rationale:'Expanded candidate schema after live agent trial exposed five rejected preview guesses, then a description on each of its 13 inputs (mcp-quality Complete Input Schemas); exact measured baseline plus 7.5% headroom, default surface unchanged.'},
   minimal: { baselineTokens: 2_736, maxTokens: 2_950, rationale: 'Exact v1 wire baseline plus 7.8% headroom.' },
   navigation: { baselineTokens: 3_533, maxTokens: 3_800, rationale: 'Exact v1 wire baseline plus 7.6% headroom.' },
   memory: { baselineTokens: 1_510, maxTokens: 1_610, rationale: 'Re-baselined from 1,216 for remember\'s trigger and pinned inputs (change: add-memory-trigger-predicates), then from 1,399 for its bounded claims input (change: add-memory-claim-verdicts), plus 6.6% headroom.' },
   verify: { baselineTokens: 2_075, maxTokens: 2_220, rationale: 'Grew with verify_change then certify_provenance (add-verification-feedback-loop, add-change-provenance-certificate); exact measured baseline plus 7.0% headroom.' },
   federation: { baselineTokens: 3_837, maxTokens: 4_100, rationale: 'Exact v1 wire baseline plus 6.9% headroom.' },
-  coordination: { baselineTokens: 3_476, maxTokens: 3_720, rationale: 'Grew with certify_merge, fleet_status, then declare_footprint (add-merge-semantic-certificate, add-fleet-coordination-arc, add-peer-footprint-board); exact measured baseline plus 7.0% headroom.' },
+  coordination: { baselineTokens: 3_721, maxTokens: 3_980, rationale: 'Grew with certify_merge, fleet_status, then declare_footprint (add-merge-semantic-certificate, add-fleet-coordination-arc, add-peer-footprint-board), then a description on every input (mcp-quality Complete Input Schemas); exact measured baseline plus 7.0% headroom.' },
+  plugin: { baselineTokens: 4_225, maxTokens: 4_520, rationale: 'The Claude Code plugin set (change: reframe-governance-as-agent-evidence); exact measured baseline plus 7.0% headroom.' },
   substrate: { baselineTokens: 5_131, maxTokens: 5_500, rationale: 'Exact v1 wire baseline plus 7.2% headroom.' },
-  full: { baselineTokens: 27_125, maxTokens: 28_400, rationale: 'Grew with verify_change, certify_provenance, certify_merge, get_handoff_briefing, certify_service_contract, and declare_footprint; re-baselined at 27,125 measured (add-peer-footprint-board) plus 4.7% headroom.' },
+  full: { baselineTokens: 28_680, maxTokens: 30_000, rationale: 'Grew with verify_change, certify_provenance, certify_merge, get_handoff_briefing, certify_service_contract, and declare_footprint; re-baselined at 28,680 measured after a description on each of the 47 inputs that had none (mcp-quality Complete Input Schemas) plus 4.6% headroom.' },
 };
 
 /**
@@ -3065,6 +3096,16 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
       if (!checked.ok) return checked.result;
       directory = checked.directory;
       (args as Record<string, unknown>).directory = directory;
+    }
+
+    if (name === 'configure_openlore') {
+      try {
+        const result = await configureOpenLoreMcp(args as Record<string,unknown>,directory,extra.signal);
+        const outcome = (result as {outcome?:string}).outcome;
+        return {content:[{type:'text' as const,text:JSON.stringify(result)}],isError:outcome !== undefined && ['blocked','stale-plan','needs-input','failed'].includes(outcome)};
+      } catch (error) {
+        return {content:[{type:'text' as const,text:JSON.stringify({version:1,outcome:'failed',reason:sanitizeForTerminal(redactSecretString(error instanceof Error ? error.message : String(error)),{keepNewlines:true}),recovery:'Inspect current configuration and retry the original plan to recover its retained operation receipt.'})}],isError:true};
+      }
     }
 
     if (options.watchAuto && !autoWatcher) {
@@ -3481,7 +3522,7 @@ export const mcpCommand = new Command('mcp')
   .option('--watch-debounce <ms>', 'Debounce delay in ms before re-indexing after a file change (default: 400)', '400')
   .option('--watch-no-embed', 'Watch signatures only — skip live vector re-embedding (embeddings refresh at commit). Large repos auto-degrade to this.')
   .option('--minimal', 'Expose only core 6 tools (orient, search_code, record_decision, detect_changes, check_spec_drift, get_health_map). Pair with alwaysLoad: true in Claude Code for always-visible core tools.')
-  .option('--preset <name>', `Expose a named tool preset. Default (no preset) is the "${LEAN_DEFAULT_PRESET}" surface — the graph-traversal core (orient, search_code, get_subgraph, trace_execution_path, analyze_impact, suggest_insertion_points, get_function_skeleton, get_landmarks, get_map, find_path), spec preparation (prepare_spec_generation + prepare_spec_repair), and governance reads (recall + verify_claim + blast_radius) — NOT the full registry. "navigation" = the lean navigate-only escape (the graph-traversal core alone, no governance or spec-workflow reads); "minimal" = orient+search+governance; "memory" = orient+remember+recall; "verify" = orient+search+verify_claim; "federation" = orient + federation_status + spec_store_status + working_set_context + change_impact_certificate + map_in_flight_conflicts + the four cross-repo conclusion tools; "coordination" = orient + plan_parallel_work + map_in_flight_conflicts + certify_merge + fleet_status + declare_footprint + analyze_impact + find_path; "full" = all ${TOOL_DEFINITIONS.length} tools (the prior default). Takes precedence over --minimal.`)
+  .option('--preset <name>', `Expose a named tool preset. Default (no preset) is the "${LEAN_DEFAULT_PRESET}" surface — the graph-traversal core (orient, search_code, get_subgraph, trace_execution_path, analyze_impact, suggest_insertion_points, get_function_skeleton, get_landmarks, get_map, find_path), spec preparation (prepare_spec_generation + prepare_spec_repair), and governance reads (recall + verify_claim + blast_radius) — NOT the full registry. "navigation" = the lean navigate-only escape (the graph-traversal core alone, no governance or spec-workflow reads); "minimal" = orient+search+governance; "memory" = orient+remember+recall; "verify" = orient+search+verify_claim; "federation" = orient + federation_status + spec_store_status + working_set_context + change_impact_certificate + map_in_flight_conflicts + the four cross-repo conclusion tools; "configuration" = provider-free configure_openlore management; "coordination" = orient + plan_parallel_work + map_in_flight_conflicts + certify_merge + fleet_status + declare_footprint + analyze_impact + find_path; "plugin" = the Claude Code plugin's 11 evidence tools (orient, search_code, get_subgraph, analyze_impact, suggest_insertion_points, get_function_skeleton, find_path, recall, verify_claim, blast_radius, verify_change); "full" = all ${TOOL_DEFINITIONS.length} tools (the prior default). Takes precedence over --minimal.`)
   .option('--all-tools', `Expose the full surface — all ${TOOL_DEFINITIONS.length} tools (alias for --preset full). Opt-in breadth; the "${LEAN_DEFAULT_PRESET}" default is recommended.`)
   .option('--list-tools', 'Print the active tool surface grouped by capability family (navigate/change/remember/verify/coordinate/federate) and exit — does not start the server. Respects --preset / --all-tools.')
   .action((options: McpServerOptions) => startMcpServer(options));

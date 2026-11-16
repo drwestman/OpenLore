@@ -5,11 +5,9 @@
  * to the process cwd for manual use.
  */
 
-import { existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { formatBuildProgress } from '../../core/services/build-progress.js';
 import { Command } from 'commander';
-import { OPENLORE_CONFIG_REL_PATH } from '../../constants.js';
-import { globalOpenLoreConfigPath } from '../../utils/config-layers.js';
+import { openloreProjectRoot } from '../../utils/project-root.js';
 import { colorForCapturedStdout } from '../../utils/colors.js';
 import { sanitizeForTerminal as safe } from '../../utils/misc.js';
 import { collectIndexStatus, type IndexStatus } from './status.js';
@@ -33,6 +31,9 @@ export function statusLabel(
 }
 
 function indexLabel(status: IndexStatus): { color: StatusColor; text: string } {
+  // A build in flight is the one thing worth showing: progress for the user, never the agent
+  // (change: hook-reliability, group 9).
+  if (status.building) return { color: 'yellow', text: `OpenLore: ${formatBuildProgress(status.building)}` };
   if (!status.indexPresent) return { color: 'yellow', text: 'OpenLore: no index' };
   if (status.degraded.length > 0) return { color: 'red', text: 'OpenLore: index degraded' };
   if (status.configUnreadable || status.embedFailure) {
@@ -46,20 +47,8 @@ function indexLabel(status: IndexStatus): { color: StatusColor; text: string } {
   return { color: 'green', text: 'OpenLore: index ready' };
 }
 
-/**
- * The nearest directory at or above `start` that holds a project `.openlore/config.json`, or
- * undefined. The user-level config (`~/.openlore/config.json`) shares that relative path but
- * marks no project, so it never counts. A bare `.openlore/` (telemetry or logs a tool left in
- * a subdirectory) is not a project either.
- */
-export function openloreProjectRoot(start: string): string | undefined {
-  const globalConfig = globalOpenLoreConfigPath();
-  for (let dir = resolve(start); ; dir = dirname(dir)) {
-    const config = join(dir, OPENLORE_CONFIG_REL_PATH);
-    if (config !== globalConfig && existsSync(config)) return dir;
-    if (dirname(dir) === dir) return undefined;
-  }
-}
+// The status line reports the project the hooks serve: one rule for both.
+export { openloreProjectRoot };
 
 /**
  * The directory whose index to report, from Claude Code's status-line JSON. Candidates, in

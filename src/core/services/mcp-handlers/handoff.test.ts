@@ -26,6 +26,7 @@ function repo(files: Record<string, string>): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'olhand-')));
   dirs.push(root);
   mkdirSync(join(root, '.openlore'));
+  writeFileSync(join(root, '.openlore', 'config.json'), '{}');
   for (const [rel, c] of Object.entries(files)) write(root, rel, c);
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root, env: GIT_ENV });
   execFileSync('git', ['add', '-A'], { cwd: root, env: GIT_ENV });
@@ -81,6 +82,16 @@ describe('get_handoff_briefing', () => {
     // Deterministic: the same state gives the same bytes.
     expect(JSON.stringify(await handleGetHandoffBriefing({ directory: root }))).toBe(JSON.stringify(r));
     expect(renderHandoff(r)).toContain('unchecked: "Handle empty `src/config.ts` input"');
+  });
+
+  it('with no OpenSpec folder, states the missing spec source instead of a silent empty openChanges', async () => {
+    const root = repo({ 'src/config.ts': 'export const a = 1;\n' });
+    write(root, 'src/config.ts', 'export const a = 2;\n');
+    const none = await handleGetHandoffBriefing({ directory: root });
+    expect(none.specSources).toEqual({ found: [], lookedFor: ['openspec'] });
+    write(root, 'openspec/changes/x/tasks.md', '- [ ] t\n');
+    const some = await handleGetHandoffBriefing({ directory: root });
+    expect(some.specSources).toBeUndefined();
   });
 
   it('a tight budget trims the least central sections first, with receipts naming the call', async () => {

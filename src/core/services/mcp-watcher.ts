@@ -1,3 +1,6 @@
+import { ConfigurationWatchPolicy } from '../configuration/watch-policy.js';
+import { FilePolicyResolver, repositoryPath } from '../configuration/policy.js';
+import { readOpenLoreConfig } from './config-manager.js';
 /**
  * McpWatcher — incremental re-indexer for the MCP server's --watch mode.
  *
@@ -36,7 +39,7 @@ import {
   readCurrentGeneration,
 } from '../runtime/analysis-generation.js';
 import { createHash } from 'node:crypto';
-import { join, relative, resolve, isAbsolute, posix } from 'node:path';
+import { basename, join, relative, resolve, isAbsolute, posix } from 'node:path';
 import { spawn } from 'node:child_process';
 import chokidar, { type FSWatcher } from 'chokidar';
 import ignoreModule from 'ignore';
@@ -431,6 +434,9 @@ const IGNORED_DIR_NAMES = new Set([
 ]);
 const IGNORED_SUFFIXES = ['.test.ts', '.test.js', '.spec.ts', '.spec.js'];
 
+/** The files whose edit changes what the watcher indexes. */
+const IGNORE_RULE_FILES = new Set(['.gitignore', '.openlore-ignore']);
+
 /**
  * True if a root-relative path should never be watched. Evaluated as a cheap
  * segment scan before any FD is opened, so it stays allocation-light. A path is
@@ -565,9 +571,41 @@ export class McpWatcher {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
+  private filePolicy = new FilePolicyResolver();
+  private watchPolicy: ConfigurationWatchPolicy | undefined;
+  /** Set by `start`: drop cached ignore rules after `.gitignore` / `.openlore-ignore` changes. */
+  private onIgnoreRulesChanged: (() => void) | undefined;
+  get configurationWatchedDirectories(): string[] { return Object.keys(this.fsWatcher?.getWatched() ?? {}).map(p => repositoryPath(relative(this.watchRoot,p))).slice(0,1000); }
+  /** Revision of the policy actually installed on this watcher. */
+  get configurationPolicyRevision(): string { return this.filePolicy.revisionFor('watch'); }
+
   async start(): Promise<void> {
     this.stopping = false;
-    const gitignoreScopes = await loadGitignoreScopes(this.rootPath);
+    // File policies are optional. A config that cannot be read must not stop live indexing:
+    // the watcher started without reading it before this option existed.
+    this.filePolicy = new FilePolicyResolver();
+    let excludePatterns: string[] = [];
+    try {
+      const configuration = await readOpenLoreConfig(this.rootPath);
+      if (configuration?.filePolicies) this.filePolicy = new FilePolicyResolver(configuration.filePolicies);
+      excludePatterns = configuration?.analysis?.excludePatterns ?? [];
+    } catch (error) {
+      process.stderr.write(`[mcp-watcher] file policies not applied (configuration unreadable): ${sanitizeForTerminal(error instanceof Error ? error.message : String(error))}\n`);
+    }
+    // Always: the watch policy is how the watcher honors `.openlore-ignore` and
+    // `analysis.excludePatterns`, as `analyze` does. It was built only when `filePolicies` was
+    // configured, so for nearly every repository the watcher indexed files analyze excludes
+    // (ROADMAP P0, #717).
+    this.watchPolicy = new ConfigurationWatchPolicy(this.rootPath, this.filePolicy, excludePatterns);
+
+    let gitignoreScopes = await loadGitignoreScopes(this.rootPath);
+    // An edited ignore file applies to the next event, not the next start: the cached rules are
+    // dropped and the gitignore scopes reloaded. A path it newly excludes stops being indexed
+    // at once; a directory it newly includes is picked up when the watcher next starts.
+    this.onIgnoreRulesChanged = () => {
+      this.watchPolicy?.invalidate();
+      void loadGitignoreScopes(this.rootPath).then((scopes) => { gitignoreScopes = scopes; }).catch(() => undefined);
+    };
     // Auto-degrade live embedding on very large trees (Step 4). Counting is
     // bounded — it stops as soon as the ceiling is exceeded.
     if (this.embed) {
@@ -593,7 +631,7 @@ export class McpWatcher {
         // parent path components above the watch root.
         ignored: (filePath: string, stats?: Stats) => {
           const rel = relative(rootPath, filePath);
-          return isIgnoredRelPath(rel) || isGitignoredPath(rel, gitignoreScopes, stats?.isDirectory()) || extraIgnore.some((p) => rel.includes(p));
+          return isIgnoredRelPath(rel) || isGitignoredPath(rel, gitignoreScopes, stats?.isDirectory()) || extraIgnore.some((p) => rel.includes(p)) || (this.watchPolicy ? !this.watchPolicy.admitted(repositoryPath(rel),stats?.isDirectory()) : false);
         },
         persistent: true,
         ignoreInitial: true,
@@ -601,10 +639,17 @@ export class McpWatcher {
         awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
       });
 
-      const watched = (p: string): boolean =>
-        SOURCE_EXTENSIONS.test(p) || HTML_EXTENSIONS.test(p) || isIndexedOpenSpecFile(this.openspecRoot, p);
+      const watched = (p: string): boolean => {
+        const rel = repositoryPath(relative(this.rootPath, p));
+        // The rules are checked again here, not only in `ignored`: an ignore file edited after
+        // start must apply to files chokidar already watches.
+        if (this.watchPolicy && !this.watchPolicy.admitted(rel)) return false;
+        return ((SOURCE_EXTENSIONS.test(p) || HTML_EXTENSIONS.test(p)) && this.filePolicy.admitted(rel, 'index', true)) || isIndexedOpenSpecFile(this.openspecRoot, p);
+      };
+      const ignoreRulesFile = (p: string): boolean => IGNORE_RULE_FILES.has(basename(p));
       this.fsWatcher.on('change', (absPath: string) => {
         const p = this.fromWatchRoot(absPath);
+        if (ignoreRulesFile(p)) this.onIgnoreRulesChanged?.();
         if (watched(p)) this.enqueue(p);
       });
       // A new file is indexed via the same change pipeline (insert is a no-op
@@ -612,6 +657,7 @@ export class McpWatcher {
       // fire 'add', so the initial scan never storms this.
       this.fsWatcher.on('add', (absPath: string) => {
         const p = this.fromWatchRoot(absPath);
+        if (ignoreRulesFile(p)) this.onIgnoreRulesChanged?.();
         if (watched(p)) this.enqueue(p);
       });
       // A deleted file must be removed from every lane (call graph, signatures,
@@ -619,6 +665,7 @@ export class McpWatcher {
       // edges/lines linger as phantom results until the next full analyze.
       this.fsWatcher.on('unlink', (absPath: string) => {
         const p = this.fromWatchRoot(absPath);
+        if (ignoreRulesFile(p)) this.onIgnoreRulesChanged?.();
         if (watched(p)) this.enqueueDeletion(p);
       });
 
@@ -2175,16 +2222,10 @@ export class McpWatcher {
         ? changedNodes
         : (cg.nodes ?? []).filter((n) => changedFilePaths.has(n.filePath));
 
-      const { embedded, reused, total, hasEmbeddings, deferred } = await VectorIndex.updateFiles(
-        this.outputPath,
-        nodes,
-        changedFilePaths,
-        context.signatures ?? [],
-        hubIds,
-        entryIds,
-        embedSvc,
-        fileContents,
-      );
+      const updateArgs = [this.outputPath,nodes,changedFilePaths,context.signatures ?? [],hubIds,entryIds,embedSvc,fileContents] as const;
+      const {embedded,reused,total,hasEmbeddings,deferred} = cfg?.filePolicies
+        ? await VectorIndex.updateFiles(...updateArgs,undefined,new FilePolicyResolver(cfg.filePolicies))
+        : await VectorIndex.updateFiles(...updateArgs);
 
       if (deferred === 'model-changed') {
         // Honest signal, not a silent no-op: the embedding model changed, so the
@@ -2194,7 +2235,7 @@ export class McpWatcher {
         process.stderr.write(
           `[mcp-watcher] embedding model changed — vector update deferred for ${changedFilePaths.size} file(s); run "openlore analyze --force" (or "openlore embed --local") to rebuild the semantic index\n`
         );
-      } else if (deferred === 'tokenizer-changed') {
+      } else if (deferred === 'tokenizer-changed' || deferred === 'policy-changed') {
         // Honest signal: the keyword tokenizer changed, so the incremental patch
         // was refused to avoid mixing token sets. Search still serves correct
         // results (the corpus is re-tokenized from raw text each process), but the
@@ -2997,8 +3038,8 @@ export class McpWatcher {
         const abs = join(dir, entry.name);
         const rel = relative(this.rootPath, abs);
         if (entry.isDirectory()) {
-          if (!isIgnoredRelPath(rel) && !isGitignoredPath(rel, gitignoreScopes, true)) await walk(abs);
-        } else if (entry.isFile() && SOURCE_EXTENSIONS.test(entry.name) && !isIgnoredRelPath(rel) && !isGitignoredPath(rel, gitignoreScopes)) {
+          if (!isIgnoredRelPath(rel) && !isGitignoredPath(rel, gitignoreScopes, true) && (this.watchPolicy?.admitted(repositoryPath(rel),true) ?? true)) await walk(abs);
+        } else if (entry.isFile() && SOURCE_EXTENSIONS.test(entry.name) && !isIgnoredRelPath(rel) && !isGitignoredPath(rel, gitignoreScopes) && (this.watchPolicy ? this.watchPolicy.admitted(repositoryPath(rel)) && this.filePolicy.admitted(repositoryPath(rel),'index',true) : true)) {
           count++;
         }
       }

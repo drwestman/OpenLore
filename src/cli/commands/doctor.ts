@@ -6,6 +6,7 @@
  */
 
 import { Command } from 'commander';
+import { noSpecSourceText } from '../../core/spec-sources/state.js';
 import { sanitizeForTerminal as safe } from '../../utils/misc.js';
 import { embeddingTlsRelaxed, withRelaxedTls } from '../../core/services/tls-scope.js';
 import { access, stat, readFile, realpath } from 'node:fs/promises';
@@ -710,14 +711,10 @@ async function checkOpenSpecDir(rootPath: string): Promise<CheckResult> {
   const rel = `${configuredRoot.replace(/^\.\//, '').replace(/\/$/, '')}/${OPENSPEC_SPECS_SUBDIR}/`;
   try {
     await access(specsDir);
-    return { name: 'OpenSpec directory', status: 'ok', detail: `${rel} exists` };
+    return { name: 'Spec source', status: 'ok', detail: `openspec: ${rel}` };
   } catch {
-    return {
-      name: 'OpenSpec directory',
-      status: 'warn',
-      detail: `${rel} not found`,
-      fix: "Run 'openlore init' then 'openlore generate'",
-    };
+    // No spec source is a supported state, not a problem to fix (change: spec-framework-neutrality).
+    return { name: 'Spec source', status: 'ok', detail: `none: ${noSpecSourceText()}; code answers work in full` };
   }
 }
 
@@ -785,6 +782,49 @@ async function checkMcpWiring(rootPath: string): Promise<CheckResult | null> {
     return { name: 'MCP wiring', status: 'ok', detail: '.mcp.json registers the openlore MCP server' };
   }
   return null;
+}
+
+/**
+ * Agent-loop hooks in Claude Code settings (change: hook-reliability, task 8.3): a hook whose
+ * runtime file is gone, and an event that runs two different OpenLore commands for one step.
+ * Null when no OpenLore hook is wired.
+ */
+export async function checkAgentHooks(rootPath: string, home: string): Promise<CheckResult | null> {
+  const { assessHookWiring, claudeSettingsFiles } = await import('../install/hook-wiring-health.js');
+  const health = await assessHookWiring(claudeSettingsFiles(rootPath, home));
+  if (!health.hooks.length) return null;
+  const problems: string[] = [];
+  if (health.missing.length) {
+    const paths = [...new Set(health.missing.map(m => m.path))];
+    // A guarded command (install writes one since hook-reliability) skips itself; an older,
+    // unguarded one fails on every event. Say which, so the message is true.
+    const guarded = (command: string) => /^\s*(\[ -f |command -v npx )/.test(command);
+    const hooks = [...new Set(health.missing.map(m => m.hook))];
+    const failing = hooks.filter(h => !guarded(h.command)).length;
+    const effect = failing === hooks.length
+      ? 'so they fail on every event'
+      : failing === 0
+        ? 'so they do nothing: each skips itself'
+        : `so ${failing} fail on every event and ${hooks.length - failing} skip themselves`;
+    problems.push(`${hooks.length} hook command(s) name a runtime that no longer exists (${paths.join(', ')}), ${effect}`);
+  }
+  for (const d of health.duplicates) {
+    // Claude Code runs an identical command once: group the entries by command.
+    const byCommand = new Map<string, string[]>();
+    for (const h of d.hooks) byCommand.set(h.command, [...(byCommand.get(h.command) ?? []), `${h.file}${h.marked ? '' : ' [not marked by openlore install]'}`]);
+    problems.push(`${d.event} runs \`${d.step}\` ${byCommand.size} times, once per distinct command: ${[...byCommand].map(([command, files]) => `${command} (in ${files.join(', ')})`).join('; ')}`);
+  }
+  if (!problems.length) {
+    return { name: 'Agent hooks', status: 'ok', detail: `${health.hooks.length} OpenLore hook command(s) wired; each runtime exists and no step runs twice` };
+  }
+  return {
+    name: 'Agent hooks',
+    status: 'warn',
+    detail: problems.join('. '),
+    fix: health.missing.length && !health.duplicates.length
+      ? "Run 'openlore install' to re-wire the hooks to this install"
+      : "Run 'openlore install' here, then remove the extra OpenLore hook entries from the files named above; keep one per step",
+  };
 }
 
 /** Every distinct `openlore` the PATH resolves to, first match first. */
@@ -1258,7 +1298,7 @@ Checks performed:
   • Config schema (unknown keys, type mismatches, version skew)
   • Analysis artifacts freshness
   • Graph store lifecycle (schema mismatch / quarantined index)
-  • OpenSpec directory presence
+  • Spec source (none is a supported state)
   • Governance corpus reference integrity
   • Injection-shaped unreviewed content (lexical advisory; never a guarantee)
   • MCP wiring (Claude Code reads .mcp.json, not .claude/settings.json)
@@ -1282,7 +1322,7 @@ Checks performed:
     }
 
     const home = process.env.OPENLORE_HOME || homedir();
-    const [staticChecks, mcpCheck, installCheck, userScopeCheck, llmCheck, embeddingCheck, retrievalModeCheck] = await Promise.all([
+    const [staticChecks, mcpCheck, installCheck, userScopeCheck, llmCheck, embeddingCheck, retrievalModeCheck, agentHooksCheck] = await Promise.all([
       Promise.all([
         checkNodeVersion(),
         checkGit(rootPath),
@@ -1304,6 +1344,7 @@ Checks performed:
       checkLLMConnection(rootPath),
       checkEmbeddingConnection(rootPath),
       checkRetrievalMode(rootPath),
+      checkAgentHooks(rootPath, home),
     ]);
 
     const unredactedChecks = [
@@ -1311,6 +1352,7 @@ Checks performed:
       ...(mcpCheck ? [mcpCheck] : []),
       installCheck,
       ...(userScopeCheck ? [userScopeCheck] : []),
+      ...(agentHooksCheck ? [agentHooksCheck] : []),
       llmCheck,
       ...(embeddingCheck ? [embeddingCheck] : []),
       retrievalModeCheck,
